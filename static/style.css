@@ -1,0 +1,432 @@
+/* ============================================================
+   ТАНЧИКИ — оформление клиента
+   Ретро-стиль: тёмная панель, моноширинный шрифт, янтарные акценты.
+   ============================================================ */
+
+:root {
+  --bg: #0d1117;
+  --panel: rgba(13, 17, 23, 0.82);
+  --panel-border: #2d333b;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --accent: #f0a202;
+  --accent-soft: #ffc857;
+  --danger: #f85149;
+  --ok: #3fb950;
+  --font: "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  -webkit-font-smoothing: antialiased;
+}
+
+canvas#game {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: crosshair;
+  image-rendering: pixelated;
+}
+
+/* ---------------------- HUD ---------------------- */
+
+#hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.panel {
+  position: absolute;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  backdrop-filter: blur(3px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+
+.panel header {
+  color: var(--accent);
+  font-size: 10px;
+  letter-spacing: 2px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--panel-border);
+  padding-bottom: 3px;
+}
+
+/* Мини-карта */
+#minimap-panel {
+  top: 12px;
+  left: 12px;
+}
+
+#minimap {
+  display: block;
+  width: 168px;
+  height: 168px;
+  image-rendering: pixelated;
+  border: 1px solid var(--panel-border);
+  background: #05070a;
+  border-radius: 3px;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 6px;
+  font-size: 9px;
+  color: var(--muted);
+}
+
+.legend span {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.dot-you {
+  background: #58d68d;
+}
+.dot-enemy {
+  background: #f85149;
+}
+.dot-bot {
+  background: #f0a202;
+}
+.dot-pickup {
+  background: #58a6ff;
+}
+
+/* Таблица лидеров */
+#leaderboard-panel {
+  top: 12px;
+  right: 12px;
+  min-width: 186px;
+  max-width: 240px;
+}
+
+#leaderboard {
+  list-style: none;
+  counter-reset: place;
+}
+
+#leaderboard li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1px 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#leaderboard li::before {
+  counter-increment: place;
+  content: counter(place);
+  width: 15px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 10px;
+  flex: none;
+}
+
+#leaderboard li .place-1::before,
+#leaderboard li:nth-child(1) {
+  color: var(--accent-soft);
+}
+
+#leaderboard li .who {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#leaderboard li .who.bot::before {
+  content: "🤖 ";
+}
+
+#leaderboard li .pts {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+#leaderboard li.me {
+  background: rgba(240, 162, 2, 0.14);
+  border-radius: 3px;
+  padding-left: 3px;
+  padding-right: 3px;
+}
+
+/* Состояние игрока */
+#status-panel {
+  bottom: 12px;
+  left: 12px;
+  min-width: 240px;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.status-row + .status-row {
+  margin-top: 3px;
+}
+
+.label {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+
+.label.small {
+  margin-left: auto;
+  opacity: 0.75;
+}
+
+.value {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+}
+
+.stars {
+  color: var(--accent);
+  letter-spacing: -1px;
+  font-size: 11px;
+}
+
+.hp-bar {
+  display: inline-block;
+  width: 92px;
+  height: 9px;
+  background: #21262d;
+  border: 1px solid var(--panel-border);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.hp-bar i {
+  display: block;
+  height: 100%;
+  width: 100%;
+  background: linear-gradient(90deg, #3fb950, #7ee787);
+  transition: width 0.18s ease-out;
+}
+
+.hp-bar i.low {
+  background: linear-gradient(90deg, #f85149, #ff7b72);
+}
+
+/* Подсказка */
+#help-panel {
+  bottom: 12px;
+  right: 12px;
+  color: var(--muted);
+  font-size: 10px;
+  max-width: 330px;
+  text-align: right;
+}
+
+#help-panel b {
+  color: var(--accent);
+}
+
+/* Индикатор потери связи */
+#connection {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(248, 81, 73, 0.92);
+  color: #fff;
+  padding: 5px 14px;
+  border-radius: 4px;
+  font-size: 12px;
+  letter-spacing: 1px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* ---------------------- Оверлеи ---------------------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(13, 17, 23, 0.55) 0%,
+    rgba(13, 17, 23, 0.88) 70%
+  );
+  backdrop-filter: blur(2px);
+}
+
+.card {
+  width: min(440px, 92vw);
+  padding: 26px 28px;
+  background: rgba(13, 17, 23, 0.94);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.65);
+  text-align: center;
+}
+
+.logo {
+  font-size: 42px;
+  letter-spacing: 8px;
+  color: var(--accent);
+  text-shadow: 0 3px 0 #7a4c00, 0 0 26px rgba(240, 162, 2, 0.35);
+  margin-bottom: 10px;
+}
+
+.tagline {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.7;
+  margin-bottom: 20px;
+}
+
+#join-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+#nickname {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 11px 12px;
+  background: #0b0f14;
+  border: 1px solid var(--panel-border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+#nickname:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(240, 162, 2, 0.16);
+}
+
+button {
+  padding: 11px 22px;
+  background: var(--accent);
+  color: #1a1205;
+  border: none;
+  border-radius: 5px;
+  font-family: var(--font);
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 2px;
+  cursor: pointer;
+  transition: background 0.15s, transform 0.08s, box-shadow 0.15s;
+  box-shadow: 0 3px 0 #7a4c00;
+}
+
+button:hover {
+  background: var(--accent-soft);
+}
+
+button:active {
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 #7a4c00;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 10.5px;
+  line-height: 1.7;
+  opacity: 0.85;
+}
+
+.dead {
+  color: var(--danger);
+  font-size: 26px;
+  letter-spacing: 4px;
+  margin-bottom: 18px;
+  text-shadow: 0 2px 0 #6b1c1c;
+}
+
+.death-stats {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 20px;
+}
+
+.death-stats div {
+  background: #0b0f14;
+  border: 1px solid var(--panel-border);
+  border-radius: 5px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.death-stats span {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 1px;
+}
+
+.death-stats b {
+  color: var(--accent-soft);
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 720px) {
+  #help-panel,
+  #leaderboard-panel {
+    display: none;
+  }
+  #minimap {
+    width: 110px;
+    height: 110px;
+  }
+}

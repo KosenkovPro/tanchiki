@@ -1,0 +1,22 @@
+[package]
+name = "tanchiki"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Многопользовательская браузерная 2D-игра «Танчики» в духе Battle City: большая открытая карта, бесшовный вход, авторитарный сервер."
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# panic = "abort" намеренно НЕ включён: паника в одной задаче не должна ронять весь игровой сервер

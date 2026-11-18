@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#0d1117" />
+    <title>ТАНЧИКИ — многопользовательская 2D-битва</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <canvas id="game"></canvas>
+
+    <!-- ================= HUD ================= -->
+    <div id="hud">
+      <!-- Мини-карта -->
+      <section id="minimap-panel" class="panel">
+        <header>КАРТА</header>
+        <canvas id="minimap" width="160" height="160"></canvas>
+        <div class="legend">
+          <span><i class="dot dot-you"></i>вы</span>
+          <span><i class="dot dot-enemy"></i>враг</span>
+          <span><i class="dot dot-bot"></i>бот</span>
+          <span><i class="dot dot-pickup"></i>бонус</span>
+        </div>
+      </section>
+
+      <!-- Таблица лидеров -->
+      <section id="leaderboard-panel" class="panel">
+        <header>ТОП-10</header>
+        <ol id="leaderboard"></ol>
+      </section>
+
+      <!-- Состояние игрока -->
+      <section id="status-panel" class="panel">
+        <div class="status-row">
+          <span class="label">УРОВЕНЬ</span>
+          <span class="value" id="stat-level">1</span>
+          <span class="stars" id="stat-stars">★</span>
+        </div>
+        <div class="status-row">
+          <span class="label">БРОНЯ</span>
+          <span class="hp-bar"><i id="stat-hp-fill"></i></span>
+          <span class="value" id="stat-hp">3/3</span>
+        </div>
+        <div class="status-row">
+          <span class="label">ОЧКИ</span>
+          <span class="value" id="stat-score">0</span>
+          <span class="label small">УБИЙСТВ</span>
+          <span class="value" id="stat-kills">0</span>
+        </div>
+        <div class="status-row">
+          <span class="label">ПИНГ</span>
+          <span class="value" id="stat-ping">—</span>
+          <span class="label small">FPS</span>
+          <span class="value" id="stat-fps">0</span>
+        </div>
+      </section>
+
+      <!-- Подсказка по управлению -->
+      <section id="help-panel" class="panel">
+        <b>WASD</b> / <b>стрелки</b> — движение · <b>Пробел</b> / <b>ЛКМ</b> — огонь ·
+        <b>колесо</b> — зум
+      </section>
+
+      <div id="connection" class="hidden">Соединение потеряно…</div>
+    </div>
+
+    <!-- ================= Оверлеи ================= -->
+    <div id="overlay" class="overlay">
+      <!-- Экран приветствия -->
+      <div class="card" id="welcome-card">
+        <h1 class="logo">ТАНЧИКИ</h1>
+        <p class="tagline">
+          Битва на открытой карте 5120×5120. Бесшовный вход — просто вбей ник и в бой.
+        </p>
+        <form id="join-form" autocomplete="off">
+          <input
+            id="nickname"
+            type="text"
+            maxlength="16"
+            placeholder="Никнейм"
+            spellcheck="false"
+          />
+          <button type="submit" id="play-button">В БОЙ</button>
+        </form>
+        <p class="hint">
+          WASD / стрелки — движение, Пробел или ЛКМ — выстрел. Звезда повышает уровень танка,
+          щит даёт неуязвимость, ремкомплект чинит броню.
+        </p>
+      </div>
+
+      <!-- Экран смерти -->
+      <div class="card hidden" id="death-card">
+        <h2 class="dead">ТАНК УНИЧТОЖЕН</h2>
+        <div class="death-stats">
+          <div><span>Очки</span><b id="death-score">0</b></div>
+          <div><span>Убийств</span><b id="death-kills">0</b></div>
+          <div><span>Смертей</span><b id="death-deaths">0</b></div>
+          <div><span>Продержался</span><b id="death-time">0 с</b></div>
+        </div>
+        <button id="respawn-button" type="button">В БОЙ</button>
+      </div>
+    </div>
+
+    <script type="module" src="/game.js"></script>
+  </body>
+</html>
