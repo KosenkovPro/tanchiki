@@ -1,0 +1,19 @@
+# Запуск «Танчиков» одной командой:
+#   docker compose up -d --build
+#   затем откройте http://localhost:3000
+services:
+  tanchiki:
+    build: .
+    image: tanchiki:latest
+    container_name: tanchiki
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      TANCHIKI_BIND: "0.0.0.0:3000"
+      TANCHIKI_TICK_RATE: "30"
+      TANCHIKI_MAP_W: "160"
+      TANCHIKI_MAP_H: "160"
+      TANCHIKI_MIN_PLAYERS: "15"
+      TANCHIKI_MAX_BOTS: "14"
+      RUST_LOG: "info"

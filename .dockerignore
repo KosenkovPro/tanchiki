@@ -1,0 +1,9 @@
+# Сборочный контекст: только то, что нужно для сборки.
+target/
+.git/
+.github/
+.gitignore
+*.log
+logs/
+README.md
+docs/

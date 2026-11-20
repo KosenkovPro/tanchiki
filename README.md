@@ -1,23 +1,50 @@
-# ТАНЧИКИ
+# 🎮 TANCHIKI
 
-Многопользовательская браузерная 2D-игра в духе **Battle City**, но с большой открытой
-картой и бесшовным входом в стиле `.io`-игр.
+> Multiplayer browser 2D tank battle in the spirit of **Battle City** — but with a huge
+> open map and seamless *drop-in* play, like `.io` games.
 
-* **Сервер:** Rust 2024, `tokio`, `axum` + WebSockets, авторитарная симуляция 30 TPS.
-* **Клиент:** Vanilla JS (ES-модули) + Canvas 2D, без сборщика и без внешних зависимостей.
-* **Сеть:** собственный компактный бинарный протокол (little-endian), без JSON и без зависимостей.
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/KosenkovPro/tanchiki.svg)](https://github.com/KosenkovPro/tanchiki/releases)
+[![Play](https://img.shields.io/badge/play-localhost%3A3000-2ea44f.svg)](http://localhost:3000)
+
+| | |
+|---|---|
+| **Server** | Rust 2024 · `tokio` · `axum` + WebSockets · authoritative simulation at **30 TPS** |
+| **Client** | Vanilla JS (ES modules) + Canvas 2D · **no bundler, no runtime dependencies** |
+| **Network** | custom compact **binary protocol** (little-endian) · no JSON, no serializer crates |
+| **Assets** | zero — everything is drawn procedurally on `<canvas>` |
 
 ```
-┌───────────────┐   WebSocket (бинарный протокол)   ┌────────────────────┐
-│  Клиент       │◄────────────────────────────────►│  Сервер (axum)     │
-│  Canvas 2D    │   INPUT ↑ / SNAPSHOT ↓            │  игровой цикл 30Hz │
-│  предсказание │   PING   ↑ / PONG   ↓             │  interest mgmt     │
-└───────────────┘                                    └────────────────────┘
+┌────────────────┐   WebSocket (binary protocol)   ┌─────────────────────┐
+│  Client        │◄───────────────────────────────►│  Server (axum)      │
+│  Canvas 2D     │   INPUT ↑  /  SNAPSHOT ↓         │  game loop 30 Hz    │
+│  prediction    │   PING   ↑  /  PONG   ↓          │  interest mgmt      │
+└────────────────┘                                 └─────────────────────┘
 ```
 
 ---
 
-## Быстрый старт
+<details name="lang">
+<summary><b>🇷🇺 Русский</b> — <i>нажмите, чтобы переключить язык на русский</i></summary>
+
+# 🎮 ТАНЧИКИ
+
+> Многопользовательская браузерная 2D-игра с танками в духе **Battle City** — но с большой
+> открытой картой и бесшовным входом в стиле `.io`-игр.
+
+| | |
+|---|---|
+| **Сервер** | Rust 2024 · `tokio` · `axum` + WebSockets · авторитарная симуляция **30 TPS** |
+| **Клиент** | Vanilla JS (ES-модули) + Canvas 2D · **без сборщика и внешних зависимостей** |
+| **Сеть** | собственный компактный **бинарный протокол** (little-endian) · без JSON и без сериализаторов |
+| **Ассеты** | отсутствуют — вся графика рисуется процедурно на `<canvas>` |
+
+---
+
+## 🚀 Быстрый старт
+
+Нужен только Rust. Склонируйте репозиторий и запустите сервер:
 
 ```bash
 git clone https://github.com/KosenkovPro/tanchiki.git
@@ -25,29 +52,74 @@ cd tanchiki
 cargo run
 ```
 
-Открыть <http://localhost:3000>. Регистрация не нужна: введите ник и нажмите **«В бой»** —
-вы сразу попадёте в общий мир.
+Откройте <http://localhost:3000> и нажмите **«В БОЙ»**. Регистрация не нужна: придумайте
+ник — и вы сразу в общем мире.
 
-Статика вшивается в бинарник через `rust-embed`, поэтому одна и та же команда работает
-и в разработке, и в релизе — папку `static/` держать рядом с бинарником не нужно.
+Статика вшивается в бинарник через `rust-embed`, поэтому папку `static/` держать рядом с
+исполняемым файлом **не нужно**: одна и та же команда работает и в разработке, и в релизе.
+
+> **Важно про редактирование клиента.** Файлы в `static/` вшиваются на этапе сборки.
+> После правки `static/*.js` или `static/*.css` нужно пересобрать сервер
+> (`cargo build`) и перезапустить его — иначе браузер получит старую версию из бинаря.
 
 ### Требования
 
 | Компонент | Версия |
 |-----------|--------|
-| Rust      | 1.85+ (edition 2024) |
-| Node.js   | не требуется |
-
-### Сборка релиза
-
-```bash
-cargo build --release
-./target/release/tanchiki
-```
+| Rust | 1.85+ (edition 2024) |
+| Node.js | не требуется |
+| Docker | не требуется (но есть `Dockerfile` и `docker-compose.yml`) |
 
 ---
 
-## Управление
+## 📦 Готовые бинарники
+
+В разделе [Releases](https://github.com/KosenkovPro/tanchiki/releases) опубликованы сборки
+под Windows и Linux (x86_64) — скачать, распаковать и запустить, без Rust и без сборки.
+
+| Файл | Платформа | Запуск |
+|------|-----------|--------|
+| `tanchiki-windows-x86_64.exe` | Windows 10/11 x86_64 | `.\tanchiki-windows-x86_64.exe` |
+| `tanchiki-linux-x86_64` | Linux x86_64 (glibc) | `chmod +x tanchiki-linux-x86_64 && ./tanchiki-linux-x86_64` |
+| `SHA256SUMS.txt` | контрольные суммы | `sha256sum -c SHA256SUMS.txt` |
+
+Проверить целостность на Windows:
+
+```powershell
+Get-FileHash .\tanchiki-windows-x86_64.exe -Algorithm SHA256
+```
+
+Сервер слушает `0.0.0.0:3000`, поэтому в браузере откройте <http://localhost:3000>.
+Чтобы принимать игроков из локальной сети, узнайте свой адрес (`ipconfig` / `ip addr`)
+и откройте `http://<ваш-ip>:3000` на другом устройстве.
+
+---
+
+## 🐳 Запуск в Docker
+
+```bash
+docker compose up -d --build
+```
+
+Откройте <http://localhost:3000>. Остановить и удалить контейнер:
+
+```bash
+docker compose down
+```
+
+Или вручную:
+
+```bash
+docker build -t tanchiki .
+docker run -d --name tanchiki -p 3000:3000 tanchiki
+```
+
+Образ — `debian:bookworm-slim` с одним бинарником внутри; `HEALTHCHECK` опрашивает
+`/healthz`, поэтому `docker ps` покажет состояние контейнера.
+
+---
+
+## 🎮 Управление
 
 | Клавиша | Действие |
 |---------|----------|
@@ -61,7 +133,7 @@ Battle City, поэтому он не застревает в узких про�
 
 ---
 
-## Игровые правила
+## 📖 Правила игры
 
 ### Типы тайлов
 
@@ -90,7 +162,7 @@ Battle City, поэтому он не застревает в узких про�
 | ● Щит | 8 секунд неуязвимости |
 | ✚ Ремкомплект | мгновенное восстановление брони |
 
-Бонусы появляются случайно на свободных тайлах, живут 30 секунд. Из уничтоженного танка
+Бонусы появляются случайно на свободных тайлах и живут 30 секунд. Из уничтоженного танка
 с 35 % шансом выпадает звезда.
 
 ### Очки
@@ -110,7 +182,49 @@ Battle City, поэтому он не застревает в узких про�
 
 ---
 
-## Архитектура
+## ⚙️ Настройки сервера
+
+Параметры задаются переменными окружения (см. `src/game.rs`, `GameConfig::from_env`):
+
+| Переменная | По умолчанию | Описание |
+|------------|--------------|----------|
+| `TANCHIKI_BIND` | `0.0.0.0:3000` | адрес прослушивания |
+| `TANCHIKI_TICK_RATE` | `30` | тиков в секунду (5…120) |
+| `TANCHIKI_MAP_W` | `160` | ширина карты в тайлах (32…512) |
+| `TANCHIKI_MAP_H` | `160` | высота карты в тайлах (32…512) |
+| `TANCHIKI_MIN_PLAYERS` | `15` | минимальный размер населения (люди + боты) |
+| `TANCHIKI_MAX_BOTS` | `14` | максимум ботов |
+| `TANCHIKI_SEED` | фиксированный | зерно генерации карты |
+| `TANCHIKI_PROFILE` | выкл. | `1` — подробный профайлинг тиков в лог |
+
+Размер тайла — константа `TILE_SIZE = 32` px (`src/map.rs`): геометрия карты, коллизии
+и протокол опираются на неё, поэтому она не выносится в настройки.
+
+Уровень логов задаётся переменной `RUST_LOG` (по умолчанию `info`).
+
+Пример запуска:
+
+```bash
+TANCHIKI_BIND=0.0.0.0:8080 TANCHIKI_MAP_W=256 TANCHIKI_MAP_H=256 cargo run --release
+```
+
+В PowerShell:
+
+```powershell
+$env:TANCHIKI_BIND = '0.0.0.0:8080'
+$env:TANCHIKI_MAP_W = '256'
+cargo run --release
+```
+
+> **Про точность тикрейта.** По умолчанию Windows округляет любое ожидание до границы
+> ~15.6 мс, из-за чего таймер на 33 мс срабатывал раз в ~46 мс — и игра теряла треть
+> тиков. Поэтому сервер (1) просит у системы точность таймера 1 мс и (2) считает тики
+> по накопленному времени, догоняя пропущенные (максимум 5 тиков за раз). Фактическая
+> частота — ровно 30 тиков/с независимо от точности планировщика ОС.
+
+---
+
+## 🏗 Архитектура
 
 ```
 src/
@@ -168,7 +282,7 @@ static/
 
 ---
 
-## Бинарный протокол
+## 📦 Бинарный протокол
 
 Транспорт — WebSocket, сообщения — бинарные фреймы. Все целые числа **little-endian**.
 Строки кодируются как `u16 len + utf8 bytes` (никнейм обрезается до 16 байт).
@@ -221,41 +335,7 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 
 ---
 
-## Конфигурация
-
-Параметры задаются переменными окружения (см. `src/game.rs`, `GameConfig::from_env`):
-
-| Переменная | По умолчанию | Описание |
-|------------|--------------|----------|
-| `TANCHIKI_BIND` | `0.0.0.0:3000` | адрес прослушивания |
-| `TANCHIKI_TICK_RATE` | `30` | тиков в секунду (5…120) |
-| `TANCHIKI_MAP_W` | `160` | ширина карты в тайлах (32…512) |
-| `TANCHIKI_MAP_H` | `160` | высота карты в тайлах (32…512) |
-| `TANCHIKI_MIN_PLAYERS` | `15` | минимальный размер населения (люди + боты) |
-| `TANCHIKI_MAX_BOTS` | `14` | максимум ботов |
-| `TANCHIKI_SEED` | фиксированный | зерно генерации карты |
-| `TANCHIKI_PROFILE` | выкл. | `1` — подробный профайлинг тиков в лог |
-
-Размер тайла — константа `TILE_SIZE = 32` px (`src/map.rs`): геометрия карты, коллизии
-и протокол опираются на неё, поэтому она не выносится в настройки.
-
-Уровень логов задаётся переменной `RUST_LOG` (по умолчанию `info`).
-
-> **Про точность тикрейта.** По умолчанию Windows округляет любое ожидание до границы
-> ~15.6 мс, из-за чего таймер на 33 мс срабатывал раз в ~46 мс — и игра теряла треть
-> тиков. Поэтому сервер (1) просит у системы точность таймера 1 мс и (2) считает тики
-> по накопленному времени, догоняя пропущенные. Фактическая частота — ровно 30 тиков/с
-> независимо от точности планировщика ОС.
-
-Пример запуска:
-
-```bash
-TANCHIKI_BIND=0.0.0.0:8080 TANCHIKI_MAP_W=256 TANCHIKI_MAP_H=256 cargo run --release
-```
-
----
-
-## Устойчивость к ошибкам
+## 🛡 Устойчивость к ошибкам
 
 * В сетевом коде **нет `unwrap()`/`expect()`**: битый пакет возвращается клиенту как
   `ERROR`, оборванное соединение корректно удаляет игрока, сбой одного соединения не
@@ -264,22 +344,412 @@ TANCHIKI_BIND=0.0.0.0:8080 TANCHIKI_MAP_W=256 TANCHIKI_MAP_H=256 cargo run --rel
 * Исходящая очередь ограничена: медленный клиент просто пропускает кадр, а не тормозит
   сервер.
 * `panic = "abort"` намеренно **не включён** в релизном профиле — паника в одной задаче
-  не должна ронять весь сервер.
+  не должна ронять весь игровой сервер.
 
 ---
 
-## Тесты
+## 🧪 Разработка и тесты
 
 ```bash
-cargo test
+cargo check --all-targets   # 0 ошибок, 0 предупреждений
+cargo test                  # 22 теста
+cargo build --release
 ```
 
 Покрыты: RLE round-trip, связность карты, разрушаемость кирпича и бетона, разрешение
 направлений, застревание танка в стенах, сбор бонусов, поведение population при входе
 людей, корректность протокола на битых данных.
 
+Полезные команды во время разработки:
+
+```bash
+# профайлинг фаз каждого 60-го тика
+TANCHIKI_PROFILE=1 cargo run --release
+
+# лог в файл
+RUST_LOG=debug cargo run --release 2> server.log
+```
+
 ---
 
-## Лицензия
+## 🩹 Если что-то пошло не так
 
-MIT
+| Симптом | Причина и решение |
+|---------|-------------------|
+| Порт 3000 занят | `TANCHIKI_BIND=0.0.0.0:3001 cargo run` |
+| `cargo: command not found` | Rust не установлен или не в `PATH`: см. <https://rustup.rs> |
+| Игра не обновляется после правки `static/` | статика вшита в бинарник — пересоберите: `cargo build` и перезапустите |
+| Соединение сразу обрывается | проверьте, что открываете `ws://<хост>:3000/ws`, а не `https://` |
+| Низкий FPS в браузере | отключите аппаратное ускорение / уменьшите окно; зум колесом меняет масштаб мира |
+| «too many open files» на Linux | поднимите лимит: `ulimit -n 4096` |
+
+Полная русская версия этой документации лежит в [`README.ru.md`](README.ru.md).
+
+---
+
+## 📄 Лицензия
+
+MIT — см. [LICENSE](LICENSE).
+
+Проект открытый: Issue и Pull Request приветствуются.
+
+</details>
+
+<details name="lang" open>
+<summary><b>🇬🇧 English</b> — <i>click to switch the language to English</i></summary>
+
+## 🚀 Quick start
+
+Only Rust is required. Clone the repository and start the server:
+
+```bash
+git clone https://github.com/KosenkovPro/tanchiki.git
+cd tanchiki
+cargo run
+```
+
+Open <http://localhost:3000> and press **“BATTLE”**. There is no registration: type a
+nickname and you are instantly in the shared world.
+
+The client assets are embedded into the binary with `rust-embed`, so you do **not** need to
+keep the `static/` folder next to the executable — the very same command works in
+development and in a release build.
+
+> **Editing the client.** Files in `static/` are baked in at build time. After changing
+> `static/*.js` or `static/*.css` you must rebuild the server (`cargo build`) and restart
+> it — otherwise the browser keeps receiving the old version embedded in the binary.
+
+### Requirements
+
+| Component | Version |
+|-----------|---------|
+| Rust | 1.85+ (edition 2024) |
+| Node.js | not required |
+| Docker | not required (but a `Dockerfile` and `docker-compose.yml` are included) |
+
+---
+
+## 📦 Prebuilt binaries
+
+The [Releases](https://github.com/KosenkovPro/tanchiki/releases) page publishes Windows and
+Linux (x86_64) builds — download, unpack, run. No Rust, no build step.
+
+| File | Platform | Run |
+|------|----------|-----|
+| `tanchiki-windows-x86_64.exe` | Windows 10/11 x86_64 | `.\tanchiki-windows-x86_64.exe` |
+| `tanchiki-linux-x86_64` | Linux x86_64 (glibc) | `chmod +x tanchiki-linux-x86_64 && ./tanchiki-linux-x86_64` |
+| `SHA256SUMS.txt` | checksums | `sha256sum -c SHA256SUMS.txt` |
+
+Verify the download on Windows:
+
+```powershell
+Get-FileHash .\tanchiki-windows-x86_64.exe -Algorithm SHA256
+```
+
+The server binds `0.0.0.0:3000`, so open <http://localhost:3000> in your browser. To let
+players from the same local network join, find your address (`ipconfig` / `ip addr`) and
+open `http://<your-ip>:3000` on the other device.
+
+---
+
+## 🐳 Running with Docker
+
+```bash
+docker compose up -d --build
+```
+
+Open <http://localhost:3000>. Stop and remove the container:
+
+```bash
+docker compose down
+```
+
+Or manually:
+
+```bash
+docker build -t tanchiki .
+docker run -d --name tanchiki -p 3000:3000 tanchiki
+```
+
+The runtime image is `debian:bookworm-slim` with a single binary inside; `HEALTHCHECK`
+polls `/healthz`, so `docker ps` reflects the real state of the container.
+
+---
+
+## 🎮 Controls
+
+| Key | Action |
+|-----|--------|
+| `W` `A` `S` `D` / arrow keys | movement (4 directions, no diagonals) |
+| `Space` / left mouse button | fire |
+| `Enter` | join the battle / respawn |
+| Mouse wheel | camera zoom (0.55×…1.6×) |
+
+When the tank turns, it is **automatically aligned to the tile grid** — exactly like in
+classic Battle City — so it never gets stuck in narrow passages.
+
+---
+
+## 📖 Game rules
+
+### Tile types
+
+| Tile | Driveable by tanks | By bullets | Notes |
+|------|--------------------|------------|-------|
+| `Empty` (0) | yes | yes | — |
+| `Brick` (1) | no | no | 4 damage stages, destroyed by fire |
+| `Steel` (2) | no | no | only a **level 3** bullet can punch through |
+| `Water` (3) | no | yes | tanks cannot enter, bullets fly over |
+| `Forest` (4) | yes | yes | a tank inside the forest is **invisible** to enemies outside that forest block (until it fires) |
+| `Ice` (5) | yes | yes | slippery: low friction, the tank coasts by inertia |
+
+### Tank levels
+
+| Level | Armor | Bullet damage | Speed | Reload | Bullets at once |
+|-------|-------|--------------|-------|--------|-----------------|
+| 1 | 3 | 1 | 140 | 0.55 s | 1 |
+| 2 | 4 | 2 | 151 | 0.45 s | 2 |
+| 3 | 5 | 3 | 162 | 0.35 s | 3 |
+
+### Pickups
+
+| Pickup | Effect |
+|--------|--------|
+| ★ Star | tank level +1 (max 3), armor fully restored |
+| ● Shield | 8 seconds of invulnerability |
+| ✚ Repair kit | instantly restores armor |
+
+Pickups spawn randomly on free tiles and live for 30 seconds. A destroyed tank drops a star
+with a 35 % chance.
+
+### Scoring
+
+| Event | Points |
+|-------|--------|
+| Tank destroyed | +100 |
+| Pickup collected | +50 |
+| Brick destroyed | +1 |
+| Steel destroyed (by a level 3 bullet) | +2 |
+
+### Bots
+
+If the server has fewer than 15 active players, it maintains the population with AI tanks
+(pathfinding around obstacles + shooting along the line of sight). When real players join,
+the extra bots leave gracefully: they explode and are removed 1.5 seconds later.
+
+---
+
+## ⚙️ Server configuration
+
+Everything is configured through environment variables (see `src/game.rs`,
+`GameConfig::from_env`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TANCHIKI_BIND` | `0.0.0.0:3000` | listening address |
+| `TANCHIKI_TICK_RATE` | `30` | ticks per second (5…120) |
+| `TANCHIKI_MAP_W` | `160` | map width in tiles (32…512) |
+| `TANCHIKI_MAP_H` | `160` | map height in tiles (32…512) |
+| `TANCHIKI_MIN_PLAYERS` | `15` | minimum population (humans + bots) |
+| `TANCHIKI_MAX_BOTS` | `14` | maximum number of bots |
+| `TANCHIKI_SEED` | fixed | map generation seed |
+| `TANCHIKI_PROFILE` | off | `1` — detailed per-tick profiling in the log |
+
+The tile size is a compile-time constant `TILE_SIZE = 32` px (`src/map.rs`): map geometry,
+collisions and the protocol are all built on top of it, so it is deliberately not
+configurable.
+
+Log verbosity is controlled with `RUST_LOG` (`info` by default).
+
+Example:
+
+```bash
+TANCHIKI_BIND=0.0.0.0:8080 TANCHIKI_MAP_W=256 TANCHIKI_MAP_H=256 cargo run --release
+```
+
+PowerShell:
+
+```powershell
+$env:TANCHIKI_BIND = '0.0.0.0:8080'
+$env:TANCHIKI_MAP_W = '256'
+cargo run --release
+```
+
+> **About tick-rate accuracy.** By default Windows rounds every wait to a ~15.6 ms
+> boundary, so a 33 ms timer fired roughly every 46 ms and the game lost a third of its
+> ticks. The server therefore (1) asks the OS for a 1 ms timer resolution and (2) counts
+> ticks from accumulated elapsed time, catching up on missed ticks (up to 5 per wake-up).
+> The effective rate is a steady 30 ticks/second regardless of the OS scheduler.
+
+---
+
+## 🏗 Architecture
+
+```
+src/
+├── main.rs      HTTP + WebSocket server, serves the embedded client assets
+├── protocol.rs  binary protocol: structures, encoding, decoding
+├── map.rs       tile types, damageability, map generation, RLE, chunks
+├── game.rs      game loop: physics, collisions, shooting, bots, loot
+└── network.rs   WebSocket connections, per-player snapshot broadcast
+static/
+├── index.html   canvas and HUD markup
+├── style.css    styling
+├── protocol.js  client-side copy of the binary protocol
+└── game.js      rendering, prediction, interpolation, HUD
+```
+
+### Tick rate and authority
+
+All physics, hit detection and wall destruction are computed **exclusively on the server**
+at a fixed tick rate of **30 TPS** (`tokio::time::interval`). The client only sends input
+state and receives finished world snapshots.
+
+### Interest management (chunks)
+
+The map is `160 × 160` tiles of `32 × 32` px — that is `5120 × 5120` px. It is split into
+chunks of `16 × 16` tiles (`10 × 10` chunks in total).
+
+Each player receives **only the entities from their own chunk and the eight neighbouring
+ones** (a `3 × 3` chunk area ≈ `1536 × 1536` px). A tank hidden in the forest additionally
+disappears from observers that are outside the same forest block.
+
+### Map synchronization
+
+* On join, a player receives the **full map state**, packed with **RLE**: a sequence of
+  `value:u8, len:u16` triples.
+* During the game only **deltas** arrive: `TileUpdate { x, y, tile_type }` for changed tiles
+  inside the visibility area.
+
+### Network safety
+
+* There is **no `unwrap()`/`expect()` in the network code**: a malformed packet is returned
+  to the client as an `ERROR`, a dropped connection removes the player cleanly, and one
+  broken connection never affects the game loop.
+* Protocol decoding checks buffer bounds on every read and never panics.
+* The outgoing queue is bounded: a slow client simply skips a frame instead of stalling
+  the server.
+
+### Client-side smoothing
+
+* **Client-side prediction** for your own tank: the client replays the server physics
+  (acceleration, friction, grid alignment) at a fixed 30 Hz step.
+* **Soft correction:** a divergence smaller than 64 px is smoothed out, a larger one is
+  snapped to the authoritative position.
+* **Linear interpolation** of other tanks and bullets from a buffer of the latest snapshots
+  with a 100 ms delay.
+
+---
+
+## 📦 Binary protocol
+
+Transport is WebSocket, messages are binary frames. All integers are **little-endian**.
+Strings are encoded as `u16 len + utf8 bytes` (the nickname is trimmed to 16 bytes).
+Every message starts with a single type byte.
+
+### Client → server
+
+| Type | Code | Body |
+|------|------|------|
+| `JOIN` | `0x01` | `nickname: string` |
+| `INPUT` | `0x02` | `seq: u32`, `flags: u8` |
+| `RESPAWN` | `0x03` | — |
+| `PING` | `0x04` | `client_time: u64` |
+
+`flags` is a bit mask: `1` up, `2` down, `4` left, `8` right, `16` fire.
+
+### Server → client
+
+| Type | Code | Body |
+|------|------|------|
+| `WELCOME` | `0x11` | `version: u16`, `player_id: u32`, `tick: u64`, map |
+| `SNAPSHOT` | `0x12` | world snapshot (see below) |
+| `LEADERBOARD` | `0x13` | `count: u16`, entries `{ id: u32, name: string, score: u32, is_bot: u8 }` |
+| `DEATH` | `0x14` | `score: u32`, `kills: u32`, `deaths: u32`, `survived_ms: u64` |
+| `RESPAWNED` | `0x15` | `tick: u64`, `x: f32`, `y: f32` |
+| `PONG` | `0x16` | `client_time: u64`, `server_time: u64` |
+| `ERROR` | `0x17` | `code: u16`, `message: string` |
+
+**Map** (inside `WELCOME`): `width: u32`, `height: u32`, `tile_size: u32`,
+`rle_len: u32`, `rle: bytes`.
+
+**`SNAPSHOT`:**
+
+```
+tick: u64
+focus_x: f32, focus_y: f32          // the point the camera should centre on
+players: u16 × { id: u32, name: string, flags: u8, x: f32, y: f32,
+                  dir: u8, level: u8, hp: u8, max_hp: u8, score: u32, kills: u32 }
+bullets: u16 × { id: u32, x: f32, y: f32, dir: u8, level: u8 }
+pickups: u16 × { id: u32, x: f32, y: f32, kind: u8, ttl: u32 }
+tiles:   u16 × { x: u16, y: u16, value: u8 }
+events:  u16 × { kind: u8, ... }     // 0 explosion, 1 tile destroyed, 2 pickup taken,
+                                     // 3 kill, 4 level up
+```
+
+A tile value is packed into a single byte: bits `0..=2` hold the base type, bits `3..=5`
+hold the damage stage (0–3 for brick).
+
+`dir`: `0` up, `1` down, `2` left, `3` right.
+
+---
+
+## 🛡 Fault tolerance
+
+* There is **no `unwrap()`/`expect()` in the network code**: a malformed packet is returned
+  to the client as an `ERROR`, a dropped connection removes the player cleanly, and one
+  broken connection never affects the game loop.
+* Protocol decoding checks buffer bounds on every read and never panics.
+* The outgoing queue is bounded: a slow client simply skips a frame instead of stalling
+  the server.
+* `panic = "abort"` is deliberately **not** enabled in the release profile — a panic in one
+  task must not take down the whole game server.
+
+---
+
+## 🧪 Development and tests
+
+```bash
+cargo check --all-targets   # 0 errors, 0 warnings
+cargo test                  # 22 tests
+cargo build --release
+```
+
+Covered: RLE round-trip, map connectivity, brick and steel damageability, direction
+resolution, tanks getting stuck in walls, pickup collection, population behaviour when
+humans join, and protocol robustness against corrupted input.
+
+Useful commands while developing:
+
+```bash
+# per-phase profiling of every 60th tick
+TANCHIKI_PROFILE=1 cargo run --release
+
+# log to a file
+RUST_LOG=debug cargo run --release 2> server.log
+```
+
+---
+
+## 🩹 Troubleshooting
+
+| Symptom | Cause and fix |
+|---------|---------------|
+| Port 3000 is busy | `TANCHIKI_BIND=0.0.0.0:3001 cargo run` |
+| `cargo: command not found` | Rust is not installed or not in `PATH`: see <https://rustup.rs> |
+| The game does not update after editing `static/` | assets are embedded in the binary — rebuild with `cargo build` and restart |
+| The connection drops immediately | make sure you open `ws://<host>:3000/ws` and not `https://` |
+| Low FPS in the browser | disable hardware acceleration / shrink the window; the mouse wheel changes the world zoom |
+| “too many open files” on Linux | raise the limit: `ulimit -n 4096` |
+
+A standalone Russian copy of this documentation lives in [`README.ru.md`](README.ru.md).
+
+---
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE).
+
+The project is open source: issues and pull requests are welcome.
+
+</details>
