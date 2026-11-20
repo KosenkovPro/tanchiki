@@ -11,7 +11,10 @@
 use std::fmt;
 
 /// Версия протокола. Клиент и сервер обязаны иметь одинаковую.
-pub const PROTOCOL_VERSION: u16 = 1;
+///
+/// * `1` — четыре направления, лидерборд без убийств;
+/// * `2` — восемь направлений (включая диагонали), в лидерборде есть убийства.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Максимальная длина никнейма в байтах UTF-8.
 pub const MAX_NICK_LEN: usize = 16;
@@ -96,6 +99,10 @@ pub type ProtocolResult<T> = Result<T, ProtocolError>;
 // ---------------------------------------------------------------------------
 
 /// Направление движения и стрельбы. Значения совпадают с байтом в протоколе.
+///
+/// Помимо четырёх кардинальных направлений есть четыре диагональных:
+/// движение по диагонали разрешено и выглядит естественно, потому что
+/// спрайт танка симметричен относительно продольной оси.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Direction {
@@ -103,45 +110,60 @@ pub enum Direction {
     Down = 1,
     Left = 2,
     Right = 3,
+    UpLeft = 4,
+    UpRight = 5,
+    DownLeft = 6,
+    DownRight = 7,
 }
 
 impl Direction {
-    /// Все направления в фиксированном порядке.
-    pub const ALL: [Direction; 4] = [
-        Direction::Up,
-        Direction::Down,
-        Direction::Left,
-        Direction::Right,
-    ];
-
     /// Единичный вектор движения.
+    ///
+    /// У диагоналей длина нормализована (`√2/2` по каждой оси), поэтому
+    /// диагональный ход не быстрее кардинального по общей скорости.
     pub fn delta(self) -> (f32, f32) {
+        const S: f32 = 0.707_106_78;
         match self {
             Direction::Up => (0.0, -1.0),
             Direction::Down => (0.0, 1.0),
             Direction::Left => (-1.0, 0.0),
             Direction::Right => (1.0, 0.0),
+            Direction::UpLeft => (-S, -S),
+            Direction::UpRight => (S, -S),
+            Direction::DownLeft => (-S, S),
+            Direction::DownRight => (S, S),
         }
     }
 
-    /// Противоположное направление.
-    pub fn opposite(self) -> Direction {
-        match self {
-            Direction::Up => Direction::Down,
-            Direction::Down => Direction::Up,
-            Direction::Left => Direction::Right,
-            Direction::Right => Direction::Left,
-        }
-    }
-
-    /// `true` для вертикальной оси (вверх/вниз).
+    /// `true` для строго вертикального направления (вверх/вниз).
     pub fn is_vertical(self) -> bool {
         matches!(self, Direction::Up | Direction::Down)
     }
 
-    /// `true`, если направление перпендикулярно `other`.
-    pub fn is_perpendicular(self, other: Direction) -> bool {
-        self.is_vertical() != other.is_vertical()
+    /// `true` для диагональных направлений.
+    pub fn is_diagonal(self) -> bool {
+        matches!(
+            self,
+            Direction::UpLeft | Direction::UpRight | Direction::DownLeft | Direction::DownRight
+        )
+    }
+
+    /// Направление по знакам осей: вертикаль (`-1` вверх, `1` вниз) и
+    /// горизонталь (`-1` влево, `1` вправо).
+    ///
+    /// Обе оси нулевые — направления нет (ввод не задан).
+    pub fn from_axes(v: i8, h: i8) -> Option<Direction> {
+        match (v, h) {
+            (-1, 0) => Some(Direction::Up),
+            (1, 0) => Some(Direction::Down),
+            (0, -1) => Some(Direction::Left),
+            (0, 1) => Some(Direction::Right),
+            (-1, -1) => Some(Direction::UpLeft),
+            (-1, 1) => Some(Direction::UpRight),
+            (1, -1) => Some(Direction::DownLeft),
+            (1, 1) => Some(Direction::DownRight),
+            _ => None,
+        }
     }
 }
 
@@ -171,14 +193,22 @@ impl InputFlags {
         }
     }
 
-    /// Нажата ли клавиша, соответствующая направлению.
-    pub fn pressed(self, dir: Direction) -> bool {
-        match dir {
-            Direction::Up => self.up,
-            Direction::Down => self.down,
-            Direction::Left => self.left,
-            Direction::Right => self.right,
-        }
+    /// Знаки осей ввода: вертикаль (`-1` вверх, `1` вниз) и горизонталь
+    /// (`-1` влево, `1` вправо).
+    ///
+    /// Обе клавиши одной оси одновременно считаются отсутствующим вводом.
+    pub fn axes(self) -> (i8, i8) {
+        let v = match (self.up, self.down) {
+            (true, false) => -1,
+            (false, true) => 1,
+            _ => 0,
+        };
+        let h = match (self.left, self.right) {
+            (true, false) => -1,
+            (false, true) => 1,
+            _ => 0,
+        };
+        (v, h)
     }
 }
 
@@ -265,7 +295,10 @@ impl GameEvent {
 pub struct LeaderboardEntry {
     pub id: u32,
     pub name: String,
+    /// Очки (за убийства, бонусы и разрушенные стены).
     pub score: u32,
+    /// Число уничтоженных танков — именно это показывается в таблице.
+    pub kills: u32,
     pub is_bot: bool,
 }
 
@@ -586,6 +619,7 @@ pub fn encode_leaderboard(entries: &[LeaderboardEntry]) -> Vec<u8> {
         w.u32(e.id);
         w.string(&e.name);
         w.u32(e.score);
+        w.u32(e.kills);
         w.u8(if e.is_bot { 1 } else { 0 });
     }
     w.finish()

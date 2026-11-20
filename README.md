@@ -13,7 +13,7 @@
 | **Server** | Rust 2024 · `tokio` · `axum` + WebSockets · authoritative simulation at **30 TPS** |
 | **Client** | Vanilla JS (ES modules) + Canvas 2D · **no bundler, no runtime dependencies** |
 | **Network** | custom compact **binary protocol** (little-endian) · no JSON, no serializer crates |
-| **Assets** | zero — everything is drawn procedurally on `<canvas>` |
+| **Assets** | graphics drawn procedurally on `<canvas>` · sounds are **CC0** (see “🔊 Sounds”) |
 
 ```
 ┌────────────────┐   WebSocket (binary protocol)   ┌─────────────────────┐
@@ -38,7 +38,7 @@
 | **Сервер** | Rust 2024 · `tokio` · `axum` + WebSockets · авторитарная симуляция **30 TPS** |
 | **Клиент** | Vanilla JS (ES-модули) + Canvas 2D · **без сборщика и внешних зависимостей** |
 | **Сеть** | собственный компактный **бинарный протокол** (little-endian) · без JSON и без сериализаторов |
-| **Ассеты** | отсутствуют — вся графика рисуется процедурно на `<canvas>` |
+| **Ассеты** | графика рисуется процедурно на `<canvas>` · звуки — **CC0** (см. «🔊 Звуки») |
 
 ---
 
@@ -123,13 +123,20 @@ docker run -d --name tanchiki -p 3000:3000 tanchiki
 
 | Клавиша | Действие |
 |---------|----------|
-| `W` `A` `S` `D` / стрелки | движение (4 направления, без диагоналей) |
+| `W` `A` `S` `D` / стрелки | движение — **в том числе по диагонали** (8 направлений) |
 | `Пробел` / ЛКМ | выстрел |
 | `Enter` | начать бой / возродиться |
+| `M` | включить / выключить звук |
 | Колесо мыши | зум камеры (0.55×…1.6×) |
 
+Диагональ получается одновременным нажатием двух клавиш (`W`+`D`, `S`+`A` и т. д.):
+сервер выводит направление из знаков осей, поэтому формат пакета `INPUT` не менялся.
+
 При повороте танк **автоматически выравнивается по сетке тайлов** — как в классическом
-Battle City, поэтому он не застревает в узких проходах.
+Battle City, поэтому он не застревает в узких проходах. Диагональный ход по сетке
+не выравнивается — он свободный.
+
+Камера **не трясётся**: ни при попаданиях, ни при взрывах.
 
 ---
 
@@ -143,16 +150,23 @@ Battle City, поэтому он не застревает в узких про�
 | `Brick` (1) | нет | нет | 4 стадии повреждения, разрушается выстрелами |
 | `Steel` (2) | нет | нет | пробивается только снарядом **3-го уровня** |
 | `Water` (3) | нет | да | танк не проезжает, снаряды летят насквозь |
-| `Forest` (4) | да | да | танк внутри леса **невидим** для врагов снаружи массива (пока не выстрелит) |
+| `Forest` (4) | да | да | танк внутри леса **невидим** для врагов снаружи массива (пока не выстрелит) и **полупрозрачен** — сквозь него видно кусты |
 | `Ice` (5) | да | да | скользко: слабое трение, танк уезжает по инерции |
 
 ### Прокачка
 
-| Уровень | Броня | Урон снаряда | Скорость | Перезарядка | Снарядов одновременно |
-|---------|-------|--------------|----------|------------|------------------------|
-| 1 | 3 | 1 | 140 | 0.55 с | 1 |
-| 2 | 4 | 2 | 151 | 0.45 с | 2 |
-| 3 | 5 | 3 | 162 | 0.35 с | 3 |
+| Уровень | Броня | Урон снаряда | Скорость | Стволов | Перезарядка | Снарядов одновременно |
+|---------|-------|--------------|----------|---------|------------|------------------------|
+| 1 | 3 | 1 | 140 | 1 | **1.65 с** | 3 |
+| 2 | 4 | 2 | 151 | **2** | 1.35 с | 6 |
+| 3 | 5 | 3 | 162 | 2 | 1.05 с | 6 |
+
+Со **второго уровня** у танка появляется **вторая пушка**: стволы разведены
+симметрично относительно продольной оси, поэтому сам спрайт танка остаётся
+симметричным и в любом из 8 направлений.
+
+Перезарядка базового танка **втрое медленнее** прежней (0.55 с → 1.65 с), и с каждой
+собранной звездой танк стреляет всё быстрее: 1.65 с → 1.35 с → 1.05 с.
 
 ### Бонусы
 
@@ -174,10 +188,32 @@ Battle City, поэтому он не застревает в узких про�
 | Разрушенный кирпич | +1 |
 | Разрушенный бетон (снарядом 3-го уровня) | +2 |
 
+### Таблица лидеров
+
+Панель «ТОП-10 · УБИЙСТВА» в правом верхнем углу показывает **число уничтоженных танков**
+главным числом, а очки — вторичным. Сортировка — по убийствам, при равенстве по очкам.
+
+### 🔊 Звуки
+
+Игра озвучена семью короткими эффектами: выстрел, выстрел врага, взрыв, попадание,
+подбор бонуса, повышение уровня и урон. Все файлы — **CC0 1.0 Universal**
+(общественное достояние): их можно свободно использовать в коммерческих проектах
+без оплаты и без указания авторства.
+
+Источник — набор
+[The Essential Retro Video Game Sound Effects Collection](https://opengameart.org/content/512-sound-effects-8-bit-style)
+(Juhani Junkala / SubspaceAudio) с OpenGameArt; подробности и точные имена файлов —
+в [`static/sfx/CREDITS.txt`](static/sfx/CREDITS.txt).
+
+Звук включается при первом клике (браузеры разрешают аудио только после действия
+пользователя) и переключается клавишей `M` или кнопкой «🔊 ЗВУК» в углу экрана.
+
 ### Боты
 
-Если на сервере меньше 15 активных игроков, сервер сам поддерживает population ИИ-танками
-(поиск пути в обход препятствий + стрельба по линии видимости). Когда приходят люди,
+Если на сервере меньше 20 активных игроков, сервер сам поддерживает население ИИ-танками
+(до 24 ботов): поиск пути в обход препятствий, стрельба по линии видимости и **бой друг
+с другом** — целью бота может быть и человек, и другой бот, поэтому на карте идут
+настоящие бои. Если цели нет, бот блуждает по карте. Когда приходят люди,
 лишние боты уходят плавно: исчезают со взрывом и удаляются через 1.5 секунды.
 
 ---
@@ -192,8 +228,8 @@ Battle City, поэтому он не застревает в узких про�
 | `TANCHIKI_TICK_RATE` | `30` | тиков в секунду (5…120) |
 | `TANCHIKI_MAP_W` | `160` | ширина карты в тайлах (32…512) |
 | `TANCHIKI_MAP_H` | `160` | высота карты в тайлах (32…512) |
-| `TANCHIKI_MIN_PLAYERS` | `15` | минимальный размер населения (люди + боты) |
-| `TANCHIKI_MAX_BOTS` | `14` | максимум ботов |
+| `TANCHIKI_MIN_PLAYERS` | `20` | минимальный размер населения (люди + боты) |
+| `TANCHIKI_MAX_BOTS` | `24` | максимум ботов |
 | `TANCHIKI_SEED` | фиксированный | зерно генерации карты |
 | `TANCHIKI_PROFILE` | выкл. | `1` — подробный профайлинг тиков в лог |
 
@@ -237,7 +273,8 @@ static/
 ├── index.html   разметка канваса и HUD
 ├── style.css    оформление
 ├── protocol.js  клиентская копия бинарного протокола
-└── game.js      рендер, предсказание, интерполяция, HUD
+├── game.js      рендер, предсказание, интерполяция, HUD
+└── sfx/         звуковые эффекты (CC0, mp3)
 ```
 
 ### Тикрейт и авторитетность
@@ -305,7 +342,7 @@ static/
 |-----|-----|------|
 | `WELCOME` | `0x11` | `version: u16`, `player_id: u32`, `tick: u64`, карта |
 | `SNAPSHOT` | `0x12` | снимок мира (см. ниже) |
-| `LEADERBOARD` | `0x13` | `count: u16`, записи `{ id: u32, name: string, score: u32, is_bot: u8 }` |
+| `LEADERBOARD` | `0x13` | `count: u16`, записи `{ id: u32, name: string, score: u32, kills: u32, is_bot: u8 }` |
 | `DEATH` | `0x14` | `score: u32`, `kills: u32`, `deaths: u32`, `survived_ms: u64` |
 | `RESPAWNED` | `0x15` | `tick: u64`, `x: f32`, `y: f32` |
 | `PONG` | `0x16` | `client_time: u64`, `server_time: u64` |
@@ -331,7 +368,10 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 Значение тайла упаковано в один байт: биты `0..=2` — базовый тип, биты `3..=5` — стадия
 повреждения (0–3 для кирпича).
 
-`dir`: `0` вверх, `1` вниз, `2` влево, `3` вправо.
+`dir`: `0` вверх, `1` вниз, `2` влево, `3` вправо, `4` вверх-влево, `5` вверх-вправо,
+`6` вниз-влево, `7` вниз-вправо.
+
+Версия протокола — **2** (в первой было 4 направления, а в лидерборде не было убийств).
 
 ---
 
@@ -352,13 +392,14 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 
 ```bash
 cargo check --all-targets   # 0 ошибок, 0 предупреждений
-cargo test                  # 22 теста
+cargo test                  # 25 тестов
 cargo build --release
 ```
 
 Покрыты: RLE round-trip, связность карты, разрушаемость кирпича и бетона, разрешение
-направлений, застревание танка в стенах, сбор бонусов, поведение population при входе
-людей, корректность протокола на битых данных.
+направлений, движение по диагонали, темп стрельбы по перезарядке, застревание танка
+в стенах, сбор бонусов, поведение population при входе людей, корректность протокола
+на битых данных.
 
 Полезные команды во время разработки:
 
@@ -480,13 +521,20 @@ polls `/healthz`, so `docker ps` reflects the real state of the container.
 
 | Key | Action |
 |-----|--------|
-| `W` `A` `S` `D` / arrow keys | movement (4 directions, no diagonals) |
+| `W` `A` `S` `D` / arrow keys | movement — **including diagonals** (8 directions) |
 | `Space` / left mouse button | fire |
 | `Enter` | join the battle / respawn |
+| `M` | toggle sound on / off |
 | Mouse wheel | camera zoom (0.55×…1.6×) |
 
+A diagonal move is just two keys at once (`W`+`D`, `S`+`A`, …): the server derives the
+direction from the axis signs, so the `INPUT` packet format did not change.
+
 When the tank turns, it is **automatically aligned to the tile grid** — exactly like in
-classic Battle City — so it never gets stuck in narrow passages.
+classic Battle City — so it never gets stuck in narrow passages. A diagonal step is not
+snapped to the grid; it stays free.
+
+The camera **never shakes**: not on hits, not on explosions.
 
 ---
 
@@ -500,16 +548,23 @@ classic Battle City — so it never gets stuck in narrow passages.
 | `Brick` (1) | no | no | 4 damage stages, destroyed by fire |
 | `Steel` (2) | no | no | only a **level 3** bullet can punch through |
 | `Water` (3) | no | yes | tanks cannot enter, bullets fly over |
-| `Forest` (4) | yes | yes | a tank inside the forest is **invisible** to enemies outside that forest block (until it fires) |
+| `Forest` (4) | yes | yes | a tank inside the forest is **invisible** to enemies outside that forest block (until it fires) and **semi-transparent** — the bushes show through it |
 | `Ice` (5) | yes | yes | slippery: low friction, the tank coasts by inertia |
 
 ### Tank levels
 
-| Level | Armor | Bullet damage | Speed | Reload | Bullets at once |
-|-------|-------|--------------|-------|--------|-----------------|
-| 1 | 3 | 1 | 140 | 0.55 s | 1 |
-| 2 | 4 | 2 | 151 | 0.45 s | 2 |
-| 3 | 5 | 3 | 162 | 0.35 s | 3 |
+| Level | Armor | Bullet damage | Speed | Guns | Reload | Bullets at once |
+|-------|-------|--------------|-------|------|--------|-----------------|
+| 1 | 3 | 1 | 140 | 1 | **1.65 s** | 3 |
+| 2 | 4 | 2 | 151 | **2** | 1.35 s | 6 |
+| 3 | 5 | 3 | 162 | 2 | 1.05 s | 6 |
+
+From **level 2** the tank gets a **second gun**: the barrels are spread symmetrically
+around the longitudinal axis, so the tank sprite itself stays symmetric in all 8
+directions.
+
+The base tank reloads **three times slower** than before (0.55 s → 1.65 s), and every
+collected star makes it shoot faster: 1.65 s → 1.35 s → 1.05 s.
 
 ### Pickups
 
@@ -531,11 +586,31 @@ with a 35 % chance.
 | Brick destroyed | +1 |
 | Steel destroyed (by a level 3 bullet) | +2 |
 
+### Leaderboard
+
+The “TOP-10 · KILLS” panel in the top-right corner shows the **number of destroyed tanks**
+as the main number, with points as the secondary value. The order is by kills, then by points.
+
+### 🔊 Sounds
+
+The game is voiced with seven short effects: shot, enemy shot, explosion, hit, pickup,
+level up and damage. Every file is **CC0 1.0 Universal** (public domain): they can be used
+in commercial projects for free — no payment and no attribution required.
+
+Source — [The Essential Retro Video Game Sound Effects Collection](https://opengameart.org/content/512-sound-effects-8-bit-style)
+(Juhani Junkala / SubspaceAudio) on OpenGameArt; details and the exact file names are in
+[`static/sfx/CREDITS.txt`](static/sfx/CREDITS.txt).
+
+Audio starts on the first click (browsers only allow sound after a user gesture) and can be
+toggled with the `M` key or the “🔊 SOUND” button in the corner of the screen.
+
 ### Bots
 
-If the server has fewer than 15 active players, it maintains the population with AI tanks
-(pathfinding around obstacles + shooting along the line of sight). When real players join,
-the extra bots leave gracefully: they explode and are removed 1.5 seconds later.
+If the server has fewer than 20 active players, it maintains the population with AI tanks
+(up to 24 bots): pathfinding around obstacles, shooting along the line of sight and
+**fighting each other** — a bot may target a human or another bot, so real battles happen
+all over the map. With no target around, a bot wanders around the map. When real players
+join, the extra bots leave gracefully: they explode and are removed 1.5 seconds later.
 
 ---
 
@@ -550,8 +625,8 @@ Everything is configured through environment variables (see `src/game.rs`,
 | `TANCHIKI_TICK_RATE` | `30` | ticks per second (5…120) |
 | `TANCHIKI_MAP_W` | `160` | map width in tiles (32…512) |
 | `TANCHIKI_MAP_H` | `160` | map height in tiles (32…512) |
-| `TANCHIKI_MIN_PLAYERS` | `15` | minimum population (humans + bots) |
-| `TANCHIKI_MAX_BOTS` | `14` | maximum number of bots |
+| `TANCHIKI_MIN_PLAYERS` | `20` | minimum population (humans + bots) |
+| `TANCHIKI_MAX_BOTS` | `24` | maximum number of bots |
 | `TANCHIKI_SEED` | fixed | map generation seed |
 | `TANCHIKI_PROFILE` | off | `1` — detailed per-tick profiling in the log |
 
@@ -596,7 +671,8 @@ static/
 ├── index.html   canvas and HUD markup
 ├── style.css    styling
 ├── protocol.js  client-side copy of the binary protocol
-└── game.js      rendering, prediction, interpolation, HUD
+├── game.js      rendering, prediction, interpolation, HUD
+└── sfx/         sound effects (CC0, mp3)
 ```
 
 ### Tick rate and authority
@@ -664,7 +740,7 @@ Every message starts with a single type byte.
 |------|------|------|
 | `WELCOME` | `0x11` | `version: u16`, `player_id: u32`, `tick: u64`, map |
 | `SNAPSHOT` | `0x12` | world snapshot (see below) |
-| `LEADERBOARD` | `0x13` | `count: u16`, entries `{ id: u32, name: string, score: u32, is_bot: u8 }` |
+| `LEADERBOARD` | `0x13` | `count: u16`, entries `{ id: u32, name: string, score: u32, kills: u32, is_bot: u8 }` |
 | `DEATH` | `0x14` | `score: u32`, `kills: u32`, `deaths: u32`, `survived_ms: u64` |
 | `RESPAWNED` | `0x15` | `tick: u64`, `x: f32`, `y: f32` |
 | `PONG` | `0x16` | `client_time: u64`, `server_time: u64` |
@@ -690,7 +766,10 @@ events:  u16 × { kind: u8, ... }     // 0 explosion, 1 tile destroyed, 2 pickup
 A tile value is packed into a single byte: bits `0..=2` hold the base type, bits `3..=5`
 hold the damage stage (0–3 for brick).
 
-`dir`: `0` up, `1` down, `2` left, `3` right.
+`dir`: `0` up, `1` down, `2` left, `3` right, `4` up-left, `5` up-right, `6` down-left,
+`7` down-right.
+
+The protocol version is **2** (version 1 had 4 directions and a leaderboard without kills).
 
 ---
 
@@ -711,13 +790,14 @@ hold the damage stage (0–3 for brick).
 
 ```bash
 cargo check --all-targets   # 0 errors, 0 warnings
-cargo test                  # 22 tests
+cargo test                  # 25 tests
 cargo build --release
 ```
 
 Covered: RLE round-trip, map connectivity, brick and steel damageability, direction
-resolution, tanks getting stuck in walls, pickup collection, population behaviour when
-humans join, and protocol robustness against corrupted input.
+resolution, diagonal movement, the fire cadence following the reload timer, tanks getting
+stuck in walls, pickup collection, population behaviour when humans join, and protocol
+robustness against corrupted input.
 
 Useful commands while developing:
 

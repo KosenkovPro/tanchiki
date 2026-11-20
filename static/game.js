@@ -34,8 +34,27 @@ const TICK_DT = 1 / 30;
 const INTERP_DELAY = 100; // мс задержки для интерполяции чужих объектов
 const SNAP_HISTORY = 24;
 
-/** Угол поворота для каждого направления (радианы). */
-const ROT = [0, Math.PI, -Math.PI / 2, Math.PI / 2];
+/** Угол поворота спрайта для каждого направления (радианы). */
+const ROT = [
+  0,
+  Math.PI,
+  -Math.PI / 2,
+  Math.PI / 2,
+  -Math.PI / 4,
+  Math.PI / 4,
+  (-3 * Math.PI) / 4,
+  (3 * Math.PI) / 4,
+];
+
+/** Вектор направления для каждого направления (нормализованный). */
+const S = Math.SQRT1_2;
+const DIR_DX = [0, 0, -1, 1, -S, S, -S, S];
+const DIR_DY = [-1, 1, 0, 0, -S, -S, S, S];
+
+/** Перезарядка по уровню (в секундах) — зеркалит `level_fire_cooldown`. */
+function fireCooldown(level) {
+  return 1.65 - 0.3 * Math.max(0, level - 1);
+}
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -62,6 +81,7 @@ const statScore = document.getElementById('stat-score');
 const statKills = document.getElementById('stat-kills');
 const statPing = document.getElementById('stat-ping');
 const statFps = document.getElementById('stat-fps');
+const soundButton = document.getElementById('sound-toggle');
 
 // ---------------------------------------------------------------------------
 // Состояние
@@ -94,27 +114,111 @@ const pred = {
   x: 0,
   y: 0,
   dir: DIR.DOWN,
+  /** Направление движения: скорость направлена вдоль него. */
+  moveDir: DIR.DOWN,
   vel: 0,
   level: 1,
   hp: 3,
   maxHp: 3,
   shielded: false,
+  /** Остаток перезарядки — по нему клиент играет звук выстрела. */
+  cooldown: 0,
 };
 
 /** Визуальное смещение, которое плавно гасится после серверной коррекции. */
 const correction = { x: 0, y: 0 };
 
-const camera = { x: 0, y: 0, zoom: 1, shake: 0 };
+const camera = { x: 0, y: 0, zoom: 1 };
 
 const keys = new Set();
 let mouseDown = false;
-let prevInputBits = 0;
 let inputAccumulator = 0;
 
 const particles = [];
 let terrainCanvas = null;
 let terrainCtx = null;
 let sprites = null;
+
+// ---------------------------------------------------------------------------
+// Звук
+// ---------------------------------------------------------------------------
+
+/**
+ * Простой звуковой движок на Web Audio API.
+ *
+ * Все файлы — CC0 (см. `static/sfx/CREDITS.txt`): можно использовать
+ * в коммерческой игре без указания авторства и без оплаты.
+ */
+const audio = {
+  ctx: null,
+  master: null,
+  buffers: new Map(),
+  enabled: true,
+  loading: false,
+};
+
+const SFX_NAMES = ['shot', 'shot_foe', 'explosion', 'hit', 'pickup', 'powerup', 'damage'];
+
+/** Загружает и декодирует звуки. Вызывается по первому действию игрока. */
+async function initAudio() {
+  if (audio.ctx || audio.loading) return;
+  audio.loading = true;
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) {
+    audio.loading = false;
+    return;
+  }
+  try {
+    audio.ctx = new Ctx();
+    audio.master = audio.ctx.createGain();
+    audio.master.gain.value = 0.9;
+    audio.master.connect(audio.ctx.destination);
+    await Promise.all(
+      SFX_NAMES.map(async (name) => {
+        try {
+          const res = await fetch(`/sfx/${name}.mp3`);
+          if (!res.ok) return;
+          const raw = await res.arrayBuffer();
+          audio.buffers.set(name, await audio.ctx.decodeAudioData(raw));
+        } catch (err) {
+          console.warn('не удалось загрузить звук:', name, err);
+        }
+      }),
+    );
+  } catch (err) {
+    console.warn('звук недоступен:', err);
+  }
+  audio.loading = false;
+  updateSoundButton();
+}
+
+/** Проигрывает звук с заданной громкостью (0..1) и скоростью. */
+function playSound(name, volume = 1, rate = 1) {
+  if (!audio.enabled || !audio.ctx) return;
+  const buf = audio.buffers.get(name);
+  if (!buf) return;
+  if (audio.ctx.state === 'suspended') audio.ctx.resume();
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = rate;
+  const gain = audio.ctx.createGain();
+  gain.gain.value = volume;
+  src.connect(gain);
+  gain.connect(audio.master);
+  src.start();
+}
+
+function toggleSound() {
+  audio.enabled = !audio.enabled;
+  if (audio.enabled && audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+  updateSoundButton();
+}
+
+function updateSoundButton() {
+  if (!soundButton) return;
+  soundButton.textContent = audio.enabled ? '🔊 ЗВУК' : '🔇 ЗВУК ВЫКЛ';
+  soundButton.classList.toggle('off', !audio.enabled);
+}
 
 // ---------------------------------------------------------------------------
 // Подключение
@@ -248,6 +352,20 @@ function applySnapshot(msg) {
   });
   if (state.snapshots.length > SNAP_HISTORY) state.snapshots.shift();
 
+  // Выстрел противника рядом с нами — короткий щелчок.
+  const prevSnap = state.snapshots.length >= 2 ? state.snapshots[state.snapshots.length - 2] : null;
+  if (prevSnap && pred.active) {
+    const pcx = pred.x + TANK_SIZE / 2;
+    const pcy = pred.y + TANK_SIZE / 2;
+    for (const b of msg.bullets) {
+      if (prevSnap.bullets.has(b.id)) continue;
+      if (Math.hypot(b.x - pcx, b.y - pcy) < 260) {
+        playSound('shot_foe', 0.22, 0.92 + Math.random() * 0.16);
+        break;
+      }
+    }
+  }
+
   // Обновляем карту дельтами.
   if (msg.tiles.length && state.map) {
     for (const t of msg.tiles) {
@@ -262,11 +380,21 @@ function applySnapshot(msg) {
   for (const ev of msg.events) {
     if (ev.kind === 'explosion') {
       spawnExplosion(ev.x, ev.y, ev.size);
-      if (Math.hypot(ev.x - camera.x, ev.y - camera.y) < 420) camera.shake = Math.min(9, camera.shake + ev.size * 1.6);
+      // Громкость взрыва зависит от расстояния до камеры.
+      const dist = Math.hypot(ev.x - camera.x, ev.y - camera.y);
+      if (dist < 700) playSound('explosion', 0.6 * (1 - dist / 700));
     } else if (ev.kind === 'tileBroken') {
       spawnDebris(ev.x * state.map.tileSize + 16, ev.y * state.map.tileSize + 16);
+      const dist = Math.hypot(
+        ev.x * state.map.tileSize + 16 - camera.x,
+        ev.y * state.map.tileSize + 16 - camera.y,
+      );
+      if (dist < 420) playSound('hit', 0.3 * (1 - dist / 420));
     } else if (ev.kind === 'pickup') {
       spawnSparkle(ev.x, ev.y);
+      playSound('pickup', 0.55);
+    } else if (ev.kind === 'levelUp') {
+      if (ev.id === state.myId) playSound('powerup', 0.75);
     }
   }
 
@@ -276,9 +404,11 @@ function applySnapshot(msg) {
     state.score = mine.score;
     state.kills = mine.kills;
     pred.level = mine.level;
+    const hpBefore = pred.hp;
     pred.hp = mine.hp;
     pred.maxHp = mine.maxHp;
     pred.shielded = mine.shielded;
+    if (mine.hp < hpBefore) playSound('damage', 0.7);
 
     if (!pred.active) {
       // Первый раз сервер показал наш танк — синхронизируем предсказание.
@@ -326,44 +456,48 @@ function currentInput() {
   return bits;
 }
 
-function pressedIn(bits, dir) {
-  switch (dir) {
-    case DIR.UP:
-      return (bits & BIT.UP) !== 0;
-    case DIR.DOWN:
-      return (bits & BIT.DOWN) !== 0;
-    case DIR.LEFT:
-      return (bits & BIT.LEFT) !== 0;
-    default:
-      return (bits & BIT.RIGHT) !== 0;
-  }
+/**
+ * Знаки осей ввода: вертикаль (-1 вверх, 1 вниз) и горизонталь
+ * (-1 влево, 1 вправо). Нажатие двух осей сразу даёт диагональ.
+ */
+function inputAxes() {
+  const v =
+    (keys.has('KeyW') || keys.has('ArrowUp') ? -1 : 0) +
+    (keys.has('KeyS') || keys.has('ArrowDown') ? 1 : 0);
+  const h =
+    (keys.has('KeyA') || keys.has('ArrowLeft') ? -1 : 0) +
+    (keys.has('KeyD') || keys.has('ArrowRight') ? 1 : 0);
+  return [v, h];
 }
 
-function isPerpendicular(a, b) {
-  const vertical = (d) => d === DIR.UP || d === DIR.DOWN;
-  return vertical(a) !== vertical(b);
+/** Направление по знакам осей — тот же алгоритм, что на сервере. */
+function directionFromAxes(v, h) {
+  if (v === 0 && h === 0) return null;
+  if (v < 0 && h === 0) return DIR.UP;
+  if (v > 0 && h === 0) return DIR.DOWN;
+  if (v === 0 && h < 0) return DIR.LEFT;
+  if (v === 0 && h > 0) return DIR.RIGHT;
+  if (v < 0 && h < 0) return DIR.UP_LEFT;
+  if (v < 0 && h > 0) return DIR.UP_RIGHT;
+  if (v > 0 && h < 0) return DIR.DOWN_LEFT;
+  return DIR.DOWN_RIGHT;
 }
 
-/** Тот же алгоритм разрешения направления, что на сервере. */
-function resolveDirection(current, input, prev) {
-  const candidates = [];
-  if (input & BIT.UP) candidates.push(DIR.UP);
-  if (input & BIT.DOWN) candidates.push(DIR.DOWN);
-  if (input & BIT.LEFT) candidates.push(DIR.LEFT);
-  if (input & BIT.RIGHT) candidates.push(DIR.RIGHT);
-  if (candidates.length === 0) return current;
-  if (candidates.length === 1) return candidates[0];
-
-  const newly = candidates.filter((d) => !pressedIn(prev, d));
-  if (newly.length === 1) return newly[0];
-  const perp = newly.find((d) => isPerpendicular(d, current)) ?? candidates.find((d) => isPerpendicular(d, current));
-  return perp ?? current;
+function isDiagonal(dir) {
+  return dir >= DIR.UP_LEFT;
 }
 
 window.addEventListener('keydown', (e) => {
   if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+  if (e.code === 'KeyM') {
+    e.preventDefault();
+    initAudio();
+    toggleSound();
+    return;
+  }
   if (e.code === 'Enter' && !overlayEl.classList.contains('hidden')) {
     e.preventDefault();
+    initAudio();
     if (state.joined) doRespawn();
     else doJoin();
     return;
@@ -373,6 +507,13 @@ window.addEventListener('keydown', (e) => {
 
 window.addEventListener('keyup', (e) => keys.delete(e.code));
 window.addEventListener('blur', () => keys.clear());
+
+if (soundButton) {
+  soundButton.addEventListener('click', () => {
+    initAudio();
+    toggleSound();
+  });
+}
 
 canvas.addEventListener('mousedown', (e) => {
   if (e.button === 0) mouseDown = true;
@@ -422,11 +563,11 @@ function isOnIce(x, y) {
   return (m.tiles[ty * m.width + tx] & 7) === TILE.ICE;
 }
 
-function alignToGrid() {
+function alignToGrid(dir) {
   const m = state.map;
   if (!m) return;
   const ts = m.tileSize;
-  const vertical = pred.dir === DIR.UP || pred.dir === DIR.DOWN;
+  const vertical = dir === DIR.UP || dir === DIR.DOWN;
   const axisVal = vertical ? pred.x : pred.y;
   const base = Math.round(axisVal / ts);
   for (const delta of [0, -1, 1, -2, 2]) {
@@ -444,8 +585,8 @@ function alignToGrid() {
 }
 
 function movePredicted(dist) {
-  const dx = [0, 0, -1, 1][pred.dir];
-  const dy = [-1, 1, 0, 0][pred.dir];
+  const dx = DIR_DX[pred.moveDir];
+  const dy = DIR_DY[pred.moveDir];
   const steps = Math.max(1, Math.ceil(Math.abs(dist)));
   const step = dist / steps;
   for (let i = 0; i < steps; i++) {
@@ -463,50 +604,45 @@ function movePredicted(dist) {
 function stepPrediction(dt) {
   if (!pred.active || state.dead) return;
   const input = currentInput();
-  const desired = resolveDirection(pred.dir, input, prevInputBits);
-  const turned = desired !== pred.dir;
+  const [av, ah] = inputAxes();
+  const desired = directionFromAxes(av, ah);
+  const turned = desired !== null && desired !== pred.moveDir;
 
   const onIce = isOnIce(pred.x, pred.y);
   const speed = BASE_SPEED * (1 + 0.08 * (pred.level - 1));
   const accel = onIce ? 220 : 1100;
   const decel = onIce ? 120 : 1800;
 
-  let target = 0;
-  if (pressedIn(input, desired)) target = speed;
-  else if (pressedIn(input, opposite(desired))) target = -speed * 0.6;
-
+  const target = desired !== null ? speed : 0;
   const baseVel = turned ? 0 : pred.vel;
   const delta = target - baseVel;
   const rate = delta > 0 ? accel : decel;
   const maxStep = rate * dt;
   let vel = baseVel + Math.max(-maxStep, Math.min(maxStep, delta));
-  if (Math.abs(vel) < 1) vel = 0;
+  if (vel < 1) vel = 0;
 
   if (turned) {
-    pred.dir = desired;
+    // Выравнивание по сетке — только между кардинальными направлениями.
+    const wasCardinal = !isDiagonal(pred.moveDir);
+    const nowCardinal = !isDiagonal(desired);
+    pred.moveDir = desired;
     pred.vel = 0;
-    alignToGrid();
-  } else {
-    pred.dir = desired;
+    if (nowCardinal && wasCardinal) alignToGrid(desired);
+  } else if (desired !== null) {
+    pred.moveDir = desired;
   }
+
+  pred.dir = desired !== null ? desired : pred.dir;
   pred.vel = vel;
 
   const dist = vel * dt;
-  if (Math.abs(dist) > 0.001) movePredicted(dist);
+  if (dist > 0.001) movePredicted(dist);
 
-  prevInputBits = input;
-}
-
-function opposite(dir) {
-  switch (dir) {
-    case DIR.UP:
-      return DIR.DOWN;
-    case DIR.DOWN:
-      return DIR.UP;
-    case DIR.LEFT:
-      return DIR.RIGHT;
-    default:
-      return DIR.LEFT;
+  // Перезарядка: по ней клиент понимает, когда прозвучит выстрел.
+  pred.cooldown = Math.max(0, pred.cooldown - dt);
+  if ((input & BIT.FIRE) !== 0 && pred.cooldown <= 0) {
+    playSound('shot', 0.5);
+    pred.cooldown = fireCooldown(pred.level);
   }
 }
 
@@ -540,6 +676,7 @@ function hideOverlay() {
 function doJoin() {
   const name = nicknameInput.value.trim();
   if (!state.connected) return;
+  initAudio();
   playButton.disabled = true;
   state.joined = true;
   localStorage.setItem('tanchiki.nick', name);
@@ -549,6 +686,7 @@ function doJoin() {
 
 function doRespawn() {
   if (!state.connected) return;
+  initAudio();
   respawnButton.disabled = true;
   send(encodeRespawn());
   hideOverlay();
@@ -823,8 +961,8 @@ function drawBullets(bullets) {
   for (const b of bullets.values()) {
     const x = worldToScreenX(b.x);
     const y = worldToScreenY(b.y);
-    const dx = [0, 0, -1, 1][b.dir];
-    const dy = [-1, 1, 0, 0][b.dir];
+    const dx = DIR_DX[b.dir] ?? 0;
+    const dy = DIR_DY[b.dir] ?? 0;
     const size = 6 * camera.zoom;
 
     // След снаряда.
@@ -842,13 +980,26 @@ function drawBullets(bullets) {
   }
 }
 
+/** Находится ли точка внутри леса (тайлы кустов). */
+function isInForest(x, y) {
+  const m = state.map;
+  if (!m) return false;
+  const tx = Math.floor((x + TANK_SIZE / 2) / m.tileSize);
+  const ty = Math.floor((y + TANK_SIZE / 2) / m.tileSize);
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
+  return (m.tiles[ty * m.width + tx] & 7) === TILE.FOREST;
+}
+
 function drawTank(p, opts = {}) {
   const size = TANK_SIZE * camera.zoom;
   const x = worldToScreenX(p.x);
   const y = worldToScreenY(p.y);
   const hue = opts.hue ?? 40;
+  const level = p.level ?? 1;
 
   ctx.save();
+  // В чаще танк частично маскируется — становится полупрозрачным.
+  ctx.globalAlpha = isInForest(p.x, p.y) ? (opts.self ? 0.62 : 0.45) : 1;
   ctx.translate(x + size / 2, y + size / 2);
   ctx.rotate(ROT[p.dir] ?? 0);
 
@@ -872,15 +1023,22 @@ function drawTank(p, opts = {}) {
   ctx.fillStyle = `hsl(${hue}, 62%, 52%)`;
   ctx.fillRect(-half + trackW, -half + size * 0.14, size - trackW * 2, size * 0.16);
 
-  // Ствол.
+  // Стволы: на втором уровне появляется вторая пушка.
+  // Обе симметричны относительно продольной оси танка.
   ctx.fillStyle = `hsl(${hue}, 45%, 26%)`;
-  ctx.fillRect(-size * 0.1, -half, size * 0.2, size * 0.34);
+  if (level >= 2) {
+    ctx.fillRect(-size * 0.313, -half, size * 0.16, size * 0.34);
+    ctx.fillRect(size * 0.153, -half, size * 0.16, size * 0.34);
+  } else {
+    ctx.fillRect(-size * 0.1, -half, size * 0.2, size * 0.34);
+  }
 
   // Башня.
   ctx.fillStyle = `hsl(${hue}, 66%, 56%)`;
   ctx.fillRect(-size * 0.18, -half + size * 0.24, size * 0.36, size * 0.34);
 
   ctx.restore();
+  ctx.globalAlpha = 1;
 
   // Уровень прокачки — звёздочки на башне.
   if (p.level > 1) {
@@ -958,13 +1116,6 @@ function renderWorld(now) {
   ctx.fillStyle = '#0a0e13';
   ctx.fillRect(0, 0, w, h);
 
-  const shakeX = camera.shake > 0 ? (Math.random() - 0.5) * camera.shake : 0;
-  const shakeY = camera.shake > 0 ? (Math.random() - 0.5) * camera.shake : 0;
-  const savedX = camera.x;
-  const savedY = camera.y;
-  camera.x += shakeX;
-  camera.y += shakeY;
-
   drawTiles(now);
 
   const renderTime = performance.now() - INTERP_DELAY;
@@ -1010,9 +1161,6 @@ function renderWorld(now) {
   }
 
   drawParticles();
-
-  camera.x = savedX;
-  camera.y = savedY;
 }
 
 /** Стабильный цвет танка по id. */
@@ -1045,10 +1193,14 @@ function renderLeaderboard() {
     const who = document.createElement('span');
     who.className = e.isBot ? 'who bot' : 'who';
     who.textContent = e.name || '—';
+    // Главное число — число уничтоженных танков.
+    const kills = document.createElement('span');
+    kills.className = 'kills';
+    kills.textContent = String(e.kills ?? 0);
     const pts = document.createElement('span');
     pts.className = 'pts';
-    pts.textContent = String(e.score);
-    li.append(who, pts);
+    pts.textContent = `${e.score}`;
+    li.append(who, kills, pts);
     leaderboardEl.append(li);
   }
 }
@@ -1115,7 +1267,6 @@ function frame(now) {
   const follow = Math.min(1, dt * 9);
   camera.x += (targetX - camera.x) * follow;
   camera.y += (targetY - camera.y) * follow;
-  camera.shake = Math.max(0, camera.shake - dt * 22);
 
   // Коррекция плавно гасится.
   correction.x *= Math.pow(0.0025, dt);

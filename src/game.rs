@@ -61,7 +61,7 @@ pub const PICKUP_SCORE: u32 = 50;
 pub const BRICK_SCORE: u32 = 1;
 
 /// Имена ботов.
-pub const BOT_NAMES: [&str; 15] = [
+pub const BOT_NAMES: [&str; 24] = [
     "Ильза",
     "Барсик",
     "Тигр",
@@ -77,6 +77,15 @@ pub const BOT_NAMES: [&str; 15] = [
     "Дракон",
     "Рысь",
     "Комета",
+    "Метеор",
+    "Барс",
+    "Грифон",
+    "Змей",
+    "Орел",
+    "Самурай",
+    "Скорпион",
+    "Ураган",
+    "Ястреб",
 ];
 
 /// Скорость танка для уровня прокачки.
@@ -94,14 +103,34 @@ pub fn level_bullet_damage(level: u8) -> u8 {
     level.clamp(1, 3)
 }
 
-/// Задержка между выстрелами для уровня прокачки.
+/// Задержка между выстрелами для уровня прокачки, в секундах.
+///
+/// Базовый танк стреляет заметно медленнее, чем раньше (1.65 с против
+/// 0.55 с), но с каждой собранной звездой перезарядка сокращается.
 pub fn level_fire_cooldown(level: u8) -> f32 {
-    0.55 - 0.10 * level.saturating_sub(1) as f32
+    1.65 - 0.30 * level.saturating_sub(1) as f32
 }
 
+/// Сколько стволов у танка: на втором уровне появляется вторая пушка.
+pub fn level_guns(level: u8) -> usize {
+    if level >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
+/// Расстояние между стволами двойной пушки (в пикселях).
+pub const GUN_OFFSET: f32 = 7.0;
+
 /// Сколько снарядов может лететь одновременно.
+///
+/// Предел не должен быть жёстче перезарядки: время жизни снаряда (до
+/// попадания в стену) местами больше когорты, и тогда темп стрельбы
+/// задавался бы не перезарядкой, а этим ограничением. Поэтому в полёте
+/// всегда держится запас снарядов — темп задаёт `level_fire_cooldown`.
 pub fn level_max_bullets(level: u8) -> usize {
-    level.clamp(1, 3) as usize
+    level_guns(level) * 3
 }
 
 /// Максимальное здоровье для уровня прокачки.
@@ -141,8 +170,8 @@ impl Default for GameConfig {
             map_w: MAP_W,
             map_h: MAP_H,
             tile_size: TILE_SIZE,
-            min_population: 15,
-            max_bots: 14,
+            min_population: 20,
+            max_bots: 24,
             seed: 0x7A4C_1E55_D1CE_2026,
             profile: false,
         }
@@ -213,9 +242,14 @@ pub struct Tank {
     /// Левый верхний угол хитбокса в пикселях мира.
     pub x: f32,
     pub y: f32,
-    /// Направление движения и ствола.
+    /// Направление, в которую «смотрит» танк: по нему наводятся стволы.
+    ///
+    /// У человека совпадает с направлением движения, у бота — с направлением
+    /// на цель (бот может идти прямо и стрелять по диагонали).
     pub dir: Direction,
-    /// Скорость вдоль текущей оси (со знаком).
+    /// Направление движения: скорость направлена вдоль него.
+    pub move_dir: Direction,
+    /// Скорость вдоль текущего направления движения.
     pub vel: f32,
     /// Уровень прокачки 1..=3.
     pub level: u8,
@@ -243,6 +277,7 @@ impl Tank {
             x,
             y,
             dir: Direction::Down,
+            move_dir: Direction::Down,
             vel: 0.0,
             level,
             hp: max_hp,
@@ -316,6 +351,8 @@ pub struct BotState {
     pub next_plan_tick: u64,
     /// Текущая цель (id игрока).
     pub target: Option<u32>,
+    /// Направление наводки: бот может идти прямо и стрелять по диагонали.
+    pub aim: Option<Direction>,
 }
 
 /// Игрок: человек или бот.
@@ -333,8 +370,6 @@ pub struct Player {
     pub deaths: u32,
     /// Текущий ввод.
     pub input: InputFlags,
-    /// Предыдущий ввод (нужен для разрешения диагоналей).
-    pub prev_input: InputFlags,
     /// Порядковый номер последнего пакета ввода.
     pub last_seq: u32,
     /// Канал отправки в клиент.
@@ -486,24 +521,22 @@ impl Game {
     }
 
     fn update_player_movement(&mut self, pid: u32) {
-        let (input, prev, cur_dir, level, vel) = {
+        let (input, cur_move, level, vel, aim) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
             let Some(tank) = player.tank.as_ref() else {
                 return;
             };
-            (
-                player.input,
-                player.prev_input,
-                tank.dir,
-                tank.level,
-                tank.vel,
-            )
+            let aim = player.bot.as_ref().and_then(|b| b.aim);
+            (player.input, tank.move_dir, tank.level, tank.vel, aim)
         };
 
-        let desired = resolve_direction(cur_dir, &input, &prev);
-        let turned = desired != cur_dir;
+        // Направление движения выводится из осей ввода: диагональ получается
+        // сама собой, когда нажаты вертикальная и горизонтальная клавиши.
+        let (av, ah) = input.axes();
+        let desired_move = Direction::from_axes(av, ah);
+        let turned = desired_move.is_some() && desired_move != Some(cur_move);
 
         let Some(mut tank) = self.players.get_mut(&pid).and_then(|p| p.tank.take()) else {
             return;
@@ -514,37 +547,41 @@ impl Game {
         let accel = if on_ice { 220.0 } else { 1100.0 };
         let decel = if on_ice { 120.0 } else { 1800.0 };
 
-        let target = if input.pressed(desired) {
-            speed
-        } else if input.pressed(desired.opposite()) {
-            -speed * 0.6
-        } else {
-            0.0
-        };
+        // Целевая скорость: вперёд по текущему направлению движения.
+        let target = if desired_move.is_some() { speed } else { 0.0 };
 
         let base_vel = if turned { 0.0 } else { vel };
         let delta = target - base_vel;
         let rate = if delta > 0.0 { accel } else { decel };
         let max_step = rate * TICK_DT;
         let mut new_vel = base_vel + delta.clamp(-max_step, max_step);
-        if new_vel.abs() < 1.0 {
+        if new_vel < 1.0 {
             new_vel = 0.0;
         }
 
         if turned {
-            // Поворот: выравниваем по сетке, как в классическом Battle City.
-            tank.dir = desired;
+            let next = desired_move.unwrap_or(cur_move);
+            // Выравнивание по сетке — только между кардинальными
+            // направлениями: диагональный ход идёт свободно.
+            let was_cardinal = !cur_move.is_diagonal();
+            let now_cardinal = !next.is_diagonal();
+            tank.move_dir = next;
             tank.vel = 0.0;
-            self.align_to_grid(&mut tank);
-        } else {
-            tank.dir = desired;
+            if now_cardinal && was_cardinal {
+                self.align_to_grid(&mut tank, next);
+            }
+        } else if let Some(next) = desired_move {
+            tank.move_dir = next;
         }
+
+        // Куда «смотрит» танк: бот наводится на цель, человек — по движению.
+        tank.dir = aim.unwrap_or_else(|| desired_move.unwrap_or(tank.dir));
         tank.vel = new_vel;
 
         let dist = new_vel * TICK_DT;
-        if dist.abs() > 0.001 {
+        if dist > 0.001 {
             self.move_tank(&mut tank, dist);
-            tank.track_phase += new_vel.abs() * TICK_DT / 6.0;
+            tank.track_phase += new_vel * TICK_DT / 6.0;
         }
 
         if let Some(player) = self.players.get_mut(&pid) {
@@ -553,8 +590,8 @@ impl Game {
     }
 
     /// Приводит поперечную ось танка к сетке тайлов.
-    fn align_to_grid(&self, tank: &mut Tank) {
-        let vertical = tank.dir.is_vertical();
+    fn align_to_grid(&self, tank: &mut Tank, dir: Direction) {
+        let vertical = dir.is_vertical();
         let axis_val = if vertical { tank.x } else { tank.y };
         let base = (axis_val / TILE_SIZE).round() as i32;
         for delta in [0i32, -1, 1, -2, 2] {
@@ -578,11 +615,11 @@ impl Game {
 
     /// Перемещает танк пошагово, останавливаясь на препятствии.
     fn move_tank(&self, tank: &mut Tank, dist: f32) {
-        if dist == 0.0 {
+        if dist <= 0.0 {
             return;
         }
-        let (dx, dy) = tank.dir.delta();
-        let steps = dist.abs().ceil().max(1.0) as i32;
+        let (dx, dy) = tank.move_dir.delta();
+        let steps = dist.ceil().max(1.0) as i32;
         let step = dist / steps as f32;
         for _ in 0..steps {
             let nx = tank.x + dx * step;
@@ -623,40 +660,52 @@ impl Game {
             return;
         }
 
+        let guns = level_guns(level);
         let alive = self.bullets.values().filter(|b| b.owner == pid).count();
-        if alive >= level_max_bullets(level) {
+        if alive + guns > level_max_bullets(level) {
             return;
         }
 
-        // Снаряд появляется у дула; если там стена — из центра танка.
         let (dx, dy) = dir.delta();
-        let muzzle_x = cx + dx * (TANK_SIZE * 0.5 + 3.0);
-        let muzzle_y = cy + dy * (TANK_SIZE * 0.5 + 3.0);
-        let (bx, by) = if self.map.rect_is_free(
-            muzzle_x - BULLET_SIZE * 0.5,
-            muzzle_y - BULLET_SIZE * 0.5,
-            BULLET_SIZE,
-        ) {
-            (muzzle_x, muzzle_y)
-        } else {
-            (cx, cy)
-        };
+        // Перпендикуляр к направлению выстрела: по нему разводятся стволы.
+        let (px, py) = (-dy, dx);
 
-        let id = self.next_entity_id;
-        self.next_entity_id += 1;
-        self.bullets.insert(
-            id,
-            Bullet {
+        for gun in 0..guns {
+            // Стволы симметричны относительно продольной оси танка.
+            let offset = match guns {
+                1 => 0.0,
+                _ if gun == 0 => -GUN_OFFSET,
+                _ => GUN_OFFSET,
+            };
+            let muzzle_x = cx + dx * (TANK_SIZE * 0.5 + 3.0) + px * offset;
+            let muzzle_y = cy + dy * (TANK_SIZE * 0.5 + 3.0) + py * offset;
+            // Снаряд появляется у дула; если там стена — из центра танка.
+            let (bx, by) = if self.map.rect_is_free(
+                muzzle_x - BULLET_SIZE * 0.5,
+                muzzle_y - BULLET_SIZE * 0.5,
+                BULLET_SIZE,
+            ) {
+                (muzzle_x, muzzle_y)
+            } else {
+                (cx + px * offset, cy + py * offset)
+            };
+
+            let id = self.next_entity_id;
+            self.next_entity_id += 1;
+            self.bullets.insert(
                 id,
-                owner: pid,
-                x: bx,
-                y: by,
-                dir,
-                level,
-                damage: level_bullet_damage(level),
-                speed: level_bullet_speed(level),
-            },
-        );
+                Bullet {
+                    id,
+                    owner: pid,
+                    x: bx,
+                    y: by,
+                    dir,
+                    level,
+                    damage: level_bullet_damage(level),
+                    speed: level_bullet_speed(level),
+                },
+            );
+        }
 
         if let Some(player) = self.players.get_mut(&pid) {
             if let Some(tank) = player.tank.as_mut() {
@@ -1028,50 +1077,46 @@ impl Game {
                         .unwrap_or_default();
                 }
             }
+            // Цели нет — бот бродит по карте, чтобы мир не выглядел мёртвым.
+            if path.is_empty() && target.is_none() {
+                path = self.wander_path(bx, by);
+            }
             if let Some(player) = self.players.get_mut(&pid) {
                 if let Some(bot) = player.bot.as_mut() {
                     bot.path = path;
                     bot.path_idx = 0;
                     bot.target = target;
-                    bot.next_plan_tick = now + 30;
+                    // Перепланировки разводим по тикам: иначе все боты
+                    // одновременно запускают поиск пути.
+                    bot.next_plan_tick = now + 30 + (pid % 20) as u64;
                 }
             }
         }
 
         // Принимаем решение: стрелять и куда двигаться.
         let mut input = InputFlags::default();
-        let (target_center, aligned, los) = match target {
-            Some(tid) => {
-                let mut info = None;
-                if let Some(p) = self.players.get(&tid) {
-                    if let Some(t) = p.tank.as_ref() {
-                        let c = t.center();
-                        let dx = (c.0 - (bx + TANK_SIZE * 0.5)).abs();
-                        let dy = (c.1 - (by + TANK_SIZE * 0.5)).abs();
-                        let aligned = dx < 20.0 || dy < 20.0;
-                        let los = self.map.bullet_line_of_sight(
-                            bx + TANK_SIZE * 0.5,
-                            by + TANK_SIZE * 0.5,
-                            c.0,
-                            c.1,
-                        );
-                        info = Some((c, aligned, los));
-                    }
-                }
-                match info {
-                    Some(v) => (Some(v.0), v.1, v.2),
-                    None => (None, false, false),
+        let mut aim: Option<Direction> = None;
+
+        if let Some(tid) = target {
+            let target_center = self
+                .players
+                .get(&tid)
+                .and_then(|p| p.tank.as_ref())
+                .map(|t| t.center());
+            if let Some(tc) = target_center {
+                let bcx = bx + TANK_SIZE * 0.5;
+                let bcy = by + TANK_SIZE * 0.5;
+                // Видим цель — наводимся и стреляем (в том числе по диагонали).
+                if self.map.bullet_line_of_sight(bcx, bcy, tc.0, tc.1) {
+                    aim = Some(direction_towards(bcx, bcy, tc.0, tc.1));
+                    input.fire = true;
                 }
             }
-            None => (None, false, false),
-        };
-        let _ = target_center;
+        }
 
-        if aligned && los {
-            // Видим цель — стреляем и не дёргаемся.
-            input.fire = true;
-        } else {
-            // Идём по маршруту.
+        // Идём по маршруту: движение кардинальное, направление наводки
+        // при этом может быть диагональным.
+        {
             let path = self
                 .players
                 .get(&pid)
@@ -1102,16 +1147,40 @@ impl Game {
         }
 
         if let Some(player) = self.players.get_mut(&pid) {
-            player.prev_input = player.input;
             player.input = input;
+            if let Some(bot) = player.bot.as_mut() {
+                bot.aim = aim;
+            }
         }
     }
 
+    /// Случайный маршрут для блуждания, когда поблизости нет цели.
+    fn wander_path(&mut self, bx: f32, by: f32) -> Vec<(u32, u32)> {
+        let from = self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5);
+        for _ in 0..8 {
+            let tx = self.rng.range(1, self.cfg.map_w.saturating_sub(1));
+            let ty = self.rng.range(1, self.cfg.map_h.saturating_sub(1));
+            if self.map.blocks_tank(tx, ty) {
+                continue;
+            }
+            if let Some(path) = self.find_path(from, (tx, ty)) {
+                if !path.is_empty() {
+                    return path;
+                }
+            }
+        }
+        Vec::new()
+    }
+
     /// Выбирает ближайшую разумную цель для бота.
+    ///
+    /// Приоритет — цели, которые видно: так боты дерутся и друг с другом,
+    /// а не только с игроками.
     fn find_bot_target(&self, bot_id: u32, bx: f32, by: f32) -> Option<u32> {
         let bcx = bx + TANK_SIZE * 0.5;
         let bcy = by + TANK_SIZE * 0.5;
-        let mut best: Option<(u32, f32)> = None;
+        let mut best_visible: Option<(u32, f32)> = None;
+        let mut best_any: Option<(u32, f32)> = None;
         for (pid, player) in self.players.iter() {
             if *pid == bot_id {
                 continue;
@@ -1124,16 +1193,19 @@ impl Game {
             let dx = tcx - bcx;
             let dy = tcy - bcy;
             let dist = dx * dx + dy * dy;
-            if dist > 700.0 * 700.0 {
+            if dist > 900.0 * 900.0 {
                 continue;
             }
-            let visible = self.map.bullet_line_of_sight(bcx, bcy, tcx, tcy);
-            let score = if visible { dist * 0.2 } else { dist };
-            if best.is_none_or(|(_, bs)| score < bs) {
-                best = Some((*pid, score));
+            if best_any.is_none_or(|(_, bd)| dist < bd) {
+                best_any = Some((*pid, dist));
+            }
+            if self.map.bullet_line_of_sight(bcx, bcy, tcx, tcy)
+                && best_visible.is_none_or(|(_, bd)| dist < bd)
+            {
+                best_visible = Some((*pid, dist));
             }
         }
-        best.map(|(id, _)| id)
+        best_visible.or(best_any).map(|(id, _)| id)
     }
 
     /// Поиск пути по тайлам (BFS).
@@ -1298,7 +1370,6 @@ impl Game {
                 kills: 0,
                 deaths: 0,
                 input: InputFlags::default(),
-                prev_input: InputFlags::default(),
                 last_seq: 0,
                 tx: None,
                 joined: true,
@@ -1309,6 +1380,7 @@ impl Game {
                     path_idx: 0,
                     next_plan_tick: self.tick,
                     target: None,
+                    aim: None,
                 }),
                 removal_at: None,
             },
@@ -1391,10 +1463,17 @@ impl Game {
                 id: p.id,
                 name: p.nickname.clone(),
                 score: p.score,
+                kills: p.kills,
                 is_bot: p.is_bot,
             })
             .collect();
-        entries.sort_by(|a, b| b.score.cmp(&a.score).then(a.id.cmp(&b.id)));
+        // Главная метрика — число уничтоженных танков.
+        entries.sort_by(|a, b| {
+            b.kills
+                .cmp(&a.kills)
+                .then(b.score.cmp(&a.score))
+                .then(a.id.cmp(&b.id))
+        });
         entries.truncate(10);
         self.leaderboard = entries;
     }
@@ -1412,6 +1491,7 @@ impl Game {
                         id: player.id,
                         name: player.nickname.clone(),
                         score: player.score,
+                        kills: player.kills,
                         is_bot: player.is_bot,
                     });
                 }
@@ -1447,7 +1527,6 @@ impl Game {
                 kills: 0,
                 deaths: 0,
                 input: InputFlags::default(),
-                prev_input: InputFlags::default(),
                 last_seq: 0,
                 tx: Some(tx.clone()),
                 joined: false,
@@ -1548,7 +1627,6 @@ impl Game {
                     continue;
                 }
                 player.last_seq = seq;
-                player.prev_input = player.input;
                 player.input = input;
             }
         }
@@ -1734,39 +1812,27 @@ pub fn aabb_overlap(
     ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
-/// Определяет направление движения по вводу.
+/// Направление от точки к точке: восемь направлений по знакам разностей.
 ///
-/// Классический Battle City допускает только четыре направления и не
-/// оставляет диагоналей: при одновременном нажатии двух клавиш выбирается
-/// та, что нажата позже, а если такой нет — перпендикулярная текущей.
-pub fn resolve_direction(current: Direction, input: &InputFlags, prev: &InputFlags) -> Direction {
-    let candidates: Vec<Direction> = Direction::ALL
-        .iter()
-        .copied()
-        .filter(|d| input.pressed(*d))
-        .collect();
-    if candidates.is_empty() {
-        return current;
-    }
-    if candidates.len() == 1 {
-        return candidates[0];
-    }
-
-    let newly: Vec<Direction> = candidates
-        .iter()
-        .copied()
-        .filter(|d| !prev.pressed(*d))
-        .collect();
-    if newly.len() == 1 {
-        return newly[0];
-    }
-    if let Some(d) = newly.iter().copied().find(|d| d.is_perpendicular(current)) {
-        return d;
-    }
-    if let Some(d) = candidates.iter().copied().find(|d| d.is_perpendicular(current)) {
-        return d;
-    }
-    current
+/// Небольшой порог по каждой оси не даёт «дрожать» наводке, когда цель
+/// почти точно по курсу.
+pub fn direction_towards(x0: f32, y0: f32, x1: f32, y1: f32) -> Direction {
+    const EPS: f32 = 8.0;
+    let v = if y1 - y0 < -EPS {
+        -1
+    } else if y1 - y0 > EPS {
+        1
+    } else {
+        0
+    };
+    let h = if x1 - x0 < -EPS {
+        -1
+    } else if x1 - x0 > EPS {
+        1
+    } else {
+        0
+    };
+    Direction::from_axes(v, h).unwrap_or(Direction::Down)
 }
 
 #[cfg(test)]
@@ -1787,29 +1853,187 @@ mod tests {
     }
 
     #[test]
-    fn direction_resolution_prefers_single_press() {
-        let input = InputFlags {
-            left: true,
+    fn input_axes_make_diagonals() {
+        let up_right = InputFlags {
+            up: true,
+            right: true,
+            ..Default::default()
+        };
+        assert_eq!(up_right.axes(), (-1, 1));
+        assert_eq!(
+            Direction::from_axes(up_right.axes().0, up_right.axes().1),
+            Some(Direction::UpRight)
+        );
+
+        let up = InputFlags {
+            up: true,
             ..Default::default()
         };
         assert_eq!(
-            resolve_direction(Direction::Up, &input, &InputFlags::default()),
-            Direction::Left
+            Direction::from_axes(up.axes().0, up.axes().1),
+            Some(Direction::Up)
+        );
+
+        // Обе клавиши одной оси — ввода по этой оси нет.
+        let both = InputFlags {
+            up: true,
+            down: true,
+            ..Default::default()
+        };
+        assert_eq!(both.axes(), (0, 0));
+        assert_eq!(Direction::from_axes(0, 0), None);
+    }
+
+    #[test]
+    fn direction_towards_picks_quadrant() {
+        assert_eq!(direction_towards(0.0, 0.0, 0.0, -100.0), Direction::Up);
+        assert_eq!(direction_towards(0.0, 0.0, 100.0, 0.0), Direction::Right);
+        assert_eq!(
+            direction_towards(0.0, 0.0, 100.0, 100.0),
+            Direction::DownRight
+        );
+        assert_eq!(
+            direction_towards(0.0, 0.0, -100.0, 100.0),
+            Direction::DownLeft
         );
     }
 
     #[test]
-    fn direction_resolution_picks_perpendicular_on_diagonal() {
-        let input = InputFlags {
-            right: true,
-            up: true,
-            ..Default::default()
-        };
-        // Ничего не менялось — выбираем перпендикулярное текущему.
-        assert_eq!(
-            resolve_direction(Direction::Down, &input, &InputFlags::default()),
-            Direction::Right
+    fn stars_add_second_gun_and_slow_reload_down() {
+        assert_eq!(level_guns(1), 1);
+        assert_eq!(level_guns(2), 2);
+        assert_eq!(level_guns(3), 2);
+        // Базовый танк стреляет втрое медленнее прежнего (0.55 с -> 1.65 с),
+        // и с каждой звездой перезарядка сокращается.
+        assert!((level_fire_cooldown(1) - 1.65).abs() < 0.001);
+        assert!(level_fire_cooldown(2) < level_fire_cooldown(1));
+        assert!(level_fire_cooldown(3) < level_fire_cooldown(2));
+        // Предел на снаряды в полёте не должен быть жёстче перезарядки,
+        // иначе темп стрельбы задаёт время жизни снаряда, а не перезарядка.
+        assert_eq!(level_max_bullets(1), 3);
+        assert_eq!(level_max_bullets(2), 6);
+        assert_eq!(level_max_bullets(3), 6);
+    }
+
+    #[test]
+    fn fire_cadence_follows_cooldown() {
+        // Танк держит огонь: темп выстрелов должен совпадать с перезарядкой,
+        // а на втором уровне — стать чаще и бить из двух стволов.
+        fn measure(level: u8) -> (Vec<u64>, usize) {
+            let mut game = test_game();
+            let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+            game.join_player(pid, "A".into());
+            {
+                let tank = game.players.get_mut(&pid).and_then(|p| p.tank.as_mut()).expect("tank");
+                tank.level = level;
+                tank.max_hp = level_max_hp(level);
+                tank.hp = tank.max_hp;
+            }
+            // Заглушки-бонусы далеко от танка: случайная звезда не изменит уровень.
+            let (tx, ty) = game
+                .players
+                .get(&pid)
+                .and_then(|p| p.tank.as_ref())
+                .map(|t| (t.x, t.y))
+                .expect("center");
+            for i in 0..MAX_PICKUPS as u32 {
+                game.pickups.insert(
+                    i,
+                    Pickup {
+                        id: i,
+                        x: tx + 4000.0 + i as f32,
+                        y: ty,
+                        kind: PickupKind::Star,
+                        expires_at: u64::MAX,
+                    },
+                );
+            }
+            game.apply_input(
+                1,
+                1,
+                InputFlags {
+                    fire: true,
+                    ..Default::default()
+                },
+            );
+
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut shots: Vec<u64> = Vec::new();
+            let mut bullets_per_shot = 0usize;
+            for _ in 0..300 {
+                game.tick();
+                let fresh: Vec<u32> = game
+                    .bullets
+                    .values()
+                    .filter(|b| b.owner == pid)
+                    .filter(|b| seen.insert(b.id))
+                    .map(|b| b.id)
+                    .collect();
+                if !fresh.is_empty() {
+                    shots.push(game.tick);
+                    bullets_per_shot = fresh.len();
+                }
+            }
+            (shots, bullets_per_shot)
+        }
+
+        // Первый уровень: выстрел раз в ~1.65 с = 50 тиков, один ствол.
+        let (shots, per_shot) = measure(1);
+        assert!(shots.len() >= 3, "выстрелов слишком мало: {:?}", shots);
+        let gaps: Vec<u64> = shots.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            (49..=51).contains(&gaps[0]),
+            "первый интервал должен быть ~50 тиков (1.65 с): {:?}",
+            gaps
         );
+        for g in &gaps {
+            assert!(
+                *g >= 49,
+                "стрелять быстрее перезарядки нельзя (мин. 50 тиков): {:?}",
+                gaps
+            );
+        }
+        assert_eq!(per_shot, 1);
+
+        // Второй уровень: перезарядка короче (~1.35 с = 40 тиков) и два ствола.
+        let (shots, per_shot) = measure(2);
+        let gaps: Vec<u64> = shots.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(
+            (39..=42).contains(&gaps[0]),
+            "на втором уровне первый интервал должен быть ~40 тиков (1.35 с): {:?}",
+            gaps
+        );
+        for g in &gaps {
+            assert!(
+                *g >= 39,
+                "стрелять быстрее перезарядки нельзя (мин. 40 тиков): {:?}",
+                gaps
+            );
+        }
+        assert_eq!(per_shot, 2);
+    }
+
+    #[test]
+    fn diagonal_input_moves_tank_diagonally() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "Тест".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "Тест".into());
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                right: true,
+                down: true,
+                ..Default::default()
+            },
+        );
+        game.tick();
+        let tank = game
+            .players
+            .get(&pid)
+            .and_then(|p| p.tank.as_ref())
+            .expect("tank");
+        assert_eq!(tank.move_dir, Direction::DownRight);
     }
 
     #[test]

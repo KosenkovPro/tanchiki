@@ -26,8 +26,9 @@
 
       <!-- Таблица лидеров -->
       <section id="leaderboard-panel" class="panel">
-        <header>ТОП-10</header>
+        <header>ТОП-10 · УБИЙСТВА</header>
         <ol id="leaderboard"></ol>
+        <div class="leaderboard-legend"><span class="kills">☠</span> убийств · <span class="pts">★</span> очки</div>
       </section>
 
       <!-- Состояние игрока -->
@@ -58,8 +59,9 @@
 
       <!-- Подсказка по управлению -->
       <section id="help-panel" class="panel">
-        <b>WASD</b> / <b>стрелки</b> — движение · <b>Пробел</b> / <b>ЛКМ</b> — огонь ·
-        <b>колесо</b> — зум
+        <b>WASD</b> / <b>стрелки</b> — движение (в т.ч. по диагонали) ·
+        <b>Пробел</b> / <b>ЛКМ</b> — огонь · <b>колесо</b> — зум · <b>M</b> — звук
+        <button id="sound-toggle" type="button" class="on">🔊 ЗВУК</button>
       </section>
 
       <div id="connection" class="hidden">Соединение потеряно…</div>
@@ -84,8 +86,9 @@
           <button type="submit" id="play-button">В БОЙ</button>
         </form>
         <p class="hint">
-          WASD / стрелки — движение, Пробел или ЛКМ — выстрел. Звезда повышает уровень танка,
-          щит даёт неуязвимость, ремкомплект чинит броню.
+          WASD / стрелки — движение (работает и по диагонали), Пробел или ЛКМ — выстрел.
+          Звезда повышает уровень танка: со второго уровня у него две пушки и выше скорострельность,
+          щит даёт неуязвимость, ремкомплект чинит броню. Клавиша M — включить/выключить звук.
         </p>
       </div>
 

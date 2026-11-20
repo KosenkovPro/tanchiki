@@ -5,7 +5,7 @@
  * строки кодируются как `u16 len + utf8 bytes`.
  */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /** Клиент -> сервер. */
 export const MSG = Object.freeze({
@@ -27,8 +27,17 @@ export const SVR = Object.freeze({
   ERROR: 0x17,
 });
 
-/** Направления. */
-export const DIR = Object.freeze({ UP: 0, DOWN: 1, LEFT: 2, RIGHT: 3 });
+/** Направления: четыре кардинальных и четыре диагональных. */
+export const DIR = Object.freeze({
+  UP: 0,
+  DOWN: 1,
+  LEFT: 2,
+  RIGHT: 3,
+  UP_LEFT: 4,
+  UP_RIGHT: 5,
+  DOWN_LEFT: 6,
+  DOWN_RIGHT: 7,
+});
 
 /** Биты ввода. */
 export const BIT = Object.freeze({ UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8, FIRE: 16 });
@@ -333,6 +342,7 @@ function readLeaderboard(r) {
       id: r.u32(),
       name: r.str(),
       score: r.u32(),
+      kills: r.u32(),
       isBot: r.u8() !== 0,
     });
   }
