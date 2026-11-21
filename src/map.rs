@@ -1,46 +1,32 @@
-//! Тайловая карта мира: типы тайлов, разрушаемость, пространственное разбиение.
+//! Карта мира: тайлы, ярусы, повреждаемость, генерация, RLE, чанки.
 //!
-//! Карта — это сетка `MAP_W x MAP_H` тайлов размером `TILE_SIZE x TILE_SIZE` пикселей.
-//! Значение тайла упаковано в один байт:
-//!
-//! ```text
-//! биты 0..=2  — базовый тип тайла (TileKind)
-//! биты 3..=5  — стадия повреждения (0..=7, используется кирпичом и бетоном)
-//! ```
+//! Карта состоит из нескольких **ярусов** (уровней по высоте). Вид сверху,
+//! но этажей несколько: нижний ярус — земля, верхний — площадки и перекрытия.
+//! Переход между ярусами — тайл-«трамплин» (`TileKind::Ramp`), он есть
+//! сразу на обоих ярусах: заехав на него, танк меняет этаж.
 
-/// Размер тайла в пикселях.
 pub const TILE_SIZE: f32 = 32.0;
 
-/// Ширина карты в тайлах.
 pub const MAP_W: u32 = 160;
-
-/// Высота карты в тайлах.
 pub const MAP_H: u32 = 160;
 
-/// Количество тайлов в чанке по одной оси.
 pub const CHUNK_TILES: u32 = 16;
-
-/// Количество чанков по X.
 pub const CHUNKS_X: u32 = MAP_W / CHUNK_TILES;
-
-/// Количество чанков по Y.
 pub const CHUNKS_Y: u32 = MAP_H / CHUNK_TILES;
 
-/// Радиус видимости в чанках (1 = текущий чанк + 8 соседних).
-/// Радиус выборки чанков вокруг игрока (в чанках).
-///
-/// Чанк — 16 тайлов (512 пикселей). Радиус 3 гарантированно перекрывает
-/// конус обзора в 900 пикселей при любом положении танка внутри чанка.
 pub const VIEW_CHUNK_RADIUS: i32 = 3;
 
-/// Сколько попаданий по кирпичу нужно, чтобы его разрушить.
 pub const BRICK_MAX_DAMAGE: u8 = 4;
 
-// ---------------------------------------------------------------------------
-// Типы тайлов
-// ---------------------------------------------------------------------------
+/// Количество ярусов (этажей) карты.
+pub const LEVELS: u8 = 2;
 
-/// Базовый тип тайла.
+/// Нижний ярус — земля.
+pub const LEVEL_GROUND: u8 = 0;
+/// Верхний ярус — площадки и перекрытия.
+pub const LEVEL_UPPER: u8 = 1;
+
+/// Тип тайла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TileKind {
@@ -56,6 +42,8 @@ pub enum TileKind {
     Forest = 4,
     /// Лёд — скользкая поверхность с инерцией.
     Ice = 5,
+    /// Трамплин — переход между ярусами.
+    Ramp = 6,
 }
 
 impl TileKind {
@@ -67,6 +55,7 @@ impl TileKind {
             3 => TileKind::Water,
             4 => TileKind::Forest,
             5 => TileKind::Ice,
+            6 => TileKind::Ramp,
             _ => TileKind::Empty,
         }
     }
@@ -94,6 +83,11 @@ impl TileKind {
     /// Скользкий ли тайл (низкое трение).
     pub fn is_slippery(self) -> bool {
         matches!(self, TileKind::Ice)
+    }
+
+    /// Является ли тайл переходом между ярусами.
+    pub fn is_ramp(self) -> bool {
+        matches!(self, TileKind::Ramp)
     }
 }
 // ---------------------------------------------------------------------------
@@ -137,7 +131,7 @@ impl Rng {
         self.next_u32() % n
     }
 
-    /// Случайное число в диапазоне `lo..=hi`.
+    /// Случайное число из диапазона `lo..=hi`.
     pub fn range(&mut self, lo: u32, hi: u32) -> u32 {
         if hi <= lo {
             return lo;
@@ -160,27 +154,29 @@ impl Rng {
 // Карта
 // ---------------------------------------------------------------------------
 
-/// Тайловая карта мира.
+/// Тайловая карта мира с несколькими ярусами.
 #[derive(Debug, Clone)]
 pub struct GameMap {
     width: u32,
     height: u32,
-    /// Упакованные значения тайлов.
-    tiles: Vec<u8>,
+    /// Упакованные значения тайлов: по одному массиву на ярус.
+    layers: Vec<Vec<u8>>,
     /// Идентификатор лесного массива для каждого тайла (`u32::MAX` — не лес).
-    forest_regions: Vec<u32>,
+    forest_regions: Vec<Vec<u32>>,
 }
 
 impl GameMap {
     /// Генерирует карту заданного размера с зерном.
     pub fn generate(width: u32, height: u32, seed: u64) -> GameMap {
+        let total = (width * height) as usize;
         let mut map = GameMap {
             width,
             height,
-            tiles: vec![0; (width * height) as usize],
-            forest_regions: vec![u32::MAX; (width * height) as usize],
+            layers: vec![vec![0; total]; LEVELS as usize],
+            forest_regions: vec![vec![u32::MAX; total]; LEVELS as usize],
         };
         map.build(seed);
+        map.build_upper_level(seed ^ 0x5DEE_CE66_D1CE_4B0D);
         map.rebuild_forest_regions();
         map
     }
@@ -195,9 +191,14 @@ impl GameMap {
         self.height
     }
 
-    /// Количество тайлов.
+    /// Количество ярусов.
+    pub fn levels(&self) -> u8 {
+        self.layers.len() as u8
+    }
+
+    /// Количество тайлов на одном ярусе.
     pub fn len(&self) -> usize {
-        self.tiles.len()
+        (self.width * self.height) as usize
     }
 
     #[inline]
@@ -208,45 +209,57 @@ impl GameMap {
         Some((ty * self.width + tx) as usize)
     }
 
+    /// Нормализует номер яруса.
+    #[inline]
+    fn level_index(&self, level: u8) -> usize {
+        (level as usize).min(self.layers.len() - 1)
+    }
+
     /// Упакованное значение тайла.
-    pub fn value(&self, tx: u32, ty: u32) -> u8 {
+    pub fn value(&self, tx: u32, ty: u32, level: u8) -> u8 {
         match self.index(tx, ty) {
-            Some(i) => self.tiles[i],
+            Some(i) => self.layers[self.level_index(level)][i],
             None => TileKind::Steel.bits(),
         }
     }
 
     /// Базовый тип тайла.
-    pub fn kind(&self, tx: u32, ty: u32) -> TileKind {
-        TileKind::from_bits(self.value(tx, ty))
+    pub fn kind(&self, tx: u32, ty: u32, level: u8) -> TileKind {
+        TileKind::from_bits(self.value(tx, ty, level))
     }
 
     /// Стадия повреждения тайла.
-    pub fn damage(&self, tx: u32, ty: u32) -> u8 {
-        self.value(tx, ty) >> 3
+    pub fn damage(&self, tx: u32, ty: u32, level: u8) -> u8 {
+        self.value(tx, ty, level) >> 3
     }
 
     /// Записывает упакованное значение тайла.
-    pub fn set_value(&mut self, tx: u32, ty: u32, value: u8) {
+    pub fn set_value(&mut self, tx: u32, ty: u32, level: u8, value: u8) {
         if let Some(i) = self.index(tx, ty) {
-            self.tiles[i] = value;
+            let li = self.level_index(level);
+            self.layers[li][i] = value;
         }
     }
 
     /// Записывает базовый тип тайла, сбрасывая повреждение.
-    pub fn set_kind(&mut self, tx: u32, ty: u32, kind: TileKind) {
-        self.set_value(tx, ty, kind.bits());
+    pub fn set_kind(&mut self, tx: u32, ty: u32, level: u8, kind: TileKind) {
+        self.set_value(tx, ty, level, kind.bits());
     }
 
     /// Блокирует ли тайл движение танка.
-    pub fn blocks_tank(&self, tx: u32, ty: u32) -> bool {
-        self.kind(tx, ty).blocks_tank()
+    pub fn blocks_tank(&self, tx: u32, ty: u32, level: u8) -> bool {
+        self.kind(tx, ty, level).blocks_tank()
+    }
+
+    /// Является ли тайл переходом между ярусами.
+    pub fn is_ramp(&self, tx: u32, ty: u32, level: u8) -> bool {
+        self.kind(tx, ty, level).is_ramp()
     }
 
     /// Находится ли точка (в пикселях) внутри лесного массива.
-    pub fn forest_region(&self, tx: u32, ty: u32) -> Option<u32> {
+    pub fn forest_region(&self, tx: u32, ty: u32, level: u8) -> Option<u32> {
         let idx = self.index(tx, ty)?;
-        let region = self.forest_regions[idx];
+        let region = self.forest_regions[self.level_index(level)][idx];
         if region == u32::MAX {
             None
         } else {
@@ -267,16 +280,15 @@ impl GameMap {
         (tx / CHUNK_TILES, ty / CHUNK_TILES)
     }
 
-    /// RLE-кодирование массива тайлов: тройки `value:u8, len:u16`.
-    pub fn rle_encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.tiles.len() / 2);
+    /// RLE-кодирование яруса: тройки `value:u8, len:u16`.
+    pub fn rle_encode_level(&self, level: u8) -> Vec<u8> {
+        let tiles = &self.layers[self.level_index(level)];
+        let mut out = Vec::with_capacity(tiles.len() / 2);
         let mut i = 0usize;
-        while i < self.tiles.len() {
-            let value = self.tiles[i];
+        while i < tiles.len() {
+            let value = tiles[i];
             let mut run = 1u16;
-            while (i + run as usize) < self.tiles.len()
-                && self.tiles[i + run as usize] == value
-                && run < u16::MAX
+            while (i + run as usize) < tiles.len() && tiles[i + run as usize] == value && run < u16::MAX
             {
                 run += 1;
             }
@@ -285,6 +297,13 @@ impl GameMap {
             i += run as usize;
         }
         out
+    }
+
+    /// RLE-кодирование всех ярусов.
+    pub fn rle_encode(&self) -> Vec<Vec<u8>> {
+        (0..self.layers.len() as u8)
+            .map(|level| self.rle_encode_level(level))
+            .collect()
     }
 
     /// Расшифровывает RLE-поток обратно в массив тайлов.
@@ -310,7 +329,6 @@ impl GameMap {
     // -----------------------------------------------------------------------
     // Генерация
     // -----------------------------------------------------------------------
-
     fn build(&mut self, seed: u64) {
         let mut rng = Rng::new(seed);
         let w = self.width;
@@ -322,9 +340,9 @@ impl GameMap {
                 let edge = x == 0 || y == 0 || x == w - 1 || y == h - 1;
                 let near_edge = x == 1 || y == 1 || x == w - 2 || y == h - 2;
                 if edge {
-                    self.set_kind(x, y, TileKind::Steel);
+                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Steel);
                 } else if near_edge {
-                    self.set_kind(x, y, TileKind::Brick);
+                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Brick);
                 }
             }
         }
@@ -364,7 +382,7 @@ impl GameMap {
         for y in cy - 4..cy + 5 {
             for x in cx - 4..cx + 5 {
                 if x > 1 && y > 1 && x < w - 2 && y < h - 2 {
-                    self.set_kind(x, y, TileKind::Empty);
+                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Empty);
                 }
             }
         }
@@ -378,8 +396,6 @@ impl GameMap {
     fn place_symmetric(&mut self, x: u32, y: u32, bw: u32, bh: u32, kind: TileKind) {
         let w = self.width;
         let h = self.height;
-        let mx = w - 1 - x;
-        let my = h - 1 - y;
         for dy in 0..bh {
             for dx in 0..bw {
                 let px = x + dx;
@@ -391,14 +407,13 @@ impl GameMap {
                 let right = w - 1 - px;
                 let bottom = h - 1 - py;
                 if px < right && py < bottom {
-                    self.set_kind(px, py, kind);
-                    self.set_kind(right, py, kind);
-                    self.set_kind(px, bottom, kind);
-                    self.set_kind(right, bottom, kind);
+                    self.set_kind(px, py, LEVEL_GROUND, kind);
+                    self.set_kind(right, py, LEVEL_GROUND, kind);
+                    self.set_kind(px, bottom, LEVEL_GROUND, kind);
+                    self.set_kind(right, bottom, LEVEL_GROUND, kind);
                 }
             }
         }
-        let _ = (mx, my);
     }
 
     /// Гарантирует, что все пустые области связаны с центром карты.
@@ -428,7 +443,7 @@ impl GameMap {
                 if visited[nidx] {
                     continue;
                 }
-                if self.kind(nx, ny).blocks_tank() {
+                if self.kind(nx, ny, LEVEL_GROUND).blocks_tank() {
                     continue;
                 }
                 visited[nidx] = true;
@@ -440,49 +455,129 @@ impl GameMap {
         for y in 0..self.height {
             for x in 0..self.width {
                 let idx = (y * self.width + x) as usize;
-                if !visited[idx] && !self.kind(x, y).blocks_tank() {
-                    self.set_kind(x, y, TileKind::Brick);
+                if !visited[idx] && !self.kind(x, y, LEVEL_GROUND).blocks_tank() {
+                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Brick);
                 }
             }
         }
     }
 
+    /// Строит верхний ярус: площадки-перекрытия и трамплины вниз.
+    fn build_upper_level(&mut self, seed: u64) {
+        let mut rng = Rng::new(seed);
+        let w = self.width;
+        let h = self.height;
+
+        // 1. Площадки на верхнем ярусе. Ставим их над свободными местами
+        //    нижнего яруса, чтобы они не «замуровывали» нижний этаж.
+        let blocks = 14 + rng.below(8);
+        for _ in 0..blocks {
+            let bw = rng.range(3, 9);
+            let bh = rng.range(3, 7);
+            let bx = rng.range(3, w.saturating_sub(bw + 3));
+            let by = rng.range(3, h.saturating_sub(bh + 3));
+            let kind = if rng.chance(70) {
+                TileKind::Brick
+            } else {
+                TileKind::Steel
+            };
+            for dy in 0..bh {
+                for dx in 0..bw {
+                    let px = bx + dx;
+                    let py = by + dy;
+                    if px < 2 || py < 2 || px >= w - 2 || py >= h - 2 {
+                        continue;
+                    }
+                    // Под площадкой должно быть проходимо — иначе нижний
+                    // ярус получит непроходимый «слепой» карман.
+                    if self.kind(px, py, LEVEL_GROUND).blocks_tank() {
+                        continue;
+                    }
+                    self.set_kind(px, py, LEVEL_UPPER, kind);
+                }
+            }
+        }
+
+        // 2. Трамплины: переходы между ярусами. Один и тот же тайл есть
+        //    на обоих ярусах, поэтому заехав на него, танк меняет этаж.
+        let ramps = 10 + rng.below(6);
+        let mut placed = 0u32;
+        let mut attempts = 0u32;
+        while placed < ramps && attempts < 4096 {
+            attempts += 1;
+            let tx = rng.range(4, w.saturating_sub(5));
+            let ty = rng.range(4, h.saturating_sub(5));
+            // Место должно быть свободно на обоих ярусах.
+            if self.kind(tx, ty, LEVEL_GROUND).blocks_tank()
+                || self.kind(tx, ty, LEVEL_UPPER).blocks_tank()
+            {
+                continue;
+            }
+            // И вокруг должен быть проход, чтобы к трамплину можно было подъехать.
+            let mut ok = true;
+            for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                let nx = tx as i64 + dx;
+                let ny = ty as i64 + dy;
+                if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                    ok = false;
+                    break;
+                }
+                let (nx, ny) = (nx as u32, ny as u32);
+                if self.kind(nx, ny, LEVEL_GROUND).blocks_tank()
+                    || self.kind(nx, ny, LEVEL_UPPER).blocks_tank()
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            self.set_kind(tx, ty, LEVEL_GROUND, TileKind::Ramp);
+            self.set_kind(tx, ty, LEVEL_UPPER, TileKind::Ramp);
+            placed += 1;
+        }
+    }
+
     /// Пересчитывает идентификаторы лесных массивов (заливка по связности).
     fn rebuild_forest_regions(&mut self) {
-        for v in self.forest_regions.iter_mut() {
-            *v = u32::MAX;
-        }
-        let mut next_id = 0u32;
-        let mut stack: Vec<(u32, u32)> = Vec::new();
-        for y in 0..self.height {
-            for x in 0..self.width {
-                if !self.kind(x, y).hides_tank() {
-                    continue;
-                }                if let Some(i) = self.index(x, y) {
-                    if self.forest_regions[i] != u32::MAX {
+        for level in 0..self.layers.len() {
+            for v in self.forest_regions[level].iter_mut() {
+                *v = u32::MAX;
+            }
+            let mut next_id = 0u32;
+            let mut stack: Vec<(u32, u32)> = Vec::new();
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    if !self.kind(x, y, level as u8).hides_tank() {
                         continue;
                     }
-                }
-                let region = next_id;
-                next_id += 1;
-                stack.push((x, y));
-                while let Some((cx, cy)) = stack.pop() {
-                    let idx = (cy * self.width + cx) as usize;
-                    if self.forest_regions[idx] != u32::MAX {
-                        continue;
-                    }
-                    self.forest_regions[idx] = region;
-                    for (nx, ny) in [
-                        (cx.wrapping_sub(1), cy),
-                        (cx + 1, cy),
-                        (cx, cy.wrapping_sub(1)),
-                        (cx, cy + 1),
-                    ] {
-                        if nx >= self.width || ny >= self.height {
+                    if let Some(i) = self.index(x, y) {
+                        if self.forest_regions[level][i] != u32::MAX {
                             continue;
                         }
-                        if self.kind(nx, ny) == TileKind::Forest {
-                            stack.push((nx, ny));
+                    }
+                    let region = next_id;
+                    next_id += 1;
+                    stack.push((x, y));
+                    while let Some((cx, cy)) = stack.pop() {
+                        let idx = (cy * self.width + cx) as usize;
+                        if self.forest_regions[level][idx] != u32::MAX {
+                            continue;
+                        }
+                        self.forest_regions[level][idx] = region;
+                        for (nx, ny) in [
+                            (cx.wrapping_sub(1), cy),
+                            (cx + 1, cy),
+                            (cx, cy.wrapping_sub(1)),
+                            (cx, cy + 1),
+                        ] {
+                            if nx >= self.width || ny >= self.height {
+                                continue;
+                            }
+                            if self.kind(nx, ny, level as u8) == TileKind::Forest {
+                                stack.push((nx, ny));
+                            }
                         }
                     }
                 }
@@ -507,7 +602,7 @@ impl GameMap {
             }
             let x = tx as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
             let y = ty as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
-            if self.rect_is_free(x, y, tank_size) {
+            if self.rect_is_free(x, y, tank_size, LEVEL_GROUND) {
                 points.push((x, y));
             }
         }
@@ -521,7 +616,7 @@ impl GameMap {
                 let ty = rng.range(3, self.height.saturating_sub(4));
                 let x = tx as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
                 let y = ty as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
-                if self.rect_is_free(x, y, tank_size) {
+                if self.rect_is_free(x, y, tank_size, LEVEL_GROUND) {
                     points.push((x, y));
                 }
             }
@@ -530,7 +625,7 @@ impl GameMap {
     }
 
     /// Проверяет, что прямоугольник не пересекается с блокирующими тайлами.
-    pub fn rect_is_free(&self, x: f32, y: f32, size: f32) -> bool {
+    pub fn rect_is_free(&self, x: f32, y: f32, size: f32, level: u8) -> bool {
         let x0 = (x / TILE_SIZE).floor() as i64;
         let y0 = (y / TILE_SIZE).floor() as i64;
         let x1 = ((x + size - 0.001) / TILE_SIZE).floor() as i64;
@@ -544,7 +639,7 @@ impl GameMap {
                 if tx >= self.width || ty >= self.height {
                     return false;
                 }
-                if self.blocks_tank(tx, ty) {
+                if self.blocks_tank(tx, ty, level) {
                     return false;
                 }
             }
@@ -553,7 +648,7 @@ impl GameMap {
     }
 
     /// Свободна ли прямая между двумя точками для снаряда (бетон и кирпич мешают).
-    pub fn bullet_line_of_sight(&self, x0: f32, y0: f32, x1: f32, y1: f32) -> bool {
+    pub fn bullet_line_of_sight(&self, x0: f32, y0: f32, x1: f32, y1: f32, level: u8) -> bool {
         let dx = x1 - x0;
         let dy = y1 - y0;
         let dist = (dx * dx + dy * dy).sqrt();
@@ -566,7 +661,7 @@ impl GameMap {
             let px = x0 + dx * t;
             let py = y0 + dy * t;
             let (tx, ty) = self.tile_at(px, py);
-            if self.kind(tx, ty).blocks_bullet() {
+            if self.kind(tx, ty, level).blocks_bullet() {
                 return false;
             }
         }
@@ -635,7 +730,7 @@ impl SpatialGrid {
         let cy1 = cy1.min(CHUNKS_Y.saturating_sub(1));
         let cx1 = cx1.min(CHUNKS_X.saturating_sub(1));
         for cy in cy0..=cy1 {
-            for cx in cx0..=cx1 {
+            for cx in cx0..cx1 {
                 out.extend_from_slice(self.chunk(cx, cy));
             }
         }
@@ -651,17 +746,20 @@ mod tests {
     fn map_generates_with_expected_size() {
         let map = GameMap::generate(MAP_W, MAP_H, 42);
         assert_eq!(map.len(), (MAP_W * MAP_H) as usize);
-        assert_eq!(map.kind(0, 0), TileKind::Steel);
+        assert_eq!(map.kind(0, 0, LEVEL_GROUND), TileKind::Steel);
+        assert_eq!(map.levels(), LEVELS);
     }
 
     #[test]
     fn rle_roundtrip() {
         let map = GameMap::generate(MAP_W, MAP_H, 7);
-        let rle = map.rle_encode();
-        let decoded = GameMap::rle_decode(&rle, MAP_W, MAP_H).expect("decode");
-        assert_eq!(decoded.len(), map.len());
-        for (i, v) in decoded.iter().enumerate() {
-            assert_eq!(*v, map.tiles[i]);
+        for level in 0..LEVELS {
+            let rle = map.rle_encode_level(level);
+            let decoded = GameMap::rle_decode(&rle, MAP_W, MAP_H).expect("decode");
+            assert_eq!(decoded.len(), map.len());
+            for (i, v) in decoded.iter().enumerate() {
+                assert_eq!(*v, map.layers[level as usize][i]);
+            }
         }
     }
 
@@ -675,18 +773,23 @@ mod tests {
     fn map_is_connected_from_center() {
         let map = GameMap::generate(MAP_W, MAP_H, 99);
         let (cx, cy) = (MAP_W / 2, MAP_H / 2);
-        assert!(map.rect_is_free(cx as f32 * TILE_SIZE, cy as f32 * TILE_SIZE, 30.0));
+        assert!(map.rect_is_free(cx as f32 * TILE_SIZE, cy as f32 * TILE_SIZE, 30.0, LEVEL_GROUND));
         // Каждая пустая клетка достижима: проверяем, что «карманов» не осталось.
         let mut visited = vec![false; map.len()];
         let mut stack = vec![(cx, cy)];
         visited[(cy * MAP_W + cx) as usize] = true;
         while let Some((x, y)) = stack.pop() {
-            for (nx, ny) in [(x.wrapping_sub(1), y), (x + 1, y), (x, y.wrapping_sub(1)), (x, y + 1)] {
+            for (nx, ny) in [
+                (x.wrapping_sub(1), y),
+                (x + 1, y),
+                (x, y.wrapping_sub(1)),
+                (x, y + 1),
+            ] {
                 if nx >= MAP_W || ny >= MAP_H {
                     continue;
                 }
                 let idx = (ny * MAP_W + nx) as usize;
-                if visited[idx] || map.blocks_tank(nx, ny) {
+                if visited[idx] || map.blocks_tank(nx, ny, LEVEL_GROUND) {
                     continue;
                 }
                 visited[idx] = true;
@@ -695,7 +798,7 @@ mod tests {
         }
         for y in 0..MAP_H {
             for x in 0..MAP_W {
-                if !map.blocks_tank(x, y) {
+                if !map.blocks_tank(x, y, LEVEL_GROUND) {
                     assert!(visited[(y * MAP_W + x) as usize], "недостижимая клетка {x},{y}");
                 }
             }
@@ -708,8 +811,24 @@ mod tests {
         let points = map.spawn_points(25, 30.0);
         assert!(!points.is_empty());
         for (x, y) in points {
-            assert!(map.rect_is_free(x, y, 30.0));
+            assert!(map.rect_is_free(x, y, 30.0, LEVEL_GROUND));
         }
+    }
+
+    #[test]
+    fn upper_level_has_ramps_on_both_levels() {
+        let map = GameMap::generate(MAP_W, MAP_H, 11);
+        let mut ramps = 0;
+        for y in 0..MAP_H {
+            for x in 0..MAP_W {
+                if map.kind(x, y, LEVEL_GROUND) == TileKind::Ramp {
+                    ramps += 1;
+                    // Трамплин есть на обоих ярусах: заехав на него, меняем этаж.
+                    assert_eq!(map.kind(x, y, LEVEL_UPPER), TileKind::Ramp);
+                }
+            }
+        }
+        assert!(ramps > 0, "на карте должны быть переходы между ярусами");
     }
 
     #[test]
@@ -725,8 +844,8 @@ mod tests {
     #[test]
     fn tile_damage_bits_are_packed() {
         let mut map = GameMap::generate(64, 64, 1);
-        map.set_value(5, 5, TileKind::Brick.bits() | (2 << 3));
-        assert_eq!(map.kind(5, 5), TileKind::Brick);
-        assert_eq!(map.damage(5, 5), 2);
+        map.set_value(5, 5, LEVEL_GROUND, TileKind::Brick.bits() | (2 << 3));
+        assert_eq!(map.kind(5, 5, LEVEL_GROUND), TileKind::Brick);
+        assert_eq!(map.damage(5, 5, LEVEL_GROUND), 2);
     }
 }

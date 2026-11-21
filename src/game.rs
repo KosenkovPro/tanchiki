@@ -8,10 +8,13 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::Sender;
 
-use crate::map::{GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, MAP_H, MAP_W, TILE_SIZE};
+use crate::map::{
+    GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, LEVEL_GROUND, LEVEL_UPPER, MAP_H, MAP_W,
+    TILE_SIZE,
+};
 use crate::protocol::{
     self, BulletView, Direction, EffectView, GameEvent, InputFlags, LeaderboardEntry, PlayerView,
-    PickupView, Snapshot, TileUpdate,
+    PickupView, Snapshot, SoundView, TileUpdate,
 };
 
 // ---------------------------------------------------------------------------
@@ -164,8 +167,31 @@ pub const MORTAR_COOLDOWN: u64 = 180;
 /// Кулдаун авиаподдержки (в тиках).
 pub const AIR_STRIKE_COOLDOWN: u64 = 450;
 
-/// Время полёта миномётного снаряда (в тиках).
-pub const MORTAR_FLIGHT_TICKS: u64 = 45;
+/// Во сколько раз миномётный снаряд медленнее прямого выстрела из пушки.
+///
+/// Требование ТЗ: «скорость полёта выстрела из гранатомёта должна быть в два
+/// раза медленнее, чем скорость прямого выстрела из пушки». Поэтому время
+/// полёта считается от дистанции и скорости пули, а не задаётся константой.
+pub const MORTAR_SPEED_RATIO: f32 = 0.5;
+
+/// Минимальное время полёта миномёта (в тиках) — для выстрела в упор.
+pub const MORTAR_MIN_FLIGHT_TICKS: u64 = 15;
+
+/// Максимальное время полёта миномёта (в тиках) — ограничение на дальность.
+pub const MORTAR_MAX_FLIGHT_TICKS: u64 = 300;
+
+/// Дальность слышимости выстрелов и взрывов (в пикселях).
+///
+/// Звук — единственный канал, который намеренно не скрывается конусом
+/// обзора: по нему игрок слышит, с какой стороны атакуют.
+pub const SOUND_HEAR_RANGE: f32 = 1800.0;
+
+/// Звук выстрела.
+pub const SOUND_SHOT: u8 = 0;
+/// Звук взрыва.
+pub const SOUND_EXPLOSION: u8 = 1;
+/// Звук попадания.
+pub const SOUND_HIT: u8 = 2;
 
 /// Задержка удара авиаподдержки (в тиках).
 pub const AIR_STRIKE_DELAY: u64 = 75;
@@ -410,6 +436,11 @@ pub struct Tank {
     pub vel: f32,
     /// Уровень прокачки 1..=3.
     pub level: u8,
+    /// Ярус (этаж по высоте), на котором находится танк.
+    pub deck: u8,
+    /// Стоял ли танк на трамплине в прошлом тике: нужен, чтобы ярус
+    /// переключался один раз, а не каждую клетку.
+    pub on_ramp: bool,
     /// Текущее здоровье.
     pub hp: u8,
     /// Максимальное здоровье.
@@ -438,6 +469,8 @@ impl Tank {
             move_dir: Direction::Down,
             vel: 0.0,
             level,
+            deck: crate::map::LEVEL_GROUND,
+            on_ramp: false,
             hp: max_hp,
             max_hp,
             cooldown: 0.0,
@@ -482,6 +515,8 @@ pub struct Pickup {
     pub kind: PickupKind,
     /// До какого тика бонус существует.
     pub expires_at: u64,
+    /// Ярус, на котором лежит бонус.
+    pub deck: u8,
 }
 
 /// Снаряд.
@@ -494,6 +529,8 @@ pub struct Bullet {
     pub y: f32,
     /// Направление полёта: 16 направлений (шаг 22.5°).
     pub dir: u8,
+    /// Ярус, на котором летит снаряд.
+    pub deck: u8,
     pub level: u8,
     pub damage: u8,
     pub speed: f32,
@@ -514,6 +551,8 @@ pub struct Mortar {
     pub start_tick: u64,
     /// Длительность полёта в тиках.
     pub flight_ticks: u64,
+    /// Ярус, с которого запущен снаряд.
+    pub deck: u8,
 }
 
 /// Вызов авиаподдержки: удар приходит в точку с задержкой.
@@ -525,6 +564,8 @@ pub struct AirStrike {
     pub y: f32,
     /// Тик, в который приходится удар.
     pub hit_tick: u64,
+    /// Ярус, по которому бьёт удар.
+    pub deck: u8,
 }
 
 /// Состояние ИИ-бота.
@@ -619,6 +660,11 @@ pub struct Game {
     pub tile_updates: Vec<TileUpdate>,
     /// События текущего тика.
     pub events: Vec<GameEvent>,
+    /// Звуковые события текущего тика.
+    ///
+    /// Их слышно даже вне конуса обзора — по ним игрок понимает, с какой
+    /// стороны атакуют.
+    pub sounds: Vec<SoundView>,
     /// Вспомогательный буфер для поиска пути.
     path_parent: Vec<u32>,
     path_queue: Vec<u32>,
@@ -631,10 +677,12 @@ impl Game {
 
         // Проверяем, что RLE-кодирование обратимо: клиент разворачивает поток
         // обратно в массив тайлов и должен получить ровно ту же карту.
-        let rle = map.rle_encode();
-        match GameMap::rle_decode(&rle, map.width(), map.height()) {
-            Some(decoded) if decoded.len() == map.len() => {}
-            _ => tracing::warn!("RLE-карта не проходит проверку round-trip"),
+        for level in 0..map.levels() {
+            let rle = map.rle_encode_level(level);
+            match GameMap::rle_decode(&rle, map.width(), map.height()) {
+                Some(decoded) if decoded.len() == map.len() => {}
+                _ => tracing::warn!("RLE-карта яруса {level} не проходит проверку round-trip"),
+            }
         }
 
         let total = (cfg.map_w * cfg.map_h) as usize;
@@ -654,7 +702,9 @@ impl Game {
             pickup_grid: SpatialGrid::new(),
             leaderboard: Vec::new(),
             tile_updates: Vec::new(),
-            events: Vec::new(),            path_parent: vec![u32::MAX; total],
+            events: Vec::new(),
+            sounds: Vec::new(),
+            path_parent: vec![u32::MAX; total],
             path_queue: Vec::with_capacity(total),
         }
     }
@@ -669,6 +719,7 @@ impl Game {
         self.tick += 1;
         self.tile_updates.clear();
         self.events.clear();
+        self.sounds.clear();
 
         let started = Instant::now();
         self.update_bots();
@@ -764,7 +815,7 @@ impl Game {
             return;
         };
 
-        let on_ice = self.is_on_ice(tank.x, tank.y);
+        let on_ice = self.is_on_ice(tank.x, tank.y, tank.deck);
         // Боты всегда медленнее игрока — иначе они ощущаются сильнее человека.
         let speed_mult = skill.map(|s| s.speed_mult()).unwrap_or(1.0);
         let speed = level_speed(level) * speed_mult;
@@ -810,6 +861,9 @@ impl Game {
             tank.track_phase += new_vel * TICK_DT / 6.0;
         }
 
+        // Трамплин меняет ярус: заехали на переход — оказались на другом этаже.
+        self.update_deck(&mut tank);
+
         if let Some(player) = self.players.get_mut(&pid) {
             player.tank = Some(tank);
         }
@@ -831,7 +885,7 @@ impl Game {
             } else {
                 (tank.x, candidate)
             };
-            if x >= 0.0 && y >= 0.0 && self.map.rect_is_free(x, y, TANK_SIZE) {
+            if x >= 0.0 && y >= 0.0 && self.map.rect_is_free(x, y, TANK_SIZE, tank.deck) {
                 tank.x = x;
                 tank.y = y;
                 return;
@@ -850,7 +904,7 @@ impl Game {
         for _ in 0..steps {
             let nx = tank.x + dx * step;
             let ny = tank.y + dy * step;
-            if !self.map.rect_is_free(nx, ny, TANK_SIZE) {
+            if !self.map.rect_is_free(nx, ny, TANK_SIZE, tank.deck) {
                 tank.vel = 0.0;
                 return;
             }
@@ -860,13 +914,35 @@ impl Game {
     }
 
     /// Находится ли танк на скользком тайле.
-    fn is_on_ice(&self, x: f32, y: f32) -> bool {
+    fn is_on_ice(&self, x: f32, y: f32, deck: u8) -> bool {
         let (tx, ty) = self.map.tile_at(x + TANK_SIZE * 0.5, y + TANK_SIZE * 0.5);
-        self.map.kind(tx, ty).is_slippery()
+        self.map.kind(tx, ty, deck).is_slippery()
+    }
+
+    /// Проверяет, не стоит ли танк на трамплине, и переключает ярус.
+    ///
+    /// Переход работает как дверной порог: ярус меняется только при
+    /// входе на трамплин, поэтому танк не «прыгает» между этажами,
+    /// стоя на нём.
+    fn update_deck(&mut self, tank: &mut Tank) {
+        let (tx, ty) = self.map.tile_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
+        let on_ramp = self.map.is_ramp(tx, ty, tank.deck);
+        if on_ramp && !tank.on_ramp {
+            let next = if tank.deck == LEVEL_GROUND {
+                LEVEL_UPPER
+            } else {
+                LEVEL_GROUND
+            };
+            // Переключаемся только если на новом ярусе тоже можно стоять.
+            if self.map.rect_is_free(tank.x, tank.y, TANK_SIZE, next) {
+                tank.deck = next;
+            }
+        }
+        tank.on_ramp = on_ramp;
     }
 
     fn update_player_fire(&mut self, pid: u32) {
-        let (fire, level, aim, cx, cy, fire_mult) = {
+        let (fire, level, aim, cx, cy, fire_mult, deck) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
@@ -882,7 +958,7 @@ impl Game {
             // У ботов перезарядка длиннее: чем выше сложность, тем чаще они стреляют.
             let fire_mult = player.bot.as_ref().map(|b| b.skill.fire_mult()).unwrap_or(1.0);
             let c = tank.center();
-            (true, tank.level, tank.aim, c.0, c.1, fire_mult)
+            (true, tank.level, tank.aim, c.0, c.1, fire_mult, tank.deck)
         };
         if !fire {
             return;
@@ -913,6 +989,7 @@ impl Game {
                 muzzle_x - BULLET_SIZE * 0.5,
                 muzzle_y - BULLET_SIZE * 0.5,
                 BULLET_SIZE,
+                deck,
             ) {
                 (muzzle_x, muzzle_y)
             } else {
@@ -929,6 +1006,7 @@ impl Game {
                     x: bx,
                     y: by,
                     dir: aim,
+                    deck,
                     level,
                     damage: level_bullet_damage(level),
                     speed: level_bullet_speed(level),
@@ -936,12 +1014,29 @@ impl Game {
             );
         }
 
+        // Звук выстрела слышат и те, кто не видит стрелка.
+        self.emit_sound(cx, cy, SOUND_SHOT, pid, deck);
+
         if let Some(player) = self.players.get_mut(&pid) {
             if let Some(tank) = player.tank.as_mut() {
                 tank.cooldown = level_fire_cooldown(level) * fire_mult;
                 tank.revealed_until = self.tick + REVEAL_TICKS;
             }
         }
+    }
+
+    /// Кладёт звуковое событие в очередь текущего тика.
+    fn emit_sound(&mut self, x: f32, y: f32, kind: u8, owner: u32, deck: u8) {
+        let id = self.next_entity_id;
+        self.next_entity_id += 1;
+        self.sounds.push(SoundView {
+            id,
+            x,
+            y,
+            kind,
+            owner,
+            deck,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -961,12 +1056,14 @@ impl Game {
             }
 
             let (tx, ty) = self.map.tile_at(b.x, b.y);
-            if self.map.kind(tx, ty).blocks_bullet() {
-                self.hit_tile(tx, ty, b.level, b.damage, b.owner);
+            if self.map.kind(tx, ty, b.deck).blocks_bullet() {
+                self.hit_tile(tx, ty, b.level, b.damage, b.owner, b.deck);
                 continue;
             }
 
             if let Some(hit) = self.find_tank_hit(&b) {
+                // Звук попадания слышно и тогда, когда противника не видно.
+                self.emit_sound(b.x, b.y, SOUND_HIT, b.owner, b.deck);
                 self.apply_damage(hit, b.damage, b.owner);
                 continue;
             }
@@ -990,7 +1087,7 @@ impl Game {
         for m in mortars.into_values() {
             let elapsed = now.saturating_sub(m.start_tick);
             if elapsed >= m.flight_ticks {
-                self.explode(m.x1, m.y1, MORTAR_RADIUS, MORTAR_DAMAGE, m.owner);
+                self.explode(m.x1, m.y1, MORTAR_RADIUS, MORTAR_DAMAGE, m.owner, m.deck);
                 continue;
             }
             kept_mortars.insert(m.id, m);
@@ -1002,7 +1099,7 @@ impl Game {
         let mut kept_strikes: HashMap<u32, AirStrike> = HashMap::with_capacity(strikes.len());
         for s in strikes.into_values() {
             if now >= s.hit_tick {
-                self.explode(s.x, s.y, AIR_STRIKE_RADIUS, AIR_STRIKE_DAMAGE, s.owner);
+                self.explode(s.x, s.y, AIR_STRIKE_RADIUS, AIR_STRIKE_DAMAGE, s.owner, s.deck);
                 continue;
             }
             kept_strikes.insert(s.id, s);
@@ -1011,13 +1108,19 @@ impl Game {
     }
 
     /// Взрыв в точке: урон по танкам в радиусе и разрушение кирпича.
-    fn explode(&mut self, x: f32, y: f32, radius: f32, damage: u8, owner: u32) {
+    ///
+    /// Взрыв действует только на своём ярусе: перекрытие этажей не даёт
+    /// ударить танк внизу.
+    fn explode(&mut self, x: f32, y: f32, radius: f32, damage: u8, owner: u32, deck: u8) {
         let r2 = radius * radius;
         let hit: Vec<u32> = self
             .players
             .iter()
             .filter(|(_, p)| {
                 p.tank.as_ref().is_some_and(|t| {
+                    if t.deck != deck {
+                        return false;
+                    }
                     let (cx, cy) = t.center();
                     let dx = cx - x;
                     let dy = cy - y;
@@ -1042,8 +1145,8 @@ impl Game {
                 if dx * dx + dy * dy > r2 {
                     continue;
                 }
-                if self.map.kind(tx, ty) == crate::map::TileKind::Brick {
-                    self.hit_tile(tx, ty, 3, damage, owner);
+                if self.map.kind(tx, ty, deck) == crate::map::TileKind::Brick {
+                    self.hit_tile(tx, ty, 3, damage, owner, deck);
                 }
             }
         }
@@ -1052,50 +1155,62 @@ impl Game {
             x,
             y,
             size: (radius / 8.0).round().clamp(1.0, 24.0) as u8,
+            deck,
         });
+        // Взрыв слышен и за пределами конуса обзора.
+        self.emit_sound(x, y, SOUND_EXPLOSION, owner, deck);
     }
 
     /// Обрабатывает попадание снаряда в тайл.
-    fn hit_tile(&mut self, tx: u32, ty: u32, level: u8, damage: u8, owner: u32) {
-        let kind = self.map.kind(tx, ty);
+    fn hit_tile(&mut self, tx: u32, ty: u32, level: u8, damage: u8, owner: u32, deck: u8) {
+        let kind = self.map.kind(tx, ty, deck);
         match kind {
             TileKind::Brick => {
-                let dmg = self.map.damage(tx, ty).saturating_add(damage);
+                let dmg = self.map.damage(tx, ty, deck).saturating_add(damage);
                 if dmg >= crate::map::BRICK_MAX_DAMAGE {
-                    self.map.set_kind(tx, ty, TileKind::Empty);
+                    self.map.set_kind(tx, ty, deck, TileKind::Empty);
                     self.events.push(GameEvent::TileBroken {
                         x: tx as u16,
                         y: ty as u16,
+                        deck,
                     });
                     if let Some(player) = self.players.get_mut(&owner) {
                         player.score += BRICK_SCORE;
                     }
                 } else {
-                    self.map.set_value(tx, ty, TileKind::Brick.bits() | (dmg << 3));
+                    self.map.set_value(
+                        tx,
+                        ty,
+                        deck,
+                        TileKind::Brick.bits() | (dmg << 3),
+                    );
                 }
-                let value = self.map.value(tx, ty);
+                let value = self.map.value(tx, ty, deck);
                 self.tile_updates.push(TileUpdate {
                     x: tx as u16,
                     y: ty as u16,
                     value,
+                    deck,
                 });
             }
             TileKind::Steel => {
                 // Бетон пробивается только снарядом максимального уровня.
                 if level >= 3 {
-                    self.map.set_kind(tx, ty, TileKind::Empty);
+                    self.map.set_kind(tx, ty, deck, TileKind::Empty);
                     self.events.push(GameEvent::TileBroken {
                         x: tx as u16,
                         y: ty as u16,
+                        deck,
                     });
                     if let Some(player) = self.players.get_mut(&owner) {
                         player.score += BRICK_SCORE * 2;
                     }
-                    let value = self.map.value(tx, ty);
+                    let value = self.map.value(tx, ty, deck);
                     self.tile_updates.push(TileUpdate {
                         x: tx as u16,
                         y: ty as u16,
                         value,
+                        deck,
                     });
                 }
             }
@@ -1104,6 +1219,9 @@ impl Game {
     }
 
     /// Ищет танк, задетый снарядом.
+    ///
+    /// Попасть можно только в танк на том же ярусе: стены верхнего этажа
+    /// не пуляют снизу.
     fn find_tank_hit(&self, b: &Bullet) -> Option<u32> {
         let bx = b.x - BULLET_SIZE * 0.5;
         let by = b.y - BULLET_SIZE * 0.5;
@@ -1114,6 +1232,9 @@ impl Game {
             let Some(tank) = player.tank.as_ref() else {
                 continue;
             };
+            if tank.deck != b.deck {
+                continue;
+            }
             if aabb_overlap(bx, by, BULLET_SIZE, BULLET_SIZE, tank.x, tank.y, TANK_SIZE, TANK_SIZE) {
                 return Some(*pid);
             }
@@ -1147,7 +1268,7 @@ impl Game {
             .players
             .get(&pid)
             .and_then(|p| p.tank.as_ref())
-            .map(|t| t.center());
+            .map(|t| (t.center(), t.deck));
 
         let (score, kills, deaths, joined_at) = {
             let Some(player) = self.players.get_mut(&pid) else {
@@ -1173,8 +1294,14 @@ impl Game {
             }
         }
 
-        if let Some((x, y)) = center {
-            self.events.push(GameEvent::Explosion { x, y, size: 3 });
+        if let Some((pos, deck)) = center {
+            self.events.push(GameEvent::Explosion {
+                x: pos.0,
+                y: pos.1,
+                size: 3,
+                deck,
+            });
+            self.emit_sound(pos.0, pos.1, SOUND_EXPLOSION, by, deck);
         }
         self.events.push(GameEvent::Kill {
             killer: by,
@@ -1187,8 +1314,8 @@ impl Game {
 
         // Из уничтоженного танка иногда выпадает звезда прокачки.
         if self.rng.chance(35) {
-            if let Some((x, y)) = center {
-                self.spawn_pickup_at(x, y, PickupKind::Star);
+            if let Some((pos, deck)) = center {
+                self.spawn_pickup_at(pos.0, pos.1, PickupKind::Star, deck);
             }
         }
     }
@@ -1214,12 +1341,16 @@ impl Game {
                 let Some(tank) = player.tank.as_ref() else {
                     continue;
                 };
-                (tank.x, tank.y)
+                (tank.x, tank.y, tank.deck)
             };
-            let (tx, ty) = rect;
+            let (tx, ty, deck) = rect;
 
             let mut collected: Option<Pickup> = None;
             self.pickups.retain(|_, p| {
+                // Бонус подбирается только на своём ярусе.
+                if p.deck != deck {
+                    return true;
+                }
                 let hit = p.x >= tx - 4.0
                     && p.x <= tx + TANK_SIZE + 4.0
                     && p.y >= ty - 4.0
@@ -1277,8 +1408,8 @@ impl Game {
         }
     }
 
-    /// Ставит бонус в указанную точку.
-    fn spawn_pickup_at(&mut self, x: f32, y: f32, kind: PickupKind) {
+    /// Ставит бонус в указанную точку на нужном ярусе.
+    fn spawn_pickup_at(&mut self, x: f32, y: f32, kind: PickupKind, deck: u8) {
         let id = self.next_entity_id;
         self.next_entity_id += 1;
         self.pickups.insert(
@@ -1289,6 +1420,7 @@ impl Game {
                 y,
                 kind,
                 expires_at: self.tick + PICKUP_LIFETIME,
+                deck,
             },
         );
     }
@@ -1301,16 +1433,18 @@ impl Game {
         for _ in 0..64 {
             let tx = self.rng.range(2, self.cfg.map_w.saturating_sub(2));
             let ty = self.rng.range(2, self.cfg.map_h.saturating_sub(2));
-            if self.map.blocks_tank(tx, ty) || self.map.kind(tx, ty) == TileKind::Forest {
+            if self.map.blocks_tank(tx, ty, LEVEL_GROUND)
+                || self.map.kind(tx, ty, LEVEL_GROUND) == TileKind::Forest
+            {
                 continue;
             }
             // Бонус не должен появляться прямо под танком.
             let cx = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let cy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let occupied = self.players.values().any(|p| {
-                p.tank
-                    .as_ref()
-                    .is_some_and(|t| (t.x - cx).abs() < 48.0 && (t.y - cy).abs() < 48.0)
+                p.tank.as_ref().is_some_and(|t| {
+                    t.deck == LEVEL_GROUND && (t.x - cx).abs() < 48.0 && (t.y - cy).abs() < 48.0
+                })
             });
             if occupied {
                 continue;
@@ -1328,7 +1462,7 @@ impl Game {
             45..=74 => PickupKind::Shield,
             _ => PickupKind::Repair,
         };
-        self.spawn_pickup_at(x, y, kind);
+        self.spawn_pickup_at(x, y, kind, LEVEL_GROUND);
     }
 
     // -----------------------------------------------------------------------
@@ -1348,7 +1482,7 @@ impl Game {
     }
 
     fn update_bot(&mut self, pid: u32) {
-        let (bx, by, next_plan, prev_target, skill) = {
+        let (bx, by, next_plan, prev_target, skill, deck) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
@@ -1360,7 +1494,7 @@ impl Game {
                 .as_ref()
                 .map(|b| (b.next_plan_tick, b.target, b.skill))
                 .unwrap_or((0, None, BotSkill::Normal));
-            (tank.x, tank.y, next_plan, prev_target, skill)
+            (tank.x, tank.y, next_plan, prev_target, skill, tank.deck)
         };
 
         let now = self.tick;
@@ -1368,7 +1502,7 @@ impl Game {
         let mut target = prev_target;
 
         if replan {
-            target = self.find_bot_target(pid, bx, by, skill);
+            target = self.find_bot_target(pid, bx, by, skill, deck);
         }
 
         // Пересчитываем маршрут к цели.
@@ -1379,15 +1513,21 @@ impl Game {
                     .players
                     .get(&tid)
                     .and_then(|p| p.tank.as_ref())
+                    .filter(|t| t.deck == deck)
                     .map(|t| self.map.tile_at(t.x + TANK_SIZE * 0.5, t.y + TANK_SIZE * 0.5));
                 if let Some(goal) = goal {
-                    path = self.find_path(self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5), goal)
+                    path = self
+                        .find_path(
+                            self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5),
+                            goal,
+                            deck,
+                        )
                         .unwrap_or_default();
                 }
             }
             // Цели нет — бот бродит по карте, чтобы мир не выглядел мёртвым.
             if path.is_empty() && target.is_none() {
-                path = self.wander_path(bx, by);
+                path = self.wander_path(bx, by, deck);
             }
             if let Some(player) = self.players.get_mut(&pid) {
                 if let Some(bot) = player.bot.as_mut() {
@@ -1418,17 +1558,19 @@ impl Game {
         let mut aim: Option<u8> = None;
 
         if let Some(tid) = target {
-            let target_center = self
+            let target_info = self
                 .players
                 .get(&tid)
                 .and_then(|p| p.tank.as_ref())
-                .map(|t| t.center());
-            if let Some(tc) = target_center {
+                .map(|t| (t.center(), t.deck));
+            if let Some((tc, target_deck)) = target_info {
                 let bcx = bx + TANK_SIZE * 0.5;
                 let bcy = by + TANK_SIZE * 0.5;
                 // Видим цель — наводимся (с ошибкой по уровню сложности)
                 // и стреляем, если реакция уже прошла.
-                if self.map.bullet_line_of_sight(bcx, bcy, tc.0, tc.1) {
+                if target_deck == deck
+                    && self.map.bullet_line_of_sight(bcx, bcy, tc.0, tc.1, deck)
+                {
                     let error = self
                         .players
                         .get(&pid)
@@ -1496,15 +1638,15 @@ impl Game {
     }
 
     /// Случайный маршрут для блуждания, когда поблизости нет цели.
-    fn wander_path(&mut self, bx: f32, by: f32) -> Vec<(u32, u32)> {
+    fn wander_path(&mut self, bx: f32, by: f32, deck: u8) -> Vec<(u32, u32)> {
         let from = self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5);
         for _ in 0..8 {
             let tx = self.rng.range(1, self.cfg.map_w.saturating_sub(1));
             let ty = self.rng.range(1, self.cfg.map_h.saturating_sub(1));
-            if self.map.blocks_tank(tx, ty) {
+            if self.map.blocks_tank(tx, ty, deck) {
                 continue;
             }
-            if let Some(path) = self.find_path(from, (tx, ty)) {
+            if let Some(path) = self.find_path(from, (tx, ty), deck) {
                 if !path.is_empty() {
                     return path;
                 }
@@ -1518,7 +1660,14 @@ impl Game {
     /// Приоритет — цели, которые видно: так боты дерутся и друг с другом,
     /// а не только с игроками. Дальность обзора зависит от сложности:
     /// «лёгкий» бот в принципе не замечает врага за 800 пикселей.
-    fn find_bot_target(&self, bot_id: u32, bx: f32, by: f32, skill: BotSkill) -> Option<u32> {
+    fn find_bot_target(
+        &self,
+        bot_id: u32,
+        bx: f32,
+        by: f32,
+        skill: BotSkill,
+        deck: u8,
+    ) -> Option<u32> {
         let bcx = bx + TANK_SIZE * 0.5;
         let bcy = by + TANK_SIZE * 0.5;
         let sight = skill.sight_range();
@@ -1531,6 +1680,10 @@ impl Game {
             let Some(tank) = player.tank.as_ref() else {
                 continue;
             };
+            // Противник на другом ярусе — за стеной этажа, его не видно.
+            if tank.deck != deck {
+                continue;
+            }
             let tcx = tank.x + TANK_SIZE * 0.5;
             let tcy = tank.y + TANK_SIZE * 0.5;
             let dx = tcx - bcx;
@@ -1542,7 +1695,7 @@ impl Game {
             if best_any.is_none_or(|(_, bd)| dist < bd) {
                 best_any = Some((*pid, dist));
             }
-            if self.map.bullet_line_of_sight(bcx, bcy, tcx, tcy)
+            if self.map.bullet_line_of_sight(bcx, bcy, tcx, tcy, deck)
                 && best_visible.is_none_or(|(_, bd)| dist < bd)
             {
                 best_visible = Some((*pid, dist));
@@ -1551,8 +1704,13 @@ impl Game {
         best_visible.or(best_any).map(|(id, _)| id)
     }
 
-    /// Поиск пути по тайлам (BFS).
-    fn find_path(&mut self, from: (u32, u32), to: (u32, u32)) -> Option<Vec<(u32, u32)>> {
+    /// Поиск пути по тайлам (BFS) в пределах одного яруса.
+    fn find_path(
+        &mut self,
+        from: (u32, u32),
+        to: (u32, u32),
+        deck: u8,
+    ) -> Option<Vec<(u32, u32)>> {
         let w = self.map.width() as usize;
         let h = self.map.height() as usize;
         if from.0 as usize >= w || from.1 as usize >= h {
@@ -1561,7 +1719,7 @@ impl Game {
         if to.0 as usize >= w || to.1 as usize >= h {
             return None;
         }
-        if self.map.blocks_tank(to.0, to.1) {
+        if self.map.blocks_tank(to.0, to.1, deck) {
             return None;
         }
         if from == to {
@@ -1602,7 +1760,7 @@ impl Game {
                 if self.path_parent[nidx] != u32::MAX {
                     continue;
                 }
-                if self.map.blocks_tank(nx as u32, ny as u32) {
+                if self.map.blocks_tank(nx as u32, ny as u32, deck) {
                     continue;
                 }
                 self.path_parent[nidx] = cur;
@@ -1661,15 +1819,20 @@ impl Game {
                     .players
                     .get(&id)
                     .and_then(|p| p.tank.as_ref())
-                    .map(|t| t.center());
+                    .map(|t| (t.center(), t.deck));
                 if let Some(player) = self.players.get_mut(&id) {
                     if player.removal_at.is_none() {
                         player.removal_at = Some(self.tick + 45);
                         player.tank = None;
                     }
                 }
-                if let Some((x, y)) = pos {
-                    self.events.push(GameEvent::Explosion { x, y, size: 2 });
+                if let Some((pos, deck)) = pos {
+                    self.events.push(GameEvent::Explosion {
+                        x: pos.0,
+                        y: pos.1,
+                        size: 2,
+                        deck,
+                    });
                 }
             }
         }
@@ -2034,7 +2197,7 @@ impl Game {
     /// У каждой способности свой кулдаун, а дальность ограничена.
     fn try_use_ability(&mut self, pid: u32) {
         let now = self.tick;
-        let (ability, mortar_ready, airstrike_ready, origin, target) = {
+        let (ability, mortar_ready, airstrike_ready, origin, target, level, deck) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
@@ -2047,6 +2210,8 @@ impl Game {
                 player.airstrike_ready_at,
                 tank.center(),
                 (player.target_x, player.target_y),
+                tank.level,
+                tank.deck,
             )
         };
 
@@ -2079,6 +2244,13 @@ impl Game {
 
         match ability {
             protocol::ability::MORTAR => {
+                // Скорость миномётного снаряда — вдвое меньше скорости пули,
+                // поэтому время полёта считается от дистанции.
+                let mortar_speed = level_bullet_speed(level) * MORTAR_SPEED_RATIO;
+                let flight_ticks = ((dist / mortar_speed.max(1.0)) / TICK_DT)
+                    .round()
+                    .max(MORTAR_MIN_FLIGHT_TICKS as f32)
+                    .min(MORTAR_MAX_FLIGHT_TICKS as f32) as u64;
                 let id = self.next_entity_id;
                 self.next_entity_id += 1;
                 self.mortars.insert(
@@ -2091,7 +2263,8 @@ impl Game {
                         x1: tx,
                         y1: ty,
                         start_tick: now,
-                        flight_ticks: MORTAR_FLIGHT_TICKS,
+                        flight_ticks,
+                        deck,
                     },
                 );
                 if let Some(player) = self.players.get_mut(&pid) {
@@ -2109,6 +2282,7 @@ impl Game {
                         x: tx,
                         y: ty,
                         hit_tick: now + AIR_STRIKE_DELAY,
+                        deck,
                     },
                 );
                 if let Some(player) = self.players.get_mut(&pid) {
@@ -2161,11 +2335,11 @@ impl Game {
         };
 
         // Направление башни наблюдателя задаёт конус обзора.
-        let (viewer_aim, alive) = viewer
+        let (viewer_aim, alive, viewer_deck) = viewer
             .tank
             .as_ref()
-            .map(|t| (t.aim, true))
-            .unwrap_or((0, false));
+            .map(|t| (t.aim, true, t.deck))
+            .unwrap_or((0, false, LEVEL_GROUND));
 
         // --- Танки ---
         for pid in self.player_grid.query(cx0, cy0, cx1, cy1) {
@@ -2175,6 +2349,10 @@ impl Game {
             let Some(tank) = player.tank.as_ref() else {
                 continue;
             };
+            // На другом ярусе противников не видно: этаж перекрывает обзор.
+            if tank.deck != viewer_deck {
+                continue;
+            }
             if !self.can_see(
                 viewer_id,
                 focus_x,
@@ -2184,6 +2362,7 @@ impl Game {
                 ccx,
                 ccy,
                 tank,
+                viewer_deck,
             ) {
                 continue;
             }
@@ -2195,6 +2374,7 @@ impl Game {
                 y: tank.y,
                 dir: tank.dir,
                 aim: tank.aim,
+                deck: tank.deck,
                 level: tank.level,
                 hp: tank.hp,
                 max_hp: tank.max_hp,
@@ -2203,15 +2383,16 @@ impl Game {
                 score: player.score,
                 kills: player.kills,
                 ability: player.ability,
-                ability_cd: {
-                    // Кулдаун именно выбранной способности.
-                    let ready = match player.ability {
-                        protocol::ability::MORTAR => player.mortar_ready_at,
-                        protocol::ability::AIR_STRIKE => player.airstrike_ready_at,
-                        _ => 0,
-                    };
-                    ready.saturating_sub(self.tick).min(u16::MAX as u64) as u16
-                },
+                // Оба кулдауна присылаются всегда: панель показывает
+                // готовность обеих способностей, а не только выбранной.
+                mortar_cd: player
+                    .mortar_ready_at
+                    .saturating_sub(self.tick)
+                    .min(u16::MAX as u64) as u16,
+                airstrike_cd: player
+                    .airstrike_ready_at
+                    .saturating_sub(self.tick)
+                    .min(u16::MAX as u64) as u16,
             });
         }
 
@@ -2220,8 +2401,12 @@ impl Game {
             let Some(bullet) = self.bullets.get(&bid) else {
                 continue;
             };
+            if bullet.deck != viewer_deck {
+                continue;
+            }
             // Снаряд за пределами конуса не виден — как и противник.
-            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, bullet.x, bullet.y) {
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, bullet.x, bullet.y, viewer_deck)
+            {
                 continue;
             }
             snap.bullets.push(BulletView {
@@ -2229,6 +2414,7 @@ impl Game {
                 x: bullet.x,
                 y: bullet.y,
                 dir: bullet.dir,
+                deck: bullet.deck,
                 level: bullet.level,
             });
         }
@@ -2238,19 +2424,26 @@ impl Game {
             let Some(pickup) = self.pickups.get(&pid) else {
                 continue;
             };
+            if pickup.deck != viewer_deck {
+                continue;
+            }
             snap.pickups.push(PickupView {
                 id: pickup.id,
                 x: pickup.x,
                 y: pickup.y,
                 kind: pickup.kind.as_u8(),
                 ttl: (pickup.expires_at.saturating_sub(self.tick)) as u32,
+                deck: pickup.deck,
             });
         }
 
         // --- Эффекты: миномёты в полёте и вызовы авиаподдержки ---
         for m in self.mortars.values() {
+            if m.deck != viewer_deck {
+                continue;
+            }
             let (mx, my) = mortar_position(m, self.tick);
-            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, mx, my) {
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, mx, my, viewer_deck) {
                 continue;
             }
             // Клиенту нужны обе точки: из начала и в цель — по ним он
@@ -2264,10 +2457,14 @@ impl Game {
                 x2: m.x1,
                 y2: m.y1,
                 phase,
+                deck: m.deck,
             });
         }
         for s in self.airstrikes.values() {
-            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, s.x, s.y) {
+            if s.deck != viewer_deck {
+                continue;
+            }
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, s.x, s.y, viewer_deck) {
                 continue;
             }
             let total = AIR_STRIKE_DELAY.max(1);
@@ -2281,6 +2478,7 @@ impl Game {
                 x2: s.x,
                 y2: s.y,
                 phase,
+                deck: s.deck,
             });
         }
 
@@ -2293,13 +2491,27 @@ impl Game {
             }
         }
 
+        // --- Звуки ---
+        //
+        // Единственный канал, который намеренно не скрывается конусом
+        // обзора: по нему игрок слышит, с какой стороны атакуют.
+        let hear2 = SOUND_HEAR_RANGE * SOUND_HEAR_RANGE;
+        for sound in self.sounds.iter() {
+            let dx = sound.x - focus_x;
+            let dy = sound.y - focus_y;
+            if dx * dx + dy * dy > hear2 {
+                continue;
+            }
+            snap.sounds.push(*sound);
+        }
+
         // --- События ---
         for event in self.events.iter() {
             let (ex, ey) = match *event {
                 GameEvent::Explosion { x, y, .. } => (x, y),
                 GameEvent::PickupCollected { x, y, .. } => (x, y),
                 GameEvent::AbilityUsed { x, y, .. } => (x, y),
-                GameEvent::TileBroken { x, y } => (
+                GameEvent::TileBroken { x, y, .. } => (
                     x as f32 * TILE_SIZE + TILE_SIZE * 0.5,
                     y as f32 * TILE_SIZE + TILE_SIZE * 0.5,
                 ),
@@ -2321,7 +2533,15 @@ impl Game {
     ///
     /// Конус шириной 120° вокруг направления башни, дальность — 900 пикселей.
     /// Кирпичные и бетонные стены перекрывают обзор, вода и лес — нет.
-    pub fn in_vision(&self, vx: f32, vy: f32, aim: u8, x: f32, y: f32) -> bool {
+    pub fn in_vision(
+        &self,
+        vx: f32,
+        vy: f32,
+        aim: u8,
+        x: f32,
+        y: f32,
+        deck: u8,
+    ) -> bool {
         debug_assert!(
             (VISION_COS - VISION_HALF_ANGLE.cos()).abs() < 1e-6,
             "порог обзора разошёлся с углом конуса"
@@ -2341,7 +2561,7 @@ impl Game {
         if cos < VISION_COS {
             return false;
         }
-        self.map.bullet_line_of_sight(vx, vy, x, y)
+        self.map.bullet_line_of_sight(vx, vy, x, y, deck)
     }
 
     /// Виден ли танк наблюдателю (конус обзора, чаща и радиус чанков).
@@ -2355,6 +2575,7 @@ impl Game {
         ccx: u32,
         ccy: u32,
         tank: &Tank,
+        deck: u8,
     ) -> bool {
         let (ocx, ocy) = self.map.chunk_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
         let radius = crate::map::VIEW_CHUNK_RADIUS as i64;
@@ -2364,14 +2585,15 @@ impl Game {
 
         // Главное правило тумана войны: противник виден только там,
         // куда «смотрит» башня наблюдателя.
-        if alive && !self.in_vision(vx, vy, aim, tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5)
+        if alive
+            && !self.in_vision(vx, vy, aim, tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5, deck)
         {
             return false;
         }
 
         // Танк в чаще не виден врагам снаружи лесного массива, пока не выстрелит.
         let (otx, oty) = self.map.tile_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
-        if let Some(region) = self.map.forest_region(otx, oty) {
+        if let Some(region) = self.map.forest_region(otx, oty, deck) {
             if tank.revealed_until <= self.tick {
                 let viewer_region = self
                     .players
@@ -2379,7 +2601,7 @@ impl Game {
                     .and_then(|p| p.tank.as_ref())
                     .and_then(|t| {
                         let (tx, ty) = self.map.tile_at(t.x + TANK_SIZE * 0.5, t.y + TANK_SIZE * 0.5);
-                        self.map.forest_region(tx, ty)
+                        self.map.forest_region(tx, ty, deck)
                     });
                 if viewer_region != Some(region) {
                     return false;
@@ -2490,15 +2712,15 @@ mod tests {
     }
 
     #[test]
-    fn aim_towards_picks_sixteen_directions() {
+    fn aim_towards_picks_sixty_four_directions() {
         // Угол 0 — вправо, дальше по часовой стрелке (ось Y вниз).
         assert_eq!(aim_towards(0.0, 0.0, 100.0, 0.0), 0);
-        assert_eq!(aim_towards(0.0, 0.0, 0.0, 100.0), 4);
-        assert_eq!(aim_towards(0.0, 0.0, -100.0, 0.0), 8);
-        assert_eq!(aim_towards(0.0, 0.0, 0.0, -100.0), 12);
-        // Диагональ 45° попадает между кардинальными: шаг башни 22.5°.
-        assert_eq!(aim_towards(0.0, 0.0, 100.0, 100.0), 2);
-        assert_eq!(aim_towards(0.0, 0.0, -100.0, 100.0), 6);
+        assert_eq!(aim_towards(0.0, 0.0, 0.0, 100.0), 16);
+        assert_eq!(aim_towards(0.0, 0.0, -100.0, 0.0), 32);
+        assert_eq!(aim_towards(0.0, 0.0, 0.0, -100.0), 48);
+        // Диагональ 45° попадает между кардинальными: шаг башни 5.625°.
+        assert_eq!(aim_towards(0.0, 0.0, 100.0, 100.0), 8);
+        assert_eq!(aim_towards(0.0, 0.0, -100.0, 100.0), 24);
     }
 
     #[test]
@@ -2548,6 +2770,7 @@ mod tests {
                         y: ty,
                         kind: PickupKind::Star,
                         expires_at: u64::MAX,
+                        deck: LEVEL_GROUND,
                     },
                 );
             }
@@ -2653,7 +2876,7 @@ mod tests {
             .and_then(|p| p.tank.as_ref())
             .map(|t| (t.x, t.y))
             .expect("tank");
-        assert!(game.map.rect_is_free(start.0, start.1, TANK_SIZE));
+        assert!(game.map.rect_is_free(start.0, start.1, TANK_SIZE, LEVEL_GROUND));
 
         // Долгий проход вправо не должен вывести танк за пределы карты.
         for _ in 0..600 {
@@ -2673,26 +2896,26 @@ mod tests {
     fn bullets_damage_bricks_and_bricks_have_damage_stages() {
         let mut game = test_game();
         // Ставим кирпич в известное место.
-        game.map.set_kind(10, 10, TileKind::Brick);
+        game.map.set_kind(10, 10, LEVEL_GROUND, TileKind::Brick);
         let owner = 1u32;
-        game.hit_tile(10, 10, 1, 1, owner);
-        assert_eq!(game.map.damage(10, 10), 1);
-        game.hit_tile(10, 10, 1, 1, owner);
-        assert_eq!(game.map.damage(10, 10), 2);
+        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
+        assert_eq!(game.map.damage(10, 10, LEVEL_GROUND), 1);
+        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
+        assert_eq!(game.map.damage(10, 10, LEVEL_GROUND), 2);
         // Четыре попадания — кирпич разрушен.
-        game.hit_tile(10, 10, 1, 1, owner);
-        game.hit_tile(10, 10, 1, 1, owner);
-        assert_eq!(game.map.kind(10, 10), TileKind::Empty);
+        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
+        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
+        assert_eq!(game.map.kind(10, 10, LEVEL_GROUND), TileKind::Empty);
     }
 
     #[test]
     fn steel_survives_normal_bullets_and_dies_from_level_three() {
         let mut game = test_game();
-        game.map.set_kind(12, 12, TileKind::Steel);
-        game.hit_tile(12, 12, 1, 1, 1);
-        assert_eq!(game.map.kind(12, 12), TileKind::Steel);
-        game.hit_tile(12, 12, 3, 3, 1);
-        assert_eq!(game.map.kind(12, 12), TileKind::Empty);
+        game.map.set_kind(12, 12, LEVEL_GROUND, TileKind::Steel);
+        game.hit_tile(12, 12, 1, 1, 1, LEVEL_GROUND);
+        assert_eq!(game.map.kind(12, 12, LEVEL_GROUND), TileKind::Steel);
+        game.hit_tile(12, 12, 3, 3, 1, LEVEL_GROUND);
+        assert_eq!(game.map.kind(12, 12, LEVEL_GROUND), TileKind::Empty);
     }
 
     #[test]
@@ -2757,12 +2980,12 @@ mod tests {
             .and_then(|p| p.tank.as_ref())
             .map(|t| t.center())
             .expect("center");
-        game.spawn_pickup_at(center.0, center.1, PickupKind::Repair);
+        game.spawn_pickup_at(center.0, center.1, PickupKind::Repair, LEVEL_GROUND);
         game.update_pickups();
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("tank");
         assert_eq!(tank.hp, tank.max_hp);
 
-        game.spawn_pickup_at(center.0, center.1, PickupKind::Star);
+        game.spawn_pickup_at(center.0, center.1, PickupKind::Star, LEVEL_GROUND);
         game.update_pickups();
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("tank");
         assert_eq!(tank.level, 2);
@@ -2780,16 +3003,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Расчищает прямоугольник тайлов — чтобы тест не зависел от карты.
-    fn clear_tiles(game: &mut Game, x0: u32, y0: u32, x1: u32, y1: u32) {
+    fn clear_tiles(game: &mut Game, x0: u32, y0: u32, x1: u32, y1: u32, deck: u8) {
         for ty in y0..=y1 {
             for tx in x0..=x1 {
-                game.map.set_kind(tx, ty, TileKind::Empty);
+                game.map.set_kind(tx, ty, deck, TileKind::Empty);
             }
         }
     }
 
     /// Ставит танк игрока в заданную точку: без стен, без защиты при спавне.
     fn place_tank(game: &mut Game, pid: u32, x: f32, y: f32, aim: u8) {
+        place_tank_on(game, pid, x, y, aim, LEVEL_GROUND);
+    }
+
+    /// Ставит танк игрока на нужный ярус.
+    fn place_tank_on(game: &mut Game, pid: u32, x: f32, y: f32, aim: u8, deck: u8) {
         if let Some(player) = game.players.get_mut(&pid) {
             player.aim = aim;
             if let Some(tank) = player.tank.as_mut() {
@@ -2797,6 +3025,8 @@ mod tests {
                 tank.y = y;
                 tank.aim = aim;
                 tank.dir = Direction::Down;
+                tank.deck = deck;
+                tank.on_ramp = false;
                 tank.cooldown = 0.0;
                 tank.spawn_protect_until = 0;
                 tank.shield_until = 0;
@@ -2828,7 +3058,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 2, 2, 20, 20);
+        clear_tiles(&mut game, 2, 2, 20, 20, LEVEL_GROUND);
         // Корпус смотрит вниз, башня — вправо.
         place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
 
@@ -2864,7 +3094,7 @@ mod tests {
         game.join_player(viewer, "A".into());
         game.join_player(behind, "B".into());
         game.join_player(ahead, "C".into());
-        clear_tiles(&mut game, 0, 6, 30, 14);
+        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
@@ -2898,8 +3128,8 @@ mod tests {
         place_tank(&mut game, pid, x, y, 0);
         place_tank(&mut game, victim, x + 150.0, y, 0);
         // Между стрелком и целью — стена: миномёт её перелетает.
-        clear_tiles(&mut game, 8, 9, 12, 11);
-        game.map.set_kind(13, 10, TileKind::Steel);
+        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
+        game.map.set_kind(13, 10, LEVEL_GROUND, TileKind::Steel);
 
         let hp_before = game
             .players
@@ -2921,8 +3151,9 @@ mod tests {
             y,
         );
         assert_eq!(game.mortars.len(), 1, "миномёт должен вылететь");
+        let flight_ticks = game.mortars.values().next().expect("миномёт").flight_ticks;
 
-        for _ in 0..MORTAR_FLIGHT_TICKS + 2 {
+        for _ in 0..flight_ticks + 2 {
             game.tick();
         }
         assert!(game.mortars.is_empty(), "миномёт должен упасть");
@@ -2944,7 +3175,7 @@ mod tests {
         let victim = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
         game.join_player(victim, "B".into());
-        clear_tiles(&mut game, 8, 9, 12, 11);
+        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
@@ -3004,7 +3235,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 8, 9, 12, 11);
+        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
         place_tank(&mut game, pid, x, y, 0);
@@ -3052,5 +3283,171 @@ mod tests {
             y,
         );
         assert!(game.airstrikes.is_empty(), "дальность способности ограничена");
+    }
+
+    // -----------------------------------------------------------------------
+    // Механики v4: ярусы, звук, кулдауны
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mortar_flies_twice_slower_than_a_bullet() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 9, 16, 11, LEVEL_GROUND);
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank(&mut game, pid, x, y, 0);
+
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::MORTAR,
+            x + 300.0,
+            y,
+        );
+        let mortar = game.mortars.values().next().expect("миномёт");
+        let dist = (mortar.x1 - mortar.x0).abs();
+
+        // Скорость миномёта — ровно половина скорости пули.
+        let bullet_speed = level_bullet_speed(1);
+        let expected =
+            ((dist / (bullet_speed * MORTAR_SPEED_RATIO)) / TICK_DT).round() as u64;
+        assert_eq!(mortar.flight_ticks, expected, "время полёта миномёта");
+
+        // А значит — вдвое дольше, чем летел бы прямой снаряд.
+        let bullet_time = ((dist / bullet_speed) / TICK_DT).round() as u64;
+        assert!(
+            (mortar.flight_ticks as f64 - bullet_time as f64 * 2.0).abs() < 2.0,
+            "миномёт должен лететь вдвое медленнее пули: {} против {} тиков",
+            mortar.flight_ticks,
+            bullet_time
+        );
+    }
+
+    #[test]
+    fn shots_are_heard_outside_the_view_cone() {
+        let mut game = test_game();
+        let viewer = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        let shooter = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(viewer, "A".into());
+        game.join_player(shooter, "B".into());
+        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
+
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        // Башня наблюдателя смотрит вправо, стрелок — за спиной.
+        place_tank(&mut game, viewer, x, y, 0);
+        place_tank(&mut game, shooter, x - 200.0, y, 0);
+
+        game.apply_input(
+            2,
+            1,
+            InputFlags {
+                fire: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::NONE,
+            0.0,
+            0.0,
+        );
+        game.tick();
+
+        let snap = game.snapshot_for(viewer).expect("снимок");
+        assert!(
+            !snap.players.iter().any(|p| p.id == shooter),
+            "стрелок за спиной не должен быть виден"
+        );
+        assert!(
+            snap.sounds
+                .iter()
+                .any(|s| s.kind == SOUND_SHOT && s.owner == shooter),
+            "выстрел за спиной должен быть слышен"
+        );
+    }
+
+    #[test]
+    fn ramp_moves_the_tank_to_another_deck() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 9, 14, 11, LEVEL_GROUND);
+        clear_tiles(&mut game, 8, 9, 14, 11, LEVEL_UPPER);
+        // Трамплин есть сразу на обоих ярусах.
+        game.map.set_kind(11, 10, LEVEL_GROUND, TileKind::Ramp);
+        game.map.set_kind(11, 10, LEVEL_UPPER, TileKind::Ramp);
+
+        place_tank(&mut game, pid, 11.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        game.tick();
+
+        let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+        assert_eq!(tank.deck, LEVEL_UPPER, "заезд на трамплин меняет ярус");
+    }
+
+    #[test]
+    fn enemies_on_another_deck_are_hidden() {
+        let mut game = test_game();
+        let viewer = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        let foe = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(viewer, "A".into());
+        game.join_player(foe, "B".into());
+        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
+        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_UPPER);
+
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank_on(&mut game, viewer, x, y, 0, LEVEL_GROUND);
+        // Противник прямо перед наблюдателем, но этажом выше.
+        place_tank_on(&mut game, foe, x + 200.0, y, 0, LEVEL_UPPER);
+
+        game.tick();
+        let snap = game.snapshot_for(viewer).expect("снимок");
+        assert!(
+            !snap.players.iter().any(|p| p.id == foe),
+            "противник на другом ярусе не виден"
+        );
+        assert!(
+            snap.players.iter().any(|p| p.id == viewer),
+            "свой танк виден всегда"
+        );
+    }
+
+    #[test]
+    fn snapshot_always_reports_both_cooldowns() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 9, 16, 11, LEVEL_GROUND);
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank(&mut game, pid, x, y, 0);
+
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::MORTAR,
+            x + 200.0,
+            y,
+        );
+        game.tick();
+
+        let snap = game.snapshot_for(pid).expect("снимок");
+        let me = snap.players.iter().find(|p| p.id == pid).expect("игрок");
+        assert!(me.mortar_cd > 0, "кулдаун миномёта виден всегда");
+        assert_eq!(
+            me.airstrike_cd, 0,
+            "кулдаун авиаподдержки тоже присылается всегда"
+        );
     }
 }

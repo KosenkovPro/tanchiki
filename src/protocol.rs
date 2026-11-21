@@ -15,8 +15,11 @@ use std::fmt;
 /// * `1` — четыре направления, лидерборд без убийств;
 /// * `2` — восемь направлений (включая диагонали), в лидерборде есть убийства;
 /// * `3` — башня смотрит в 16 направлений (наведение мышью), добавлены
-///   способности (миномёт, авиаподдержка) и туман войны по конусу взгляда.
-pub const PROTOCOL_VERSION: u16 = 3;
+///   способности (миномёт, авиаподдержка) и туман войны по конусу взгляда;
+/// * `4` — башня смотрит в 64 направления (шаг 5.625°), карта разделена на
+///   ярусы (этажи), у сущностей есть `deck`, звуки приходят отдельным
+///   каналом и слышны вне конуса обзора.
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// Максимальная длина никнейма в байтах UTF-8.
 pub const MAX_NICK_LEN: usize = 16;
@@ -185,24 +188,27 @@ impl Direction {
 // Наведение (башня)
 // ---------------------------------------------------------------------------
 
-/// Количество направлений наведения башни (шаг 22.5°).
-pub const AIM_COUNT: u8 = 16;
+/// Количество направлений наведения башни (шаг 5.625°).
+///
+/// Много направлений нужно для плавной границы конуса обзора: при 16
+/// направлениях край конуса прыгал на 22.5° и тайлы «моргали».
+pub const AIM_COUNT: u8 = 64;
 
 /// Единичный вектор направления наведения.
 ///
 /// Угол `0` — вправо, дальше по часовой стрелке: в экранных координатах
 /// ось Y направлена вниз.
 pub fn aim_delta(aim: u8) -> (f32, f32) {
-    let a = aim as f32 * (std::f32::consts::PI / 8.0);
+    let a = aim as f32 * (std::f32::consts::PI * 2.0 / AIM_COUNT as f32);
     (a.cos(), a.sin())
 }
 
-/// Направление наведения по вектору: округление до ближайшего из 16.
+/// Направление наведения по вектору: округление до ближайшего из 64.
 pub fn aim_from_vector(dx: f32, dy: f32) -> u8 {
     if dx.abs() < f32::EPSILON && dy.abs() < f32::EPSILON {
         return 0;
     }
-    let step = std::f32::consts::PI / 8.0;
+    let step = std::f32::consts::PI * 2.0 / AIM_COUNT as f32;
     let idx = (dy.atan2(dx) / step).round() as i32;
     idx.rem_euclid(AIM_COUNT as i32) as u8
 }
@@ -277,8 +283,10 @@ pub struct PlayerView {
     pub y: f32,
     /// Направление корпуса (восемь направлений движения).
     pub dir: Direction,
-    /// Направление башни (16 направлений) — по нему летят снаряды.
+    /// Направление башни (64 направления, шаг 5.625°) — по нему летят снаряды.
     pub aim: u8,
+    /// Ярус (этаж по высоте), на котором находится танк.
+    pub deck: u8,
     pub level: u8,
     pub hp: u8,
     pub max_hp: u8,
@@ -288,8 +296,10 @@ pub struct PlayerView {
     pub kills: u32,
     /// Выбранная способность игрока.
     pub ability: u8,
-    /// Через сколько тиков способность снова будет доступна.
-    pub ability_cd: u16,
+    /// Через сколько тиков миномёт снова будет доступен.
+    pub mortar_cd: u16,
+    /// Через сколько тиков авиаподдержка снова будет доступна.
+    pub airstrike_cd: u16,
 }
 
 /// Состояние снаряда.
@@ -298,9 +308,28 @@ pub struct BulletView {
     pub id: u32,
     pub x: f32,
     pub y: f32,
-    /// Направление полёта (16 направлений).
+    /// Направление полёта (64 направления).
     pub dir: u8,
+    /// Ярус, на котором летит снаряд.
+    pub deck: u8,
     pub level: u8,
+}
+
+/// Звуковое событие: источник звука в мировых координатах.
+///
+/// Отправляется всем, кто рядом, даже если источника не видно: по нему
+/// клиент играет объёмный звук и игрок слышит, с какой стороны атакуют.
+#[derive(Debug, Clone, Copy)]
+pub struct SoundView {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    /// `0` — выстрел, `1` — взрыв, `2` — попадание.
+    pub kind: u8,
+    /// Чей это звук (`0` — бота, иначе id игрока).
+    pub owner: u32,
+    /// Ярус, на котором произошёл звук.
+    pub deck: u8,
 }
 
 /// Визуальный эффект: снаряд миномёта, вызов авиаподдержки и т. п.
@@ -316,6 +345,8 @@ pub struct EffectView {
     pub y2: f32,
     /// Ход процесса: `0..=100`.
     pub phase: u8,
+    /// Ярус эффекта.
+    pub deck: u8,
 }
 
 /// Состояние бонуса.
@@ -327,6 +358,8 @@ pub struct PickupView {
     pub kind: u8,
     /// Остаток времени жизни в тиках.
     pub ttl: u32,
+    /// Ярус, на котором лежит бонус.
+    pub deck: u8,
 }
 
 /// Изменение одного тайла карты.
@@ -335,15 +368,28 @@ pub struct TileUpdate {
     pub x: u16,
     pub y: u16,
     pub value: u8,
+    /// Ярус, на котором изменился тайл.
+    pub deck: u8,
 }
 
 /// Событие мира для клиента.
 #[derive(Debug, Clone, Copy)]
 pub enum GameEvent {
     /// Взрыв.
-    Explosion { x: f32, y: f32, size: u8 },
+    Explosion {
+        x: f32,
+        y: f32,
+        size: u8,
+        /// Ярус, на котором произошёл взрыв.
+        deck: u8,
+    },
     /// Разрушенный тайл.
-    TileBroken { x: u16, y: u16 },
+    TileBroken {
+        x: u16,
+        y: u16,
+        /// Ярус, на котором разрушен тайл.
+        deck: u8,
+    },
     /// Подобранный бонус.
     PickupCollected { x: f32, y: f32, kind: u8 },
     /// Уничтожение танка.
@@ -393,6 +439,8 @@ pub struct Snapshot {
     pub events: Vec<GameEvent>,
     /// Визуальные эффекты (миномёты, авиаподдержка).
     pub effects: Vec<EffectView>,
+    /// Звуковые события — их слышно даже вне конуса обзора.
+    pub sounds: Vec<SoundView>,
 }
 
 /// Данные карты для начальной синхронизации.
@@ -401,8 +449,8 @@ pub struct MapData {
     pub width: u32,
     pub height: u32,
     pub tile_size: u32,
-    /// RLE-поток: тройки `value:u8, len:u16`.
-    pub rle: Vec<u8>,
+    /// RLE-потоки тайлов: по одному на ярус.
+    pub rle: Vec<Vec<u8>>,
 }
 
 /// Сообщение, разобранное из клиентского пакета.
@@ -414,7 +462,7 @@ pub enum ClientMessage {
     Input {
         seq: u32,
         input: InputFlags,
-        /// Направление башни (0..16).
+        /// Направление башни (0..64).
         aim: u8,
         /// Запрошенная способность.
         ability: u8,
@@ -481,11 +529,17 @@ impl Writer {
     }
 
     /// Записывает строку с префиксом-длиной `u16`.
+    ///
+    /// Обрезка идёт **по границе символа**: кириллица занимает два байта,
+    /// и простое обрезание по байтам разорвало бы многобайтовый символ —
+    /// клиент получил бы невалидный UTF-8 и отбросил бы сообщение.
     pub fn string(&mut self, v: &str) -> &mut Self {
-        let bytes = v.as_bytes();
-        let len = bytes.len().min(MAX_NICK_LEN);
-        self.u16(len as u16);
-        self.buf.extend_from_slice(&bytes[..len]);
+        let mut end = v.len().min(MAX_NICK_LEN);
+        while end > 0 && !v.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.u16(end as u16);
+        self.buf.extend_from_slice(&v.as_bytes()[..end]);
         self
     }
 
@@ -624,8 +678,11 @@ fn write_map(w: &mut Writer, map: &MapData) {
     w.u32(map.width);
     w.u32(map.height);
     w.u32(map.tile_size);
-    w.u32(map.rle.len() as u32);
-    w.bytes(&map.rle);
+    w.u8(map.rle.len() as u8);
+    for layer in &map.rle {
+        w.u32(layer.len() as u32);
+        w.bytes(layer);
+    }
 }
 
 /// Кодирует снимок мира.
@@ -655,13 +712,15 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.f32(p.y);
         w.u8(p.dir as u8);
         w.u8(p.aim);
+        w.u8(p.deck);
         w.u8(p.level);
         w.u8(p.hp);
         w.u8(p.max_hp);
         w.u32(p.score);
         w.u32(p.kills);
         w.u8(p.ability);
-        w.u16(p.ability_cd);
+        w.u16(p.mortar_cd);
+        w.u16(p.airstrike_cd);
     }
 
     w.u16(snap.bullets.len() as u16);
@@ -670,6 +729,7 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.f32(b.x);
         w.f32(b.y);
         w.u8(b.dir);
+        w.u8(b.deck);
         w.u8(b.level);
     }
 
@@ -680,6 +740,7 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.f32(p.y);
         w.u8(p.kind);
         w.u32(p.ttl);
+        w.u8(p.deck);
     }
 
     w.u16(snap.tiles.len() as u16);
@@ -687,6 +748,7 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.u16(t.x);
         w.u16(t.y);
         w.u8(t.value);
+        w.u8(t.deck);
     }
 
     w.u16(snap.effects.len() as u16);
@@ -698,20 +760,33 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.f32(e.x2);
         w.f32(e.y2);
         w.u8(e.phase);
+        w.u8(e.deck);
+    }
+
+    w.u16(snap.sounds.len() as u16);
+    for s in &snap.sounds {
+        w.u32(s.id);
+        w.f32(s.x);
+        w.f32(s.y);
+        w.u8(s.kind);
+        w.u32(s.owner);
+        w.u8(s.deck);
     }
 
     w.u16(snap.events.len() as u16);
     for e in &snap.events {
         w.u8(e.kind_byte());
         match *e {
-            GameEvent::Explosion { x, y, size } => {
+            GameEvent::Explosion { x, y, size, deck } => {
                 w.f32(x);
                 w.f32(y);
                 w.u8(size);
+                w.u8(deck);
             }
-            GameEvent::TileBroken { x, y } => {
+            GameEvent::TileBroken { x, y, deck } => {
                 w.u16(x);
                 w.u16(y);
+                w.u8(deck);
             }
             GameEvent::PickupCollected { x, y, kind } => {
                 w.f32(x);
@@ -868,18 +943,33 @@ mod tests {
     }
 
     #[test]
-    fn aim_has_sixteen_directions() {
-        // Вправо — 0, вниз — 4, влево — 8, вверх — 12.
+    fn aim_has_sixty_four_directions() {
+        // Вправо — 0, вниз — 16, влево — 32, вверх — 48.
         assert_eq!(aim_from_vector(1.0, 0.0), 0);
-        assert_eq!(aim_from_vector(0.0, 1.0), 4);
-        assert_eq!(aim_from_vector(-1.0, 0.0), 8);
-        assert_eq!(aim_from_vector(0.0, -1.0), 12);
-        // Диагональ вправо-вниз — между 0 и 4, то есть 2.
-        assert_eq!(aim_from_vector(1.0, 1.0), 2);
+        assert_eq!(aim_from_vector(0.0, 1.0), 16);
+        assert_eq!(aim_from_vector(-1.0, 0.0), 32);
+        assert_eq!(aim_from_vector(0.0, -1.0), 48);
+        // Диагональ вправо-вниз — между 0 и 16, то есть 8.
+        assert_eq!(aim_from_vector(1.0, 1.0), 8);
         let (dx, dy) = aim_delta(0);
         assert!((dx - 1.0).abs() < 0.001 && dy.abs() < 0.001);
-        let (dx, dy) = aim_delta(4);
+        let (dx, dy) = aim_delta(16);
         assert!(dx.abs() < 0.001 && (dy - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn aim_covers_full_circle_without_gaps() {
+        // Шаг башни не должен оставлять «дыр» между лучами: иначе край
+        // конуса обзора прыгает и блоки в тумане начинают моргать.
+        let step = std::f32::consts::PI * 2.0 / AIM_COUNT as f32;
+        for i in 0..AIM_COUNT {
+            let (dx, dy) = aim_delta(i);
+            let len = (dx * dx + dy * dy).sqrt();
+            assert!((len - 1.0).abs() < 1e-5, "вектор направления не единичный");
+            // Обратное преобразование должно вернуть тот же индекс.
+            assert_eq!(aim_from_vector(dx, dy), i);
+        }
+        assert!((step * AIM_COUNT as f32 - std::f32::consts::PI * 2.0).abs() < 1e-5);
     }
 
     #[test]
@@ -901,6 +991,20 @@ mod tests {
     }
 
     #[test]
+    fn writer_truncates_strings_on_a_character_boundary() {
+        // Девять кириллических букв — 18 байт. Лимит в 16 байт попадает
+        // ровно посередине девятой буквы: обрезать по байтам нельзя.
+        let mut w = Writer::new();
+        w.string("абвгдеёжзи");
+        let bytes = w.finish();
+        let len = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
+        assert_eq!(len, 16);
+        let text = std::str::from_utf8(&bytes[2..]).expect("строка должна остаться UTF-8");
+        assert_eq!(text.chars().count(), 8, "обрезка должна быть по символу");
+        assert!(text.len() <= MAX_NICK_LEN);
+    }
+
+    #[test]
     fn snapshot_encodes_and_reports_length() {
         let snap = Snapshot {
             tick: 42,
@@ -914,6 +1018,7 @@ mod tests {
                 y: 2.0,
                 dir: Direction::Left,
                 aim: 5,
+                deck: 0,
                 level: 2,
                 hp: 3,
                 max_hp: 4,
@@ -922,17 +1027,24 @@ mod tests {
                 score: 10,
                 kills: 1,
                 ability: ability::MORTAR,
-                ability_cd: 12,
+                mortar_cd: 30,
+                airstrike_cd: 0,
             }],
             bullets: vec![BulletView {
                 id: 9,
                 x: 5.0,
                 y: 6.0,
                 dir: 3,
+                deck: 0,
                 level: 1,
             }],
             pickups: Vec::new(),
-            tiles: vec![TileUpdate { x: 3, y: 4, value: 8 }],
+            tiles: vec![TileUpdate {
+                x: 3,
+                y: 4,
+                value: 8,
+                deck: 0,
+            }],
             events: vec![GameEvent::Kill { killer: 1, victim: 2 }],
             effects: vec![EffectView {
                 id: 4,
@@ -942,6 +1054,15 @@ mod tests {
                 x2: 3.0,
                 y2: 4.0,
                 phase: 50,
+                deck: 0,
+            }],
+            sounds: vec![SoundView {
+                id: 5,
+                x: 10.0,
+                y: 20.0,
+                kind: 0,
+                owner: 7,
+                deck: 0,
             }],
         };
         let bytes = encode_snapshot(&snap);

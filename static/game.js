@@ -43,13 +43,28 @@ const SNAP_HISTORY = 24;
 const VISION_RANGE = 900;
 /** Половина угла конуса обзора (60°, то есть конус 120°). */
 const VISION_HALF_ANGLE = Math.PI / 3;
-/** Сколько лучей используется для расчёта видимой области. */
-const VISION_RAYS = 56;
 /** Дальность применения способности. */
 const ABILITY_RANGE = 1400;
-/** Кулдауны способностей в тиках (30 тиков в секунду). */
-const MORTAR_COOLDOWN = 180;
-const AIR_STRIKE_COOLDOWN = 450;
+
+/** Нижний ярус — земля. */
+const LEVEL_GROUND = 0;
+/** Верхний ярус — площадки и перекрытия. */
+const LEVEL_UPPER = 1;
+/** Сколько ярусов на карте. */
+const LEVEL_COUNT = 2;
+
+/**
+ * Насколько быстро проявляется и гаснет тайл тумана.
+ *
+ * Плавная интерполяция вместо мгновенного переключения — главное
+ * средство от «моргания»: край конуса не щёлкает, а плавно темнеет.
+ * Значение — доля пути к цели за кадр: 0.14 даёт примерно 120 мс
+ * на проявление тайла, и при повороте взгляда ничего не вспыхивает.
+ */
+const FOG_FADE = 0.14;
+
+/** Насколько сильно исследованный, но не видимый тайл приглушается. */
+const FOG_MEMORY = 0.45;
 
 /** Угол поворота спрайта для каждого направления (радианы). */
 const ROT = [
@@ -98,6 +113,7 @@ const statScore = document.getElementById('stat-score');
 const statKills = document.getElementById('stat-kills');
 const statPing = document.getElementById('stat-ping');
 const statFps = document.getElementById('stat-fps');
+const statDeck = document.getElementById('stat-deck');
 const soundButton = document.getElementById('sound-toggle');
 const abilityBar = document.getElementById('ability-bar');
 const abilityHint = document.getElementById('ability-hint');
@@ -125,27 +141,40 @@ const state = {
   deaths: 0,
   focus: { x: 0, y: 0 },
   seq: 0,
-  /** Выбранная способность: NONE / MORTAR / AIR_STRIKE. */
-  ability: ABILITY.NONE,
+  /** Выбранная способность: миномёт или авиаподдержка. */
+  ability: ABILITY.MORTAR,
   /** Флаг «применить способность» — одноразовый, живёт до отправки пакета. */
   pendingUse: false,
-  /** Остаток кулдауна способности в тиках (приходит с сервера). */
-  abilityCd: 0,
+  /** Остаток кулдауна миномёта в тиках — присылается всегда. */
+  mortarCd: 0,
+  /** Остаток кулдауна авиаподдержки в тиках — присылается всегда. */
+  airstrikeCd: 0,
+  /** Ярус, на котором сейчас находится игрок. */
+  deck: LEVEL_GROUND,
 };
 
 /**
  * Туман войны в духе Age of Empires 2.
  *
- * `explored` — тайлы, где игрок уже был;
- * `visible` — тайлы, которые видно прямо сейчас (конус взгляда);
- * `seen` — «старый» вид тайла: тем, что было в момент последнего взгляда.
+ * Для каждого яруса храним:
+ *  - `explored` — тайлы, где игрок уже был;
+ *  - `light`    — текущая освещённость тайла (0..1), плавно меняется;
+ *  - `target`   — куда освещённость стремится (0 — темно, 1 — светло);
+ *  - `seen`     — «старый» вид тайла: тем, что было в момент последнего взгляда.
+ *
+ * Важно: видимость считается **по каждому тайлу отдельно** (проверка
+ * линии видимости), а не «веером лучей». Веер давал рваный край конуса,
+ * и тайлы на его границе то попадали в свет, то нет — это и было моргание.
+ * Поверх плавная интерполяция `light` убирает остаточные скачки.
  */
 const fog = {
-  explored: null,
-  visible: null,
-  seen: null,
+  explored: [],
+  light: [],
+  target: [],
+  seen: [],
   canvas: null,
   ctx: null,
+  image: null,
   /** Версия карты, для которой построены массивы. */
   width: 0,
   height: 0,
@@ -157,8 +186,8 @@ const pred = {
   x: 0,
   y: 0,
   dir: DIR.DOWN,
-  /** Направление башни: 16 направлений, задаётся курсором мыши. */
-  aim: 4,
+  /** Направление башни: 64 направления, задаётся курсором мыши. */
+  aim: 16,
   /** Направление движения: скорость направлена вдоль него. */
   moveDir: DIR.DOWN,
   vel: 0,
@@ -166,6 +195,10 @@ const pred = {
   hp: 3,
   maxHp: 3,
   shielded: false,
+  /** Ярус, на котором находится танк. */
+  deck: LEVEL_GROUND,
+  /** Стоял ли танк на трамплине в прошлом кадре. */
+  onRamp: false,
   /** Остаток перезарядки — по нему клиент играет звук выстрела. */
   cooldown: 0,
 };
@@ -183,8 +216,8 @@ let mouseDown = false;
 let inputAccumulator = 0;
 
 const particles = [];
-let terrainCanvas = null;
-let terrainCtx = null;
+let terrainCanvases = [];
+let terrainCtxs = [];
 let sprites = null;
 
 // ---------------------------------------------------------------------------
@@ -203,9 +236,14 @@ const audio = {
   buffers: new Map(),
   enabled: true,
   loading: false,
+  /** Процедурный звук мотора (без внешних файлов). */
+  engine: null,
 };
 
 const SFX_NAMES = ['shot', 'shot_foe', 'explosion', 'hit', 'pickup', 'powerup', 'damage'];
+
+/** Звуки из серверного канала: 0 — выстрел, 1 — взрыв, 2 — попадание. */
+const SPATIAL_SFX = ['shot_foe', 'explosion', 'hit'];
 
 /** Загружает и декодирует звуки. Вызывается по первому действию игрока. */
 async function initAudio() {
@@ -233,11 +271,134 @@ async function initAudio() {
         }
       }),
     );
+    initEngineSound();
   } catch (err) {
     console.warn('звук недоступен:', err);
   }
   audio.loading = false;
   updateSoundButton();
+}
+
+/**
+ * Создаёт процедурный звук мотора.
+ *
+ * Два генератора (пила и меандр) через низкочастотный фильтр: звук
+ * «гудит» на холостых оборотах и поднимает тон по мере разгона.
+ */
+function initEngineSound() {
+  if (!audio.ctx || audio.engine) return;
+  const osc = audio.ctx.createOscillator();
+  osc.type = 'sawtooth';
+  osc.frequency.value = 40;
+  const sub = audio.ctx.createOscillator();
+  sub.type = 'square';
+  sub.frequency.value = 20;
+  const filter = audio.ctx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 300;
+  filter.Q.value = 3;
+  const gain = audio.ctx.createGain();
+  gain.gain.value = 0;
+  osc.connect(filter);
+  sub.connect(filter);
+  filter.connect(gain);
+  gain.connect(audio.master);
+  osc.start();
+  sub.start();
+  audio.engine = { osc, sub, filter, gain };
+}
+
+/**
+ * Обновляет звук мотора: громкость и тон зависят от скорости танка.
+ *
+ * @param {number} speed текущая скорость в пикселях в секунду
+ */
+function updateEngineSound(speed) {
+  const e = audio.engine;
+  if (!e || !audio.ctx) return;
+  const now = audio.ctx.currentTime;
+  const norm = Math.min(1, Math.abs(speed) / BASE_SPEED);
+  const level = audio.enabled ? 0.03 + norm * 0.075 : 0;
+  e.gain.gain.setTargetAtTime(level, now, 0.08);
+  e.osc.frequency.setTargetAtTime(38 + norm * 54, now, 0.12);
+  e.sub.frequency.setTargetAtTime(19 + norm * 27, now, 0.12);
+  e.filter.frequency.setTargetAtTime(220 + norm * 540, now, 0.12);
+}
+
+/** Ставит источник звука в мировую точку (плоскость мира — XZ). */
+function setPannerPosition(node, x, y) {
+  if (node.positionX) {
+    node.positionX.value = x;
+    node.positionY.value = 0;
+    node.positionZ.value = y;
+  } else if (node.setPosition) {
+    node.setPosition(x, 0, y);
+  }
+}
+
+/**
+ * Ставит «слушателя» в позицию игрока и направляет его по башне.
+ *
+ * Благодаря этому выстрел противника звучит слева, справа, спереди или
+ * сзади — игрок понимает, с какой стороны атакуют.
+ */
+function updateAudioListener() {
+  if (!audio.ctx) return;
+  const l = audio.ctx.listener;
+  const px = pred.x + TANK_SIZE / 2;
+  const py = pred.y + TANK_SIZE / 2;
+  const dir = aimDelta(pred.aim);
+  if (l.positionX) {
+    l.positionX.value = px;
+    l.positionY.value = 0;
+    l.positionZ.value = py;
+    l.forwardX.value = dir.x;
+    l.forwardY.value = 0;
+    l.forwardZ.value = dir.y;
+    l.upX.value = 0;
+    l.upY.value = 1;
+    l.upZ.value = 0;
+  } else if (l.setPosition) {
+    l.setPosition(px, 0, py);
+    l.setOrientation(dir.x, 0, dir.y, 0, 1, 0);
+  }
+}
+
+/**
+ * Проигрывает звук с пространственным позиционированием.
+ *
+ * @param {number} kind  0 — выстрел, 1 — взрыв, 2 — попадание;
+ * @param {number} x     мировая координата источника;
+ * @param {number} y     мировая координата источника;
+ * @param {number} deck  ярус источника.
+ */
+function playSpatialSound(kind, x, y, deck) {
+  if (!audio.enabled || !audio.ctx) return;
+  const name = SPATIAL_SFX[kind] ?? 'shot_foe';
+  const buf = audio.buffers.get(name);
+  if (!buf) return;
+  if (audio.ctx.state === 'suspended') audio.ctx.resume();
+
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = 0.88 + Math.random() * 0.24;
+
+  const panner = audio.ctx.createPanner();
+  panner.panningModel = 'HRTF';
+  panner.distanceModel = 'inverse';
+  panner.refDistance = 240;
+  panner.maxDistance = 2400;
+  panner.rolloffFactor = 1.05;
+  setPannerPosition(panner, x, y);
+
+  const gain = audio.ctx.createGain();
+  // Звук с другого этажа слышен глуше — этаж перекрывает.
+  gain.gain.value = deck === pred.deck ? 0.8 : 0.45;
+
+  src.connect(panner);
+  panner.connect(gain);
+  gain.connect(audio.master);
+  src.start();
 }
 
 /** Проигрывает звук с заданной громкостью (0..1) и скоростью. */
@@ -346,6 +507,10 @@ function handleMessage(msg) {
       pred.x = msg.x - TANK_SIZE / 2;
       pred.y = msg.y - TANK_SIZE / 2;
       pred.vel = 0;
+      // Возрождение всегда на нижнем ярусе.
+      pred.deck = LEVEL_GROUND;
+      pred.onRamp = false;
+      state.deck = LEVEL_GROUND;
       correction.x = 0;
       correction.y = 0;
       hideOverlay();
@@ -363,18 +528,30 @@ function handleMessage(msg) {
 }
 
 function applyMap(map) {
-  const tiles = decodeRle(map.rle, map.width, map.height);
+  // Карта приходит по ярусам: отдельный RLE-поток на каждый этаж.
+  const streams = Array.isArray(map.rle) ? map.rle : [map.rle];
+  const layers = [];
+  for (let i = 0; i < LEVEL_COUNT; i++) {
+    const stream = streams[i];
+    layers.push(
+      stream
+        ? decodeRle(stream, map.width, map.height)
+        : new Uint8Array(map.width * map.height),
+    );
+  }
   state.map = {
     width: map.width,
     height: map.height,
     tileSize: map.tileSize || TILE_SIZE,
-    tiles,
+    levels: layers.length,
+    layers,
   };
-  buildTerrainCanvas();
+  buildTerrainCanvases();
   // Новая карта — память исследованного сбрасывается.
-  fog.explored = null;
-  fog.visible = null;
-  fog.seen = null;
+  fog.explored = [];
+  fog.light = [];
+  fog.target = [];
+  fog.seen = [];
   fog.width = 0;
   fog.height = 0;
   ensureFog();
@@ -389,6 +566,18 @@ function applyMap(map) {
 function applySnapshot(msg) {
   state.focus.x = msg.focusX;
   state.focus.y = msg.focusY;
+
+  // Ярус присылает сервер: он и решает, на каком этаже мы находимся.
+  // Синхронизируем сразу — от этого зависит, какие события показывать.
+  const mine = msg.players.find((p) => p.id === state.myId);
+  if (mine) {
+    const serverDeck = mine.deck ?? LEVEL_GROUND;
+    if (serverDeck !== pred.deck) {
+      pred.deck = serverDeck;
+      pred.onRamp = false;
+    }
+    state.deck = pred.deck;
+  }
 
   const players = new Map();
   for (const p of msg.players) {
@@ -410,32 +599,30 @@ function applySnapshot(msg) {
   });
   if (state.snapshots.length > SNAP_HISTORY) state.snapshots.shift();
 
-  // Выстрел противника рядом с нами — короткий щелчок.
-  const prevSnap = state.snapshots.length >= 2 ? state.snapshots[state.snapshots.length - 2] : null;
-  if (prevSnap && pred.active) {
-    const pcx = pred.x + TANK_SIZE / 2;
-    const pcy = pred.y + TANK_SIZE / 2;
-    for (const b of msg.bullets) {
-      if (prevSnap.bullets.has(b.id)) continue;
-      if (Math.hypot(b.x - pcx, b.y - pcy) < 260) {
-        playSound('shot_foe', 0.22, 0.92 + Math.random() * 0.16);
-        break;
-      }
-    }
+  // Звуковой канал: выстрелы и взрывы слышны даже вне конуса обзора,
+  // поэтому по ним игрок понимает, с какой стороны атакуют.
+  for (const s of msg.sounds ?? []) {
+    if (s.owner === state.myId) continue; // свой выстрел играем локально
+    playSpatialSound(s.kind, s.x, s.y, s.deck ?? LEVEL_GROUND);
   }
 
   // Обновляем карту дельтами.
   if (msg.tiles.length && state.map) {
     for (const t of msg.tiles) {
+      const deck = t.deck ?? 0;
+      const layer = state.map.layers[deck];
+      if (!layer) continue;
       if (t.x < state.map.width && t.y < state.map.height) {
-        state.map.tiles[t.y * state.map.width + t.x] = t.value;
-        paintTerrainTile(t.x, t.y);
+        layer[t.y * state.map.width + t.x] = t.value;
+        paintTerrainTile(t.x, t.y, deck);
       }
     }
   }
 
   // События мира.
   for (const ev of msg.events) {
+    const evDeck = ev.deck ?? 0;
+    if (evDeck !== state.deck) continue; // события другого этажа не показываем
     if (ev.kind === 'explosion') {
       spawnExplosion(ev.x, ev.y, ev.size);
       // Громкость взрыва зависит от расстояния до камеры.
@@ -461,14 +648,14 @@ function applySnapshot(msg) {
   }
 
   // Свой танк: сверяем предсказание с сервером.
-  const mine = msg.players.find((p) => p.id === state.myId);
   if (mine) {
     state.score = mine.score;
     state.kills = mine.kills;
     pred.level = mine.level;
     // Башня: направление считает клиент (по курсору мыши) — так наводка
     // не запаздывает на один круг по сети. Сервер получает его во вводе.
-    state.abilityCd = mine.abilityCd ?? 0;
+    state.mortarCd = mine.mortarCd ?? 0;
+    state.airstrikeCd = mine.airstrikeCd ?? 0;
     const hpBefore = pred.hp;
     pred.hp = mine.hp;
     pred.maxHp = mine.maxHp;
@@ -562,16 +749,13 @@ window.addEventListener('keydown', (e) => {
     toggleSound();
     return;
   }
-  // Выбор способности: 1 — пушка, 2 — миномёт, 3 — авиаподдержка.
+  // Выбор способности: 1 — миномёт, 2 — авиаподдержка.
+  // Обычная пушка отдельной кнопкой не нужна: она на левой кнопке мыши.
   if (e.code === 'Digit1') {
-    selectAbility(ABILITY.NONE);
-    return;
-  }
-  if (e.code === 'Digit2') {
     selectAbility(ABILITY.MORTAR);
     return;
   }
-  if (e.code === 'Digit3') {
+  if (e.code === 'Digit2') {
     selectAbility(ABILITY.AIR_STRIKE);
     return;
   }
@@ -649,9 +833,11 @@ canvas.addEventListener(
 // Предсказание движения
 // ---------------------------------------------------------------------------
 
-function mapRectFree(x, y, size) {
+function mapRectFree(x, y, size, deck = pred.deck) {
   const m = state.map;
   if (!m) return true;
+  const layer = m.layers[deck];
+  if (!layer) return true;
   const ts = m.tileSize;
   const x0 = Math.floor(x / ts);
   const y0 = Math.floor(y / ts);
@@ -660,20 +846,52 @@ function mapRectFree(x, y, size) {
   for (let ty = y0; ty <= y1; ty++) {
     for (let tx = x0; tx <= x1; tx++) {
       if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
-      const kind = m.tiles[ty * m.width + tx] & 7;
+      const kind = layer[ty * m.width + tx] & 7;
       if (kind === TILE.BRICK || kind === TILE.STEEL || kind === TILE.WATER) return false;
     }
   }
   return true;
 }
 
-function isOnIce(x, y) {
+function isOnIce(x, y, deck = pred.deck) {
   const m = state.map;
   if (!m) return false;
+  const layer = m.layers[deck];
+  if (!layer) return false;
   const tx = Math.floor((x + TANK_SIZE / 2) / m.tileSize);
   const ty = Math.floor((y + TANK_SIZE / 2) / m.tileSize);
   if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
-  return (m.tiles[ty * m.width + tx] & 7) === TILE.ICE;
+  return (layer[ty * m.width + tx] & 7) === TILE.ICE;
+}
+
+/** Стоит ли тайл на трамплине (переходе между ярусами). */
+function isRampAt(x, y, deck = pred.deck) {
+  const m = state.map;
+  if (!m) return false;
+  const layer = m.layers[deck];
+  if (!layer) return false;
+  const tx = Math.floor((x + TANK_SIZE / 2) / m.tileSize);
+  const ty = Math.floor((y + TANK_SIZE / 2) / m.tileSize);
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
+  return (layer[ty * m.width + tx] & 7) === TILE.RAMP;
+}
+
+/**
+ * Меняет ярус при заезде на трамплин.
+ *
+ * Переход работает как дверной порог: этаж меняется только при входе на
+ * трамплин, поэтому танк не «прыгает» между этажами, стоя на нём.
+ */
+function updatePredictedDeck() {
+  const onRamp = isRampAt(pred.x, pred.y, pred.deck);
+  if (onRamp && !pred.onRamp) {
+    const next = pred.deck === LEVEL_GROUND ? LEVEL_UPPER : LEVEL_GROUND;
+    if (mapRectFree(pred.x, pred.y, TANK_SIZE, next)) {
+      pred.deck = next;
+      state.deck = next;
+    }
+  }
+  pred.onRamp = onRamp;
 }
 
 function alignToGrid(dir) {
@@ -751,6 +969,9 @@ function stepPrediction(dt) {
   const dist = vel * dt;
   if (dist > 0.001) movePredicted(dist);
 
+  // Трамплин меняет ярус: заехали на переход — оказались на другом этаже.
+  updatePredictedDeck();
+
   // Перезарядка: по ней клиент понимает, когда прозвучит выстрел.
   pred.cooldown = Math.max(0, pred.cooldown - dt);
   if ((input & BIT.FIRE) !== 0 && pred.cooldown <= 0) {
@@ -778,22 +999,37 @@ function updateMouseWorld() {
 function ensureFog() {
   const m = state.map;
   if (!m) return false;
-  if (fog.width === m.width && fog.height === m.height) return true;
+  if (fog.width === m.width && fog.height === m.height && fog.explored.length === LEVEL_COUNT) {
+    return true;
+  }
   fog.width = m.width;
   fog.height = m.height;
   const total = m.width * m.height;
-  fog.explored = new Uint8Array(total);
-  fog.visible = new Uint8Array(total);
-  fog.seen = new Uint8Array(m.tiles);
+  fog.explored = [];
+  fog.light = [];
+  fog.target = [];
+  fog.seen = [];
+  for (let i = 0; i < LEVEL_COUNT; i++) {
+    fog.explored.push(new Uint8Array(total));
+    fog.light.push(new Float32Array(total));
+    fog.target.push(new Float32Array(total));
+    fog.seen.push(new Uint8Array(total));
+  }
   fog.canvas = document.createElement('canvas');
   fog.canvas.width = m.width;
   fog.canvas.height = m.height;
   fog.ctx = fog.canvas.getContext('2d');
+  fog.image = fog.ctx.createImageData(m.width, m.height);
+  // «Старый» вид тайлов — снимок того, как карта выглядела изначально.
+  for (let d = 0; d < LEVEL_COUNT; d++) {
+    const layer = m.layers[d];
+    if (layer) fog.seen[d].set(layer);
+  }
   return true;
 }
 
 /** Тайл по мировым координатам. */
-function tileIndexAt(x, y) {
+function tileIndexAt(x, y, deck = pred.deck) {
   const m = state.map;
   if (!m) return -1;
   const tx = Math.floor(x / m.tileSize);
@@ -803,88 +1039,148 @@ function tileIndexAt(x, y) {
 }
 
 /** Мешает ли тайл видеть дальше. */
-function blocksSight(tx, ty) {
+function blocksSight(tx, ty, deck) {
   const m = state.map;
   if (!m) return false;
   if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return true;
-  const kind = m.tiles[ty * m.width + tx] & 7;
+  const layer = m.layers[deck];
+  if (!layer) return false;
+  const kind = layer[ty * m.width + tx] & 7;
   return kind === TILE.BRICK || kind === TILE.STEEL;
+}
+
+/**
+ * Прямая видимость между двумя тайлами (Брезенхэм по сетке).
+ *
+ * Считается по каждому тайлу отдельно — это убирает «веер лучей», из-за
+ * которого край конуса был рваным и тайлы на нём моргали. Дополнительно
+ * проверяется «угол» при диагональном шаге: стена перекрывает обзор
+ * симметрично с обеих сторон.
+ */
+function hasLineOfSight(x0, y0, x1, y1, deck) {
+  const m = state.map;
+  if (!m) return true;
+  if (x0 === x1 && y0 === y1) return true;
+  const dx = Math.abs(x1 - x0);
+  const sx = x0 < x1 ? 1 : -1;
+  const dy = -Math.abs(y1 - y0);
+  const sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy;
+  let x = x0;
+  let y = y0;
+  for (;;) {
+    const px = x;
+    const py = y;
+    const e2 = 2 * err;
+    const movedX = e2 >= dy;
+    const movedY = e2 <= dx;
+    if (movedX) {
+      err += dy;
+      x += sx;
+    }
+    if (movedY) {
+      err += dx;
+      y += sy;
+    }
+    if (x === x1 && y === y1) return true;
+    if (x < 0 || y < 0 || x >= m.width || y >= m.height) return true;
+    if (movedX && movedY) {
+      if (blocksSight(px, y, deck) || blocksSight(x, py, deck)) return false;
+    }
+    if (blocksSight(x, y, deck)) return false;
+  }
 }
 
 /**
  * Пересчитывает видимую область: конус взгляда из башни.
  *
- * Луч идёт, пока не упрётся в стену: за стеной ничего не видно.
- * Видимые тайлы запоминаются — их «старый» вид сохраняется в `seen`.
+ * Видимость определяется по каждому тайлу: попадает ли он в конус и есть
+ * ли между ним и танком стена. Видимые тайлы запоминаются — их «старый»
+ * вид сохраняется в `seen`.
  */
-function updateVisibility(cx, cy, aim) {
+function updateVisibility(cx, cy, aim, deck) {
   const m = state.map;
   if (!m || !ensureFog()) return;
-  fog.visible.fill(0);
+  const target = fog.target[deck];
+  const explored = fog.explored[deck];
+  const seen = fog.seen[deck];
+  const layer = m.layers[deck];
+  if (!layer) return;
+  target.fill(0);
 
-  const base = aim * (Math.PI / 8);
-  const step = 8;
-  const maxSteps = Math.ceil(VISION_RANGE / step);
+  const ts = m.tileSize;
+  const ptx = Math.floor(cx / ts);
+  const pty = Math.floor(cy / ts);
+  const maxTiles = Math.ceil(VISION_RANGE / ts);
+  const dir = aimDelta(aim);
+  const cosLimit = Math.cos(VISION_HALF_ANGLE);
 
-  for (let i = 0; i <= VISION_RAYS; i++) {
-    const angle = base - VISION_HALF_ANGLE + (2 * VISION_HALF_ANGLE * i) / VISION_RAYS;
-    const dx = Math.cos(angle);
-    const dy = Math.sin(angle);
-    for (let s = 1; s <= maxSteps; s++) {
-      const px = cx + dx * s * step;
-      const py = cy + dy * s * step;
-      const tx = Math.floor(px / m.tileSize);
-      const ty = Math.floor(py / m.tileSize);
-      if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) break;
+  for (let dy = -maxTiles; dy <= maxTiles; dy++) {
+    for (let dx = -maxTiles; dx <= maxTiles; dx++) {
+      const tx = ptx + dx;
+      const ty = pty + dy;
+      if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) continue;
+      const vx = tx * ts + ts * 0.5 - cx;
+      const vy = ty * ts + ts * 0.5 - cy;
+      const dist = Math.hypot(vx, vy);
+      if (dist > VISION_RANGE) continue;
+      // Тайл должен попадать в конус обзора.
+      if (dist > 1 && (vx * dir.x + vy * dir.y) / dist < cosLimit) continue;
+      // И не должен быть отделён стеной.
+      if (!hasLineOfSight(ptx, pty, tx, ty, deck)) continue;
       const idx = ty * m.width + tx;
-      fog.visible[idx] = 1;
-      if (blocksSight(tx, ty)) break;
+      target[idx] = 1;
+      explored[idx] = 1;
+      seen[idx] = layer[idx];
     }
   }
 
   // Свой тайл всегда виден.
-  const own = tileIndexAt(cx, cy);
-  if (own >= 0) fog.visible[own] = 1;
-
-  // Запоминаем текущий вид тайлов, которые видны прямо сейчас.
-  for (let i = 0; i < fog.visible.length; i++) {
-    if (fog.visible[i]) {
-      fog.seen[i] = m.tiles[i];
-      fog.explored[i] = 1;
-    }
+  const own = tileIndexAt(cx, cy, deck);
+  if (own >= 0) {
+    target[own] = 1;
+    explored[own] = 1;
+    seen[own] = layer[own];
   }
 }
 
 /**
- * Рисует слой тумана: неисследованное — чёрное, исследованное — приглушённое.
+ * Плавно гасит освещённость тайлов.
+ *
+ * Значение не прыгает сразу на 0 или 1, а подтягивается к цели — поэтому
+ * граница конуса не «щёлкает», а растворяется. Именно это убирает моргание.
  */
-function paintFogLayer() {
-  const g = fog.ctx;
-  if (!g || !state.map) return;
+function updateFogFade(dt, deck) {
   const m = state.map;
-  g.globalCompositeOperation = 'source-over';
-  g.clearRect(0, 0, m.width, m.height);
-  g.fillStyle = '#000000';
-  g.fillRect(0, 0, m.width, m.height);
+  if (!m || !ensureFog()) return;
+  const light = fog.light[deck];
+  const target = fog.target[deck];
+  const explored = fog.explored[deck];
+  const k = 1 - Math.pow(1 - FOG_FADE, dt * 60);
+  for (let i = 0; i < light.length; i++) {
+    const goal = target[i] > 0 ? 1 : explored[i] ? FOG_MEMORY : 0;
+    light[i] += (goal - light[i]) * k;
+  }
+}
 
-  // Исследованное — слегка приглушаем.
-  g.globalCompositeOperation = 'destination-out';
-  g.fillStyle = 'rgba(0,0,0,0.55)';
-  for (let i = 0; i < fog.explored.length; i++) {
-    if (!fog.explored[i]) continue;
-    const tx = i % m.width;
-    const ty = (i / m.width) | 0;
-    g.fillRect(tx, ty, 1, 1);
+/**
+ * Рисует слой тумана одним ImageData: неисследованное — чёрное,
+ * исследованное — приглушённое, видимое — чистое.
+ */
+function paintFogLayer(deck) {
+  const g = fog.ctx;
+  if (!g || !state.map || !fog.image) return;
+  const light = fog.light[deck];
+  const data = fog.image.data;
+  const total = state.map.width * state.map.height;
+  for (let i = 0; i < total; i++) {
+    const alpha = Math.round((1 - light[i]) * 255);
+    const o = i * 4 + 3;
+    // Пишем только изменившиеся пиксели — на кадр это заметно дешевле.
+    if (data[o] === alpha) continue;
+    data[o] = alpha;
   }
-  // Видимое — туман убирается полностью.
-  g.fillStyle = 'rgba(0,0,0,1)';
-  for (let i = 0; i < fog.visible.length; i++) {
-    if (!fog.visible[i]) continue;
-    const tx = i % m.width;
-    const ty = (i / m.width) | 0;
-    g.fillRect(tx, ty, 1, 1);
-  }
-  g.globalCompositeOperation = 'source-over';
+  g.putImageData(fog.image, 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -946,8 +1242,8 @@ respawnButton.addEventListener('click', doRespawn);
 function buildSprites() {
   const TS = 32;
   const c = document.createElement('canvas');
-  // 10 спрайтов в ряд: 4 стадии кирпича, бетон, лес, лёд и 3 кадра воды.
-  c.width = TS * 10;
+  // 11 спрайтов в ряд: 4 стадии кирпича, бетон, лес, лёд, 3 кадра воды, трамплин.
+  c.width = TS * 11;
   c.height = TS;
   buildSpritesInto(c.getContext('2d'), TS);
   sprites = {
@@ -955,6 +1251,7 @@ function buildSprites() {
     forest: 5,
     ice: 6,
     water: [7, 8, 9],
+    ramp: 10,
     ts: TS,
     canvas: c,
   };
@@ -965,32 +1262,42 @@ function spriteCell(index) {
   return { sx: index * ts, sy: 0 };
 }
 
-/** Отдельный холст с «рельефом» карты для мини-карты. */
-function buildTerrainCanvas() {
+/** Отдельный холст с «рельефом» карты для мини-карты — по одному на ярус. */
+function buildTerrainCanvases() {
   const m = state.map;
   if (!m) return;
-  terrainCanvas = document.createElement('canvas');
-  terrainCanvas.width = m.width;
-  terrainCanvas.height = m.height;
-  const g = terrainCanvas.getContext('2d');
-  terrainCtx = g;
-  g.fillStyle = '#0a0e13';
-  g.fillRect(0, 0, m.width, m.height);
-  for (let ty = 0; ty < m.height; ty++) {
-    for (let tx = 0; tx < m.width; tx++) {
-      paintTerrainTileTo(g, tx, ty);
+  terrainCanvases = [];
+  terrainCtxs = [];
+  for (let d = 0; d < m.levels; d++) {
+    const c = document.createElement('canvas');
+    c.width = m.width;
+    c.height = m.height;
+    const g = c.getContext('2d');
+    g.fillStyle = '#0a0e13';
+    g.fillRect(0, 0, m.width, m.height);
+    terrainCanvases.push(c);
+    terrainCtxs.push(g);
+  }
+  for (let d = 0; d < m.levels; d++) {
+    for (let ty = 0; ty < m.height; ty++) {
+      for (let tx = 0; tx < m.width; tx++) {
+        paintTerrainTileTo(terrainCtxs[d], tx, ty, d);
+      }
     }
   }
 }
 
-function paintTerrainTile(tx, ty) {
-  if (!terrainCtx || !state.map) return;
-  paintTerrainTileTo(terrainCtx, tx, ty);
+function paintTerrainTile(tx, ty, deck = 0) {
+  const g = terrainCtxs[deck];
+  if (!g || !state.map) return;
+  paintTerrainTileTo(g, tx, ty, deck);
 }
 
-function paintTerrainTileTo(g, tx, ty) {
+function paintTerrainTileTo(g, tx, ty, deck) {
   const m = state.map;
-  const v = m.tiles[ty * m.width + tx];
+  const layer = m.layers[deck];
+  if (!layer) return;
+  const v = layer[ty * m.width + tx];
   const kind = v & 7;
   let color = null;
   switch (kind) {
@@ -1008,6 +1315,9 @@ function paintTerrainTileTo(g, tx, ty) {
       break;
     case TILE.ICE:
       color = '#a8d8ef';
+      break;
+    case TILE.RAMP:
+      color = '#c9a227';
       break;
     default:
       color = '#0a0e13';
@@ -1131,9 +1441,19 @@ function worldToScreenY(wy) {
   return (wy - camera.y) * camera.zoom + canvas.clientHeight / 2;
 }
 
-function drawTiles(now) {
+/**
+ * Рисует тайлы яруса.
+ *
+ * @param {number} now      время для анимации воды;
+ * @param {number} deck     какой ярус рисуем;
+ * @param {number} alpha    прозрачность слоя (для «чужого» этажа);
+ * @param {boolean} withFog использовать ли туман войны и «старую» память.
+ */
+function drawTiles(now, deck, alpha, withFog) {
   const m = state.map;
   if (!m || !sprites) return;
+  const layer = m.layers[deck];
+  if (!layer) return;
   const ts = m.tileSize;
   const halfW = canvas.clientWidth / 2 / camera.zoom;
   const halfH = canvas.clientHeight / 2 / camera.zoom;
@@ -1145,14 +1465,19 @@ function drawTiles(now) {
 
   const s = ts * camera.zoom;
   const waterFrame = Math.floor(now / 380) % 3;
+  const light = withFog ? fog.light[deck] : null;
+  const seen = withFog ? fog.seen[deck] : null;
 
+  ctx.globalAlpha = alpha;
   for (let ty = y0; ty <= y1; ty++) {
     for (let tx = x0; tx <= x1; tx++) {
       const idx = ty * m.width + tx;
       // Видимые тайлы рисуем как есть, а исследованные — по «старому» виду,
       // как в Age of Empires 2: устаревшая карта, без живых обновлений.
-      const live = fog.visible && fog.visible[idx];
-      const v = live ? m.tiles[idx] : fog.seen ? fog.seen[idx] : m.tiles[idx];
+      // Переключаемся на «старый» вид уже под затемнением, чтобы смена
+      // не была заметна глазом.
+      const lit = light ? light[idx] > 0.75 : true;
+      const v = lit ? layer[idx] : seen ? seen[idx] : layer[idx];
       const kind = v & 7;
       if (kind === TILE.EMPTY) continue;
       const damage = v >> 3;
@@ -1163,20 +1488,23 @@ function drawTiles(now) {
       else if (kind === TILE.FOREST) index = sprites.forest;
       else if (kind === TILE.ICE) index = sprites.ice;
       else if (kind === TILE.WATER) index = sprites.water[waterFrame];
+      else if (kind === TILE.RAMP) index = sprites.ramp;
       else continue;
 
       const { sx, sy } = spriteCell(index);
       ctx.drawImage(sprites.canvas, sx, sy, 32, 32, worldToScreenX(tx * ts), worldToScreenY(ty * ts), s, s);
     }
   }
+  ctx.globalAlpha = 1;
 }
 
 function drawPickups(pickups) {
   for (const p of pickups.values()) {
     // Бонус виден только там, где игрок уже был.
-    if (fog.explored) {
-      const idx = tileIndexAt(p.x, p.y);
-      if (idx < 0 || !fog.explored[idx]) continue;
+    const explored = fog.explored[pred.deck];
+    if (explored) {
+      const idx = tileIndexAt(p.x, p.y, pred.deck);
+      if (idx < 0 || !explored[idx]) continue;
     }
     const x = worldToScreenX(p.x);
     const y = worldToScreenY(p.y);
@@ -1251,13 +1579,15 @@ function drawBullets(bullets) {
 }
 
 /** Находится ли точка внутри леса (тайлы кустов). */
-function isInForest(x, y) {
+function isInForest(x, y, deck = pred.deck) {
   const m = state.map;
   if (!m) return false;
+  const layer = m.layers[deck];
+  if (!layer) return false;
   const tx = Math.floor((x + TANK_SIZE / 2) / m.tileSize);
   const ty = Math.floor((y + TANK_SIZE / 2) / m.tileSize);
   if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
-  return (m.tiles[ty * m.width + tx] & 7) === TILE.FOREST;
+  return (layer[ty * m.width + tx] & 7) === TILE.FOREST;
 }
 
 function drawTank(p, opts = {}) {
@@ -1270,7 +1600,7 @@ function drawTank(p, opts = {}) {
 
   ctx.save();
   // В чаще танк частично маскируется — становится полупрозрачным.
-  ctx.globalAlpha = isInForest(p.x, p.y) ? (opts.self ? 0.62 : 0.45) : 1;
+  ctx.globalAlpha = isInForest(p.x, p.y, p.deck ?? pred.deck) ? (opts.self ? 0.62 : 0.45) : 1;
   ctx.translate(x + size / 2, y + size / 2);
 
   const half = size / 2;
@@ -1300,7 +1630,8 @@ function drawTank(p, opts = {}) {
 
   // --- Башня: крутится по курсору мыши, независимо от корпуса ---
   ctx.save();
-  ctx.rotate(aim * (Math.PI / 8));
+  const aimVec = aimDelta(aim);
+  ctx.rotate(Math.atan2(aimVec.y, aimVec.x));
 
   // Стволы: на втором уровне появляется вторая пушка.
   ctx.fillStyle = `hsl(${hue}, 45%, 26%)`;
@@ -1397,12 +1728,23 @@ function renderWorld(now) {
   ctx.fillStyle = '#0a0e13';
   ctx.fillRect(0, 0, w, h);
 
-  drawTiles(now);
+  const deck = pred.deck;
+  const other = deck === LEVEL_GROUND ? LEVEL_UPPER : LEVEL_GROUND;
+
+  // Соседний этаж рисуем первым и приглушённо: так видно планировку
+  // верхнего (или нижнего) уровня, но он не путается с текущим.
+  drawTiles(now, other, 0.32, false);
+  // Лёгкая тень «потолка» над чужим этажом.
+  ctx.fillStyle = 'rgba(6,10,16,0.45)';
+  ctx.fillRect(0, 0, w, h);
+
+  drawTiles(now, deck, 1, true);
 
   // Слой тумана: неисследованное закрыто, исследованное приглушено.
+  // Растягиваем с билинейной фильтрацией — край тумана получается мягким.
   if (fog.canvas && state.map) {
     const ts = state.map.tileSize;
-    ctx.imageSmoothingEnabled = false;
+    ctx.imageSmoothingEnabled = true;
     ctx.drawImage(
       fog.canvas,
       0,
@@ -1414,6 +1756,7 @@ function renderWorld(now) {
       fog.canvas.width * ts * camera.zoom,
       fog.canvas.height * ts * camera.zoom,
     );
+    ctx.imageSmoothingEnabled = false;
   }
 
   const renderTime = performance.now() - INTERP_DELAY;
@@ -1589,13 +1932,22 @@ function updateStatus() {
   statScore.textContent = String(state.score);
   statKills.textContent = String(state.kills);
   statPing.textContent = state.pingSeen ? `${state.ping} мс` : '—';
+  if (statDeck) {
+    const upper = pred.deck === LEVEL_UPPER;
+    statDeck.textContent = upper ? 'ВЕРХНИЙ' : 'НИЖНИЙ';
+    statDeck.classList.toggle('upper', upper);
+  }
 }
 
-/** Описания способностей для панели выбора. */
+/**
+ * Описания способностей для панели выбора.
+ *
+ * Обычная пушка сюда не входит: она и так на левой кнопке мыши, отдельная
+ * кнопка для неё только занимает место.
+ */
 const ABILITY_INFO = [
-  { id: ABILITY.NONE, key: '1', name: 'Пушка', desc: 'обычная стрельба' },
-  { id: ABILITY.MORTAR, key: '2', name: 'Миномёт', desc: 'через стены · урон 2' },
-  { id: ABILITY.AIR_STRIKE, key: '3', name: 'Авиаподдержка', desc: 'удар с воздуха · урон 3' },
+  { id: ABILITY.MORTAR, key: '1', name: 'Миномёт', desc: 'через стены · урон 2' },
+  { id: ABILITY.AIR_STRIKE, key: '2', name: 'Авиаподдержка', desc: 'удар с воздуха · урон 3' },
 ];
 
 /** Кэш кнопок панели способностей: id -> { el, cd }. */
@@ -1643,25 +1995,28 @@ function renderAbilityBar() {
   if (abilityButtons.size === 0) return;
   for (const [id, { el, cd }] of abilityButtons) {
     el.classList.toggle('active', id === state.ability);
-    if (id === state.ability && state.abilityCd > 0) {
-      cd.textContent = `${(state.abilityCd / 30).toFixed(1)} с`;
-      cd.classList.add('cooling');
-    } else {
-      cd.textContent = '';
-      cd.classList.remove('cooling');
-    }
+    el.classList.toggle('cooling', cooldownOf(id) > 0);
+    // Кулдаун показывается ВСЕГДА: сколько секунд осталось до готовности.
+    const left = cooldownOf(id);
+    cd.textContent = left > 0 ? `${(left / 30).toFixed(1)} с` : 'ГОТОВ';
+    cd.classList.toggle('ready', left === 0);
   }
+}
+
+/** Остаток кулдауна способности в тиках. */
+function cooldownOf(ability) {
+  if (ability === ABILITY.MORTAR) return state.mortarCd;
+  if (ability === ABILITY.AIR_STRIKE) return state.airstrikeCd;
+  return 0;
 }
 
 /** Подсказка под панелью способностей. */
 function updateAbilityHint() {
   if (!abilityHint) return;
-  if (state.ability === ABILITY.NONE) {
-    abilityHint.textContent = 'Мышь — наводка башни · ЛКМ — огонь · ПКМ — способность';
-  } else if (state.ability === ABILITY.MORTAR) {
-    abilityHint.textContent = 'Миномёт: ПКМ по точке — перелетает стены';
+  if (state.ability === ABILITY.MORTAR) {
+    abilityHint.textContent = 'Миномёт: ПКМ по точке — перелетает стены · 1 / 2 — выбор';
   } else {
-    abilityHint.textContent = 'Авиаподдержка: ПКМ по точке — удар с воздуха';
+    abilityHint.textContent = 'Авиаподдержка: ПКМ по точке — удар с воздуха · 1 / 2 — выбор';
   }
 }
 
@@ -1687,10 +2042,12 @@ function renderLeaderboard() {
 }
 
 function renderMinimap() {
-  if (!terrainCanvas || !state.map) return;
+  if (!state.map || !terrainCanvases.length) return;
   const m = state.map;
+  const deck = pred.deck;
   mctx.clearRect(0, 0, minimapCanvas.width, minimapCanvas.height);
-  mctx.drawImage(terrainCanvas, 0, 0);
+  const terrain = terrainCanvases[deck] ?? terrainCanvases[0];
+  mctx.drawImage(terrain, 0, 0);
 
   // Поверх рельефа — туман войны: неисследованное чёрное,
   // исследованное приглушено, видимое — как есть.
@@ -1777,16 +2134,24 @@ function frame(now) {
     if (pred.active) {
       const cx = pred.x + correction.x + TANK_SIZE / 2;
       const cy = pred.y + correction.y + TANK_SIZE / 2;
-      updateVisibility(cx, cy, pred.aim);
+      updateVisibility(cx, cy, pred.aim, pred.deck);
     } else if (state.focus.x || state.focus.y) {
-      updateVisibility(state.focus.x, state.focus.y, pred.aim);
+      updateVisibility(state.focus.x, state.focus.y, pred.aim, pred.deck);
     }
-    paintFogLayer();
   }
+  // А затухание идёт каждый кадр: край конуса растворяется, а не щёлкает.
+  updateFogFade(dt, pred.deck);
+  paintFogLayer(pred.deck);
+
+  // Звук мотора: громче и выше на высокой скорости.
+  updateEngineSound(pred.active && !state.dead ? pred.vel : 0);
+  // Слушатель стоит на месте игрока и смотрит туда же, куда башня.
+  updateAudioListener();
 
   updateParticles(dt);
   renderWorld(now);
   renderAbilityBar();
+  updateStatus();
 
   fpsAccum += dt;
   fpsFrames += 1;
@@ -1993,6 +2358,28 @@ function buildSpritesInto(g, TS) {
       g.bezierCurveTo(x + 8, yy - 4, x + 18, yy + 4, x + 32, yy);
       g.stroke();
     }
+  }
+
+  // Трамплин — переход между ярусами. Жёлтые шевроны показывают,
+  // куда уезжает танк.
+  {
+    const x = 10 * TS;
+    g.fillStyle = '#4a3c12';
+    g.fillRect(x, 0, TS, TS);
+    g.strokeStyle = '#e3b341';
+    g.lineWidth = 3;
+    g.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {
+      const yy = 7 + i * 9;
+      g.beginPath();
+      g.moveTo(x + 7, yy + 5);
+      g.lineTo(x + TS / 2, yy);
+      g.lineTo(x + TS - 7, yy + 5);
+      g.stroke();
+    }
+    g.strokeStyle = 'rgba(0,0,0,0.5)';
+    g.lineWidth = 1;
+    g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
   }
 }
 

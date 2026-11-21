@@ -232,6 +232,23 @@ canvas#game {
   margin-top: 3px;
 }
 
+/* Индикатор этажа: на каком ярусе находится игрок. */
+.deck-row {
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px solid var(--panel-border);
+}
+
+.deck-row .value {
+  letter-spacing: 0.08em;
+  font-weight: bold;
+  color: #8ecae6;
+}
+
+.deck-row .value.upper {
+  color: #ffd166;
+}
+
 .label {
   color: var(--muted);
   font-size: 10px;
@@ -370,6 +387,12 @@ canvas#game {
 
 .ability-cd.cooling {
   color: var(--danger);
+}
+
+/* Способность готова — кулдаун показываем зелёным. */
+.ability-cd.ready {
+  color: var(--ok, #3fb950);
+  opacity: 0.8;
 }
 
 #ability-hint {
