@@ -6,6 +6,7 @@
 :root {
   --bg: #0d1117;
   --panel: rgba(13, 17, 23, 0.82);
+  --panel-solid: rgba(10, 14, 19, 0.96);
   --panel-border: #2d333b;
   --text: #e6edf3;
   --muted: #8b949e;
@@ -14,6 +15,8 @@
   --danger: #f85149;
   --ok: #3fb950;
   --font: "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", monospace;
+  /* Базовый масштаб интерфейса: один множитель на весь HUD. */
+  --ui: 1;
 }
 
 * {
@@ -57,8 +60,8 @@ canvas#game {
   background: var(--panel);
   border: 1px solid var(--panel-border);
   border-radius: 6px;
-  padding: 8px 10px;
-  font-size: 12px;
+  padding: 9px 11px;
+  font-size: calc(12px * var(--ui));
   line-height: 1.5;
   backdrop-filter: blur(3px);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
@@ -66,23 +69,46 @@ canvas#game {
 
 .panel header {
   color: var(--accent);
-  font-size: 10px;
+  font-size: calc(10px * var(--ui));
   letter-spacing: 2px;
   margin-bottom: 6px;
   border-bottom: 1px solid var(--panel-border);
   padding-bottom: 3px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel header > span {
+  flex: 1 1 auto;
+}
+
+/* Левая колонка HUD: карта сверху, настройки звука под ней.
+   Флекс-колонка гарантирует, что панели не наезжают друг на друга
+   ни на одной высоте окна. */
+#left-stack {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+#left-stack > .panel {
+  position: static;
 }
 
 /* Мини-карта */
 #minimap-panel {
-  top: 12px;
-  left: 12px;
+  z-index: 12;
 }
 
 #minimap {
   display: block;
-  width: 168px;
-  height: 168px;
+  width: calc(320px * var(--ui));
+  height: calc(320px * var(--ui));
   image-rendering: pixelated;
   border: 1px solid var(--panel-border);
   background: #05070a;
@@ -92,23 +118,24 @@ canvas#game {
 .legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 8px;
-  margin-top: 6px;
-  font-size: 9px;
+  gap: 5px 10px;
+  margin-top: 7px;
+  font-size: calc(10px * var(--ui));
   color: var(--muted);
 }
 
 .legend span {
   display: flex;
   align-items: center;
-  gap: 3px;
+  gap: 4px;
 }
 
 .dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   display: inline-block;
+  flex: none;
 }
 
 .dot-you {
@@ -124,12 +151,83 @@ canvas#game {
   background: #58a6ff;
 }
 
+/* Кнопки-иконки в шапках панелей. */
+.mini-btn {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #161b22;
+  color: var(--accent);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  font-size: 12px;
+  line-height: 1;
+  letter-spacing: 0;
+  box-shadow: none;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.mini-btn:hover {
+  background: #1d242d;
+  color: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.mini-btn:active {
+  transform: none;
+  box-shadow: none;
+}
+
+/* Развёрнутая мини-карта: панель занимает весь экран. */
+#left-stack #minimap-panel.expanded {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  background: rgba(5, 8, 12, 0.97);
+  border: none;
+  border-radius: 0;
+  pointer-events: auto;
+}
+
+#left-stack #minimap-panel.expanded header {
+  width: 100%;
+  max-width: 1100px;
+  margin-bottom: 0;
+  border-bottom: none;
+  padding-bottom: 0;
+  font-size: calc(13px * var(--ui));
+}
+
+#left-stack #minimap-panel.expanded #minimap {
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: calc(100vh - 110px);
+  border: 1px solid var(--panel-border);
+}
+
+#left-stack #minimap-panel.expanded .legend {
+  font-size: calc(11px * var(--ui));
+}
+
 /* Таблица лидеров */
 #leaderboard-panel {
   top: 12px;
   right: 12px;
-  min-width: 186px;
-  max-width: 240px;
+  min-width: calc(186px * var(--ui));
+  max-width: calc(240px * var(--ui));
 }
 
 #leaderboard {
@@ -153,7 +251,7 @@ canvas#game {
   width: 15px;
   text-align: right;
   color: var(--muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--ui));
   flex: none;
 }
 
@@ -174,7 +272,7 @@ canvas#game {
 
 #leaderboard li .kills {
   color: var(--accent-soft);
-  font-size: 14px;
+  font-size: calc(14px * var(--ui));
   font-weight: bold;
   font-variant-numeric: tabular-nums;
   flex: none;
@@ -184,7 +282,7 @@ canvas#game {
 
 #leaderboard li .pts {
   color: var(--muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--ui));
   font-variant-numeric: tabular-nums;
   flex: none;
   min-width: 30px;
@@ -196,7 +294,7 @@ canvas#game {
   padding-top: 4px;
   border-top: 1px solid var(--panel-border);
   color: var(--muted);
-  font-size: 9px;
+  font-size: calc(9px * var(--ui));
 }
 
 .leaderboard-legend .kills {
@@ -219,7 +317,7 @@ canvas#game {
 #status-panel {
   bottom: 12px;
   left: 12px;
-  min-width: 240px;
+  min-width: calc(260px * var(--ui));
 }
 
 .status-row {
@@ -251,7 +349,7 @@ canvas#game {
 
 .label {
   color: var(--muted);
-  font-size: 10px;
+  font-size: calc(10px * var(--ui));
   letter-spacing: 1px;
 }
 
@@ -269,13 +367,13 @@ canvas#game {
 .stars {
   color: var(--accent);
   letter-spacing: -1px;
-  font-size: 11px;
+  font-size: calc(11px * var(--ui));
 }
 
 .hp-bar {
   display: inline-block;
-  width: 92px;
-  height: 9px;
+  width: calc(92px * var(--ui));
+  height: calc(9px * var(--ui));
   background: #21262d;
   border: 1px solid var(--panel-border);
   border-radius: 2px;
@@ -299,13 +397,109 @@ canvas#game {
   bottom: 12px;
   right: 12px;
   color: var(--muted);
-  font-size: 10px;
-  max-width: 330px;
+  font-size: calc(10px * var(--ui));
+  max-width: calc(340px * var(--ui));
   text-align: right;
 }
 
 #help-panel b {
   color: var(--accent);
+}
+
+.help-actions {
+  margin-top: 6px;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+/* ---------------------- Настройки звука ---------------------- */
+
+#audio-panel {
+  width: calc(342px * var(--ui));
+  pointer-events: auto;
+}
+
+#audio-panel header {
+  cursor: default;
+}
+
+.vol {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 8px;
+  margin-bottom: 5px;
+  font-size: calc(10px * var(--ui));
+  color: var(--muted);
+}
+
+.vol > span {
+  grid-column: 1;
+}
+
+.vol output {
+  grid-column: 2;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  font-size: calc(10px * var(--ui));
+  text-align: right;
+}
+
+.vol input[type="range"] {
+  grid-column: 1 / -1;
+  width: 100%;
+  height: 16px;
+  margin: 0;
+  appearance: none;
+  -webkit-appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+
+.vol input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 3px;
+  background: #21262d;
+  border: 1px solid var(--panel-border);
+}
+
+.vol input[type="range"]::-webkit-slider-thumb {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.vol input[type="range"]::-moz-range-track {
+  height: 5px;
+  border-radius: 3px;
+  background: #21262d;
+  border: 1px solid var(--panel-border);
+}
+
+.vol input[type="range"]::-moz-range-thumb {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.vol input[type="range"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#audio-panel .hint {
+  font-size: calc(9px * var(--ui));
+  margin-top: 2px;
 }
 
 /* ---------------------- Способности ---------------------- */
@@ -314,7 +508,7 @@ canvas#game {
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
-  min-width: 340px;
+  min-width: calc(340px * var(--ui));
   pointer-events: auto;
 }
 
@@ -336,7 +530,7 @@ canvas#game {
   border-radius: 4px;
   box-shadow: none;
   font-family: var(--font);
-  font-size: 11px;
+  font-size: calc(11px * var(--ui));
   letter-spacing: 0;
   text-align: left;
   cursor: pointer;
@@ -364,7 +558,7 @@ canvas#game {
   border-radius: 2px;
   background: #0b0f14;
   color: var(--accent);
-  font-size: 9px;
+  font-size: calc(9px * var(--ui));
   text-align: center;
 }
 
@@ -374,13 +568,13 @@ canvas#game {
 }
 
 .ability-desc {
-  font-size: 9px;
+  font-size: calc(9px * var(--ui));
   opacity: 0.7;
   white-space: nowrap;
 }
 
 .ability-cd {
-  font-size: 9px;
+  font-size: calc(9px * var(--ui));
   color: var(--danger);
   min-height: 11px;
 }
@@ -400,15 +594,16 @@ canvas#game {
   padding-top: 4px;
   border-top: 1px solid var(--panel-border);
   color: var(--muted);
-  font-size: 9.5px;
+  font-size: calc(9.5px * var(--ui));
   text-align: center;
 }
 
-/* Кнопка звука */
-#sound-toggle {
-  margin-top: 6px;
+/* Кнопки звука и языка */
+#sound-toggle,
+#lang-toggle {
+  margin-top: 0;
   padding: 5px 12px;
-  font-size: 10px;
+  font-size: calc(10px * var(--ui));
   letter-spacing: 1px;
   box-shadow: 0 2px 0 #7a4c00;
   pointer-events: auto;
@@ -423,6 +618,10 @@ canvas#game {
 #sound-toggle.off:hover {
   background: #3d444d;
   color: var(--text);
+}
+
+#lang-toggle {
+  min-width: 52px;
 }
 
 /* Индикатор потери связи */
@@ -584,13 +783,36 @@ button:disabled {
   font-variant-numeric: tabular-nums;
 }
 
-@media (max-width: 720px) {
+/* ---------------------- Адаптив ---------------------- */
+
+@media (max-height: 900px) {
+  :root {
+    --ui: 0.85;
+  }
+}
+
+@media (max-height: 760px) {
+  :root {
+    --ui: 0.72;
+  }
+}
+
+@media (max-width: 900px) {
   #help-panel,
   #leaderboard-panel {
     display: none;
   }
+}
+
+@media (max-width: 720px) {
   #minimap {
-    width: 110px;
-    height: 110px;
+    width: calc(160px * var(--ui));
+    height: calc(160px * var(--ui));
+  }
+  #audio-panel {
+    width: calc(180px * var(--ui));
+  }
+  #status-panel {
+    min-width: calc(190px * var(--ui));
   }
 }

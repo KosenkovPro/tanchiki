@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
 use crate::map::{
-    GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, LEVEL_GROUND, LEVEL_UPPER, MAP_H, MAP_W,
-    TILE_SIZE,
+    ramp_dir, ramp_index, GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, LEVEL_GROUND,
+    LEVEL_UPPER, MAP_H, MAP_W, RAMP_DIR_NONE, RAMP_LEN, TILE_SIZE,
 };
 use crate::protocol::{
     self, BulletView, Direction, EffectView, GameEvent, InputFlags, LeaderboardEntry, PlayerView,
@@ -438,9 +438,20 @@ pub struct Tank {
     pub level: u8,
     /// Ярус (этаж по высоте), на котором находится танк.
     pub deck: u8,
-    /// Стоял ли танк на трамплине в прошлом тике: нужен, чтобы ярус
-    /// переключался один раз, а не каждую клетку.
-    pub on_ramp: bool,
+    /// Направление полосы пандуса, по которой едет танк.
+    ///
+    /// `RAMP_DIR_NONE` — танк не на пандусе. Направление хранится как в тайле
+    /// (0 — вправо), поэтому «нет полосы» вынесено в отдельное значение.
+    pub ramp_dir: u8,
+    /// Текущий номер тайла в полосе пандуса: 0 — низ, 2 — верх.
+    pub ramp_index: u8,
+    /// Номер тайла полосы, на котором меняется ярус: -1 — ещё не определено.
+    pub ramp_target: i8,
+    /// Менялся ли уже ярус в этом заезде по пандусу.
+    ///
+    /// Нужен, чтобы танк, остановившийся на верхнем тайле полосы, не
+    /// щёлкнул обратно на соседнем тике.
+    pub ramp_switched: bool,
     /// Текущее здоровье.
     pub hp: u8,
     /// Максимальное здоровье.
@@ -470,7 +481,10 @@ impl Tank {
             vel: 0.0,
             level,
             deck: crate::map::LEVEL_GROUND,
-            on_ramp: false,
+            ramp_dir: RAMP_DIR_NONE,
+            ramp_index: 0,
+            ramp_target: -1,
+            ramp_switched: false,
             hp: max_hp,
             max_hp,
             cooldown: 0.0,
@@ -919,15 +933,44 @@ impl Game {
         self.map.kind(tx, ty, deck).is_slippery()
     }
 
-    /// Проверяет, не стоит ли танк на трамплине, и переключает ярус.
+    /// Следит за пандусом и переключает ярус в конце заезда.
     ///
-    /// Переход работает как дверной порог: ярус меняется только при
-    /// входе на трамплин, поэтому танк не «прыгает» между этажами,
-    /// стоя на нём.
+    /// Пандус — полоса из трёх тайлов: наклон от земли (нижний край, номер 0)
+    /// к верхней площадке (верхний край, номер 2). Снизу вверх танк меняет
+    /// ярус на верхнем краю полосы, сверху вниз — на нижнем. Переход выглядит
+    /// как спуск по пандусу, а не как мгновенный скачок между этажами.
     fn update_deck(&mut self, tank: &mut Tank) {
         let (tx, ty) = self.map.tile_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
-        let on_ramp = self.map.is_ramp(tx, ty, tank.deck);
-        if on_ramp && !tank.on_ramp {
+        if !self.map.is_ramp(tx, ty, tank.deck) {
+            // Сход с пандуса: следующий заезд начнётся заново.
+            tank.ramp_dir = RAMP_DIR_NONE;
+            tank.ramp_index = 0;
+            tank.ramp_target = -1;
+            tank.ramp_switched = false;
+            return;
+        }
+        let value = self.map.value(tx, ty, tank.deck);
+        let dir = ramp_dir(value);
+        let idx = ramp_index(value);
+        if tank.ramp_dir == RAMP_DIR_NONE {
+            // Только что въехали на пандус: запоминаем полосу и наш тайл в ней.
+            tank.ramp_dir = dir;
+            tank.ramp_index = idx;
+            tank.ramp_switched = false;
+        } else if idx != tank.ramp_index {
+            // Танк поехал по полосе в другую сторону — это новый заезд,
+            // счётчик переключений сбрасываем.
+            tank.ramp_switched = false;
+        }
+        // Цель перехода задаёт этаж, а не направление езда: снизу вверх —
+        // верхний край полосы, сверху вниз — нижний. Полоса всегда идёт от
+        // земли к площадке, поэтому и заезд сбоку сразу знает, где переход.
+        tank.ramp_target = if tank.deck == LEVEL_GROUND {
+            RAMP_LEN as i8 - 1
+        } else {
+            0
+        };
+        if idx as i8 == tank.ramp_target && !tank.ramp_switched {
             let next = if tank.deck == LEVEL_GROUND {
                 LEVEL_UPPER
             } else {
@@ -936,9 +979,10 @@ impl Game {
             // Переключаемся только если на новом ярусе тоже можно стоять.
             if self.map.rect_is_free(tank.x, tank.y, TANK_SIZE, next) {
                 tank.deck = next;
+                tank.ramp_switched = true;
             }
         }
-        tank.on_ramp = on_ramp;
+        tank.ramp_index = idx;
     }
 
     fn update_player_fire(&mut self, pid: u32) {
@@ -2659,6 +2703,10 @@ pub fn aim_towards(x0: f32, y0: f32, x1: f32, y1: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::{
+        ramp_dir_delta, ramp_value, RAMP_DIR_DOWN, RAMP_DIR_LEFT, RAMP_DIR_NONE, RAMP_DIR_RIGHT,
+        RAMP_DIR_UP,
+    };
 
     fn test_game() -> Game {
         Game::new(GameConfig {
@@ -3026,12 +3074,67 @@ mod tests {
                 tank.aim = aim;
                 tank.dir = Direction::Down;
                 tank.deck = deck;
-                tank.on_ramp = false;
+                tank.ramp_dir = RAMP_DIR_NONE;
+                tank.ramp_index = 0;
+                tank.ramp_target = -1;
+                tank.ramp_switched = false;
                 tank.cooldown = 0.0;
                 tank.spawn_protect_until = 0;
                 tank.shield_until = 0;
             }
         }
+    }
+
+    /// Ставит полосу пандуса из трёх тайлов: низ, середина, верх.
+    ///
+    /// Полоса кладётся одинаково на обоих ярусах — так переход работает и
+    /// вверх, и вниз. `dir` — направление подъёма: от нижнего края полосы
+    /// к верхнему.
+    fn place_ramp_strip(game: &mut Game, x0: u32, y0: u32, dir: u8) {
+        let (dx, dy) = ramp_dir_delta(dir);
+        for level in [LEVEL_GROUND, LEVEL_UPPER] {
+            for k in 0..RAMP_LEN {
+                let tx = (x0 as i64 + dx as i64 * k as i64) as u32;
+                let ty = (y0 as i64 + dy as i64 * k as i64) as u32;
+                game.map.set_value(tx, ty, level, ramp_value(dir, k));
+            }
+        }
+    }
+
+    /// Расчищает площадку под полосу пандуса и кладёт саму полосу.
+    ///
+    /// Нижний край полосы — тайл (10, 10), верхний — на два тайла дальше в
+    /// направлении подъёма.
+    fn prepare_ramp(game: &mut Game, dir: u8) {
+        clear_tiles(game, 8, 8, 16, 12, LEVEL_GROUND);
+        clear_tiles(game, 8, 8, 16, 12, LEVEL_UPPER);
+        place_ramp_strip(game, 10, 10, dir);
+    }
+
+    /// Ввод для езды в заданную сторону.
+    fn input_towards(dir: u8) -> InputFlags {
+        let (dx, dy) = ramp_dir_delta(dir);
+        InputFlags {
+            right: dx > 0,
+            down: dy > 0,
+            left: dx < 0,
+            up: dy < 0,
+            ..Default::default()
+        }
+    }
+
+    /// Противоположное направление полосы.
+    fn opposite_dir(dir: u8) -> u8 {
+        (dir + 2) & 0x03
+    }
+
+    /// Номер тайла полосы под центром танка, если он стоит на пандусе.
+    fn ramp_index_under(game: &Game, tank: &Tank) -> Option<u8> {
+        let (tx, ty) = game.map.tile_at(tank.center().0, tank.center().1);
+        if game.map.kind(tx, ty, tank.deck) != TileKind::Ramp {
+            return None;
+        }
+        Some(ramp_index(game.map.value(tx, ty, tank.deck)))
     }
 
     #[test]
@@ -3377,17 +3480,337 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 8, 9, 14, 11, LEVEL_GROUND);
-        clear_tiles(&mut game, 8, 9, 14, 11, LEVEL_UPPER);
-        // Трамплин есть сразу на обоих ярусах.
-        game.map.set_kind(11, 10, LEVEL_GROUND, TileKind::Ramp);
-        game.map.set_kind(11, 10, LEVEL_UPPER, TileKind::Ramp);
+        // Пандус из трёх тайлов: подъём вправо, от нижнего края к верхнему.
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
 
-        place_tank(&mut game, pid, 11.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if tank.center().0 >= 12.0 * TILE_SIZE {
+                assert_eq!(tank.deck, LEVEL_UPPER, "проезд по пандусу меняет ярус");
+                return;
+            }
+        }
+        panic!("танк должен доехать до конца пандуса");
+    }
+
+    #[test]
+    fn ramp_switches_deck_only_at_the_top_of_the_strip() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        // Танк въезжает на нижний тайл полосы и едет вверх по пандусу.
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+
+        let mut seen = [false; RAMP_LEN as usize];
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            let Some(idx) = ramp_index_under(&game, tank) else {
+                continue;
+            };
+            seen[idx as usize] = true;
+            match idx {
+                // На нижнем и среднем тайле ярус ещё не меняется.
+                0 | 1 => assert_eq!(
+                    tank.deck, LEVEL_GROUND,
+                    "внутри пандуса ярус меняться не должен"
+                ),
+                // На верхнем тайле — переход на верхний этаж.
+                _ => assert_eq!(
+                    tank.deck, LEVEL_UPPER,
+                    "на верхнем тайле пандуса ярус меняется"
+                ),
+            }
+            if tank.deck == LEVEL_UPPER {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1] && seen[2],
+            "танк должен проехать всю полосу: {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn ramp_switches_deck_down_at_the_bottom_of_the_strip() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        // Танк стоит на верхнем тайле полосы и спускается по пандусу вниз.
+        place_tank_on(
+            &mut game,
+            pid,
+            12.0 * TILE_SIZE,
+            10.0 * TILE_SIZE,
+            0,
+            LEVEL_UPPER,
+        );
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_LEFT));
+
+        let mut seen = [false; RAMP_LEN as usize];
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            let Some(idx) = ramp_index_under(&game, tank) else {
+                continue;
+            };
+            seen[idx as usize] = true;
+            match idx {
+                // На верхнем и среднем тайле ярус ещё не меняется.
+                1 | 2 => assert_eq!(
+                    tank.deck, LEVEL_UPPER,
+                    "внутри пандуса ярус меняться не должен"
+                ),
+                // На нижнем тайле — переход на землю.
+                _ => assert_eq!(
+                    tank.deck, LEVEL_GROUND,
+                    "на нижнем тайле пандуса ярус меняется вниз"
+                ),
+            }
+            if tank.deck == LEVEL_GROUND {
+                break;
+            }
+        }
+        assert!(
+            seen[0] && seen[1] && seen[2],
+            "танк должен проехать всю полосу: {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn ramp_on_the_right_strip_keeps_the_ride_state() {
+        // Направление полосы «вправо» — ноль, поэтому состояние заезда
+        // нельзя держать в нуле: иначе оно сбрасывалось бы каждый тик и
+        // переход не работал бы вовсе.
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+
+        let mut switched = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if tank.deck == LEVEL_UPPER {
+                switched = true;
+                break;
+            }
+        }
+        assert!(switched, "подъём по полосе вправо должен сменить ярус");
+
+        // Танк остановился на верхнем тайле полосы: состояние заезда должно
+        // сохраниться, иначе ярус может щёлкнуть обратно.
+        {
+            let tank = game
+                .players
+                .get_mut(&pid)
+                .and_then(|p| p.tank.as_mut())
+                .expect("танк");
+            tank.x = 12.0 * TILE_SIZE;
+            tank.y = 10.0 * TILE_SIZE;
+            tank.vel = 0.0;
+        }
+        send_input(&mut game, 1, 2, InputFlags::default());
+        for _ in 0..5 {
+            game.tick();
+        }
+        let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+        assert_eq!(tank.deck, LEVEL_UPPER, "ярус не должен вернуться назад");
+        assert_eq!(tank.ramp_dir, RAMP_DIR_RIGHT, "направление полосы сохранено");
+        assert!(tank.ramp_switched, "состояние заезда не должно сбрасываться");
+    }
+
+    #[test]
+    fn ramp_strips_work_in_every_direction() {
+        // Полоса «вправо» (RAMP_DIR_RIGHT == 0) — самая частая, и раньше
+        // именно на ней ломался переход: её направление совпадало с
+        // признаком «танк не на пандусе».
+        for dir in [RAMP_DIR_RIGHT, RAMP_DIR_DOWN, RAMP_DIR_LEFT, RAMP_DIR_UP] {
+            let mut game = test_game();
+            let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+            game.join_player(pid, "A".into());
+            prepare_ramp(&mut game, dir);
+
+            // Подъём: с нижнего яруса до верхнего тайла полосы.
+            place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+            send_input(&mut game, 1, 1, input_towards(dir));
+            let mut up = false;
+            for _ in 0..300 {
+                game.tick();
+                let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+                if ramp_index_under(&game, tank) == Some(RAMP_LEN - 1) {
+                    assert_eq!(
+                        tank.deck, LEVEL_UPPER,
+                        "подъём по пандусу направления {dir} должен сменить ярус"
+                    );
+                    up = true;
+                    break;
+                }
+            }
+            assert!(up, "танк должен доехать до верха полосы направления {dir}");
+
+            // Спуск: с верхнего яруса до нижнего тайла полосы.
+            let (dx, dy) = ramp_dir_delta(dir);
+            let top_x = 10.0 + 2.0 * dx as f32;
+            let top_y = 10.0 + 2.0 * dy as f32;
+            let mut game = test_game();
+            let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+            game.join_player(pid, "A".into());
+            prepare_ramp(&mut game, dir);
+            place_tank_on(
+                &mut game,
+                pid,
+                top_x * TILE_SIZE,
+                top_y * TILE_SIZE,
+                0,
+                LEVEL_UPPER,
+            );
+            send_input(&mut game, 1, 1, input_towards(opposite_dir(dir)));
+            let mut down = false;
+            for _ in 0..300 {
+                game.tick();
+                let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+                if ramp_index_under(&game, tank) == Some(0) {
+                    assert_eq!(
+                        tank.deck, LEVEL_GROUND,
+                        "спуск по пандусу направления {dir} должен сменить ярус"
+                    );
+                    down = true;
+                    break;
+                }
+            }
+            assert!(down, "танк должен доехать до низа полосы направления {dir}");
+        }
+    }
+
+    #[test]
+    fn ramp_on_the_bottom_edge_switches_to_the_ground_deck_at_once() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        // Танк на верхнем ярусе стоит на нижнем краю полосы — он уже внизу.
+        place_tank_on(
+            &mut game,
+            pid,
+            10.0 * TILE_SIZE,
+            10.0 * TILE_SIZE,
+            0,
+            LEVEL_UPPER,
+        );
         game.tick();
 
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
-        assert_eq!(tank.deck, LEVEL_UPPER, "заезд на трамплин меняет ярус");
+        assert_eq!(
+            tank.deck, LEVEL_GROUND,
+            "нижний край полосы — это уже земля"
+        );
+    }
+
+    #[test]
+    fn ramp_in_the_middle_switches_only_after_the_top_edge() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        // Танк въехал сбоку на средний тайл полосы.
+        place_tank(&mut game, pid, 11.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        game.tick();
+        {
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            assert_eq!(
+                tank.deck, LEVEL_GROUND,
+                "на среднем тайле ярус ещё не меняется"
+            );
+        }
+
+        // Теперь едет вверх по пандусу — переход на верхнем тайле.
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+        let mut switched = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            match ramp_index_under(&game, tank) {
+                Some(2) => {
+                    assert_eq!(
+                        tank.deck, LEVEL_UPPER,
+                        "на верхнем тайле пандуса ярус меняется"
+                    );
+                    switched = true;
+                    break;
+                }
+                _ => assert_eq!(
+                    tank.deck, LEVEL_GROUND,
+                    "внутри пандуса ярус меняться не должен"
+                ),
+            }
+        }
+        assert!(switched, "танк должен доехать до верхнего тайла пандуса");
+    }
+
+    #[test]
+    fn leaving_the_strip_resets_the_ramp_state() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        prepare_ramp(&mut game, RAMP_DIR_RIGHT);
+
+        // Подъём по пандусу и выезд с него на площадку.
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+        let mut left = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if tank.center().0 >= 13.0 * TILE_SIZE {
+                left = true;
+                break;
+            }
+        }
+        assert!(left, "танк должен выехать с пандуса");
+        {
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            assert_eq!(tank.deck, LEVEL_UPPER, "подъём по пандусу сменил ярус");
+            assert_eq!(
+                tank.ramp_dir, RAMP_DIR_NONE,
+                "после схода с пандуса заезд сброшен"
+            );
+            assert_eq!(tank.ramp_target, -1, "цель перехода сброшена");
+            assert!(!tank.ramp_switched, "счётчик переключений сброшен");
+        }
+
+        // Снова заезжаем на полосу — заезд начинается заново и вниз.
+        send_input(&mut game, 1, 2, input_towards(RAMP_DIR_LEFT));
+        let mut down = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if ramp_index_under(&game, tank) == Some(0) {
+                assert_eq!(
+                    tank.deck, LEVEL_GROUND,
+                    "спуск по пандусу снова меняет ярус"
+                );
+                down = true;
+                break;
+            }
+        }
+        assert!(down, "танк должен доехать до нижнего тайла пандуса");
     }
 
     #[test]

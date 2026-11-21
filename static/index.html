@@ -12,80 +12,117 @@
 
     <!-- ================= HUD ================= -->
     <div id="hud">
-      <!-- Мини-карта -->
-      <section id="minimap-panel" class="panel">
-        <header>КАРТА</header>
-        <canvas id="minimap" width="160" height="160"></canvas>
-        <div class="legend">
-          <span><i class="dot dot-you"></i>вы</span>
-          <span><i class="dot dot-enemy"></i>враг</span>
-          <span><i class="dot dot-bot"></i>бот</span>
-          <span><i class="dot dot-pickup"></i>бонус</span>
-        </div>
-      </section>
+      <!-- Левая колонка: карта сверху, настройки звука под ней -->
+      <div id="left-stack">
+        <!-- Мини-карта -->
+        <section id="minimap-panel" class="panel">
+          <header>
+            <span data-i18n="hud.map">КАРТА</span>
+            <button id="minimap-toggle" type="button" class="mini-btn" title="F">⛶</button>
+          </header>
+          <canvas id="minimap" width="320" height="320"></canvas>
+          <div class="legend">
+            <span><i class="dot dot-you"></i><span data-i18n="hud.legend.you">вы</span></span>
+            <span><i class="dot dot-enemy"></i><span data-i18n="hud.legend.enemy">враг</span></span>
+            <span><i class="dot dot-bot"></i><span data-i18n="hud.legend.bot">бот</span></span>
+            <span><i class="dot dot-pickup"></i><span data-i18n="hud.legend.pickup">бонус</span></span>
+          </div>
+        </section>
+
+        <!-- Настройки звука -->
+        <section id="audio-panel" class="panel">
+          <header><span data-i18n="settings.title">НАСТРОЙКИ ЗВУКА</span></header>
+          <label class="vol">
+            <span data-i18n="settings.master">Общая громкость</span>
+            <output>90%</output>
+            <input id="vol-master" type="range" min="0" max="100" value="90" />
+          </label>
+          <label class="vol">
+            <span data-i18n="settings.shots">Выстрелы</span>
+            <output>80%</output>
+            <input id="vol-shots" type="range" min="0" max="100" value="80" />
+          </label>
+          <label class="vol">
+            <span data-i18n="settings.explosions">Взрывы</span>
+            <output>80%</output>
+            <input id="vol-explosions" type="range" min="0" max="100" value="80" />
+          </label>
+          <label class="vol">
+            <span data-i18n="settings.engine">Мотор</span>
+            <output>70%</output>
+            <input id="vol-engine" type="range" min="0" max="100" value="70" />
+          </label>
+          <label class="vol">
+            <span data-i18n="settings.hits">Попадания и интерфейс</span>
+            <output>80%</output>
+            <input id="vol-hits" type="range" min="0" max="100" value="80" />
+          </label>
+          <div class="hint" data-i18n="settings.hint">Настройки сохраняются в браузере</div>
+        </section>
+      </div>
 
       <!-- Таблица лидеров -->
       <section id="leaderboard-panel" class="panel">
-        <header>ТОП-10 · УБИЙСТВА</header>
+        <header data-i18n="hud.top">ТОП-10 · УБИЙСТВА</header>
         <ol id="leaderboard"></ol>
-        <div class="leaderboard-legend"><span class="kills">☠</span> убийств · <span class="pts">★</span> очки</div>
+        <div class="leaderboard-legend" data-i18n="hud.leaderLegend">☠ убийств · ★ очки</div>
       </section>
 
       <!-- Состояние игрока -->
       <section id="status-panel" class="panel">
         <div class="status-row">
-          <span class="label">УРОВЕНЬ</span>
+          <span class="label" data-i18n="hud.level">УРОВЕНЬ</span>
           <span class="value" id="stat-level">1</span>
           <span class="stars" id="stat-stars">★</span>
         </div>
         <div class="status-row">
-          <span class="label">БРОНЯ</span>
+          <span class="label" data-i18n="hud.armor">БРОНЯ</span>
           <span class="hp-bar"><i id="stat-hp-fill"></i></span>
           <span class="value" id="stat-hp">3/3</span>
         </div>
         <div class="status-row">
-          <span class="label">ОЧКИ</span>
+          <span class="label" data-i18n="hud.score">ОЧКИ</span>
           <span class="value" id="stat-score">0</span>
-          <span class="label small">УБИЙСТВ</span>
+          <span class="label small" data-i18n="hud.kills">УБИЙСТВ</span>
           <span class="value" id="stat-kills">0</span>
         </div>
         <div class="status-row">
-          <span class="label">ПИНГ</span>
+          <span class="label" data-i18n="hud.ping">ПИНГ</span>
           <span class="value" id="stat-ping">—</span>
-          <span class="label small">FPS</span>
+          <span class="label small" data-i18n="hud.fps">FPS</span>
           <span class="value" id="stat-fps">0</span>
         </div>
         <div class="status-row deck-row">
-          <span class="label">ЯРУС</span>
+          <span class="label" data-i18n="hud.deck">ЯРУС</span>
           <span class="value" id="stat-deck">НИЖНИЙ</span>
         </div>
       </section>
 
       <!-- Способности -->
       <section id="ability-panel" class="panel">
-        <header>СПОСОБНОСТИ · ПКМ</header>
+        <header data-i18n="hud.abilities">СПОСОБНОСТИ · ПКМ</header>
         <div id="ability-bar"></div>
-        <div id="ability-hint">Мышь — наводка башни · ЛКМ — огонь · ПКМ — способность</div>
+        <div id="ability-hint"></div>
       </section>
 
       <!-- Подсказка по управлению -->
       <section id="help-panel" class="panel">
-        <b>WASD</b> / <b>стрелки</b> — корпус (в т.ч. по диагонали) ·
-        <b>мышь</b> — башня · <b>Пробел</b> / <b>ЛКМ</b> — огонь ·
-        <b>ПКМ</b> — способность · <b>1</b>–<b>2</b> — выбор · <b>колесо</b> — зум ·
-        <b>M</b> — звук
-        <button id="sound-toggle" type="button" class="on">🔊 ЗВУК</button>
+        <span data-i18n-html="hud.help"></span>
+        <div class="help-actions">
+          <button id="sound-toggle" type="button" class="on">🔊 ЗВУК</button>
+          <button id="lang-toggle" type="button" data-lang-toggle>EN</button>
+        </div>
       </section>
 
-      <div id="connection" class="hidden">Соединение потеряно…</div>
+      <div id="connection" class="hidden" data-i18n="msg.connectionLost">Соединение потеряно…</div>
     </div>
 
     <!-- ================= Оверлеи ================= -->
     <div id="overlay" class="overlay">
       <!-- Экран приветствия -->
       <div class="card" id="welcome-card">
-        <h1 class="logo">ТАНЧИКИ</h1>
-        <p class="tagline">
+        <h1 class="logo" data-i18n="welcome.title">ТАНЧИКИ</h1>
+        <p class="tagline" data-i18n="welcome.tagline">
           Битва на открытой карте 5120×5120. Бесшовный вход — просто вбей ник и в бой.
         </p>
         <form id="join-form" autocomplete="off">
@@ -94,34 +131,33 @@
             type="text"
             maxlength="16"
             placeholder="Никнейм"
+            data-i18n-placeholder="welcome.nickname"
             spellcheck="false"
           />
-          <button type="submit" id="play-button">В БОЙ</button>
+          <button type="submit" id="play-button" data-i18n="welcome.button">В БОЙ</button>
         </form>
-        <p class="hint">
+        <p class="hint" data-i18n-html="welcome.hint">
           Корпус танка едет на WASD или стрелках (в т.ч. по диагонали), а башня крутится за курсором
           мыши — можно ехать вбок и целиться в другую сторону. ЛКМ или Пробел — выстрел,
           ПКМ — выбранная способность (миномёт перелетает стены, авиаподдержка бьёт с воздуха),
           клавиши 1–2 переключают способность. Противники видны только там, куда смотрит башня:
-          пройденная территория остаётся на карте, но в «старом» виде. Карта двухэтажная:
-          заезжаешь на жёлтый трамплин — оказываешься на верхнем этаже, а текущий этаж
-          показан в панели слева («ЯРУС»). Звезда повышает уровень
-          танка: со второго уровня у него две пушки и выше скорострельность, щит даёт неуязвимость,
-          ремкомплект чинит броню. Выстрелы врагов слышны даже когда их не видно — по звуку
-          понятно, с какой стороны атакуют. Клавиша M — включить/выключить звук.
+          пройденная территория остаётся на карте, но в «старом» виде. Карта двухэтажная: заезжаешь
+          на жёлтый пандус — танк поднимается на верхний этаж, и наоборот; текущий этаж показан в
+          панели слева («ЯРУС»). Выстрелы врагов слышны даже когда их не видно — по звуку понятно,
+          с какой стороны атакуют. Клавиша F — развернуть карту на весь экран, M — звук.
         </p>
       </div>
 
       <!-- Экран смерти -->
       <div class="card hidden" id="death-card">
-        <h2 class="dead">ТАНК УНИЧТОЖЕН</h2>
+        <h2 class="dead" data-i18n="death.title">ТАНК УНИСЧТОЖЕН</h2>
         <div class="death-stats">
-          <div><span>Очки</span><b id="death-score">0</b></div>
-          <div><span>Убийств</span><b id="death-kills">0</b></div>
-          <div><span>Смертей</span><b id="death-deaths">0</b></div>
-          <div><span>Продержался</span><b id="death-time">0 с</b></div>
+          <div><span data-i18n="death.score">Очки</span><b id="death-score">0</b></div>
+          <div><span data-i18n="death.kills">Убийств</span><b id="death-kills">0</b></div>
+          <div><span data-i18n="death.deaths">Смертей</span><b id="death-deaths">0</b></div>
+          <div><span data-i18n="death.time">Продержался</span><b id="death-time">0 с</b></div>
         </div>
-        <button id="respawn-button" type="button">В БОЙ</button>
+        <button id="respawn-button" type="button" data-i18n="death.button">В БОЙ</button>
       </div>
     </div>
 

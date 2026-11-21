@@ -28,6 +28,8 @@ import {
   encodePing,
 } from './protocol.js';
 
+import { initI18n, t } from './i18n.js';
+
 // ---------------------------------------------------------------------------
 // Константы (зеркалят src/game.rs)
 // ---------------------------------------------------------------------------
@@ -52,6 +54,25 @@ const LEVEL_GROUND = 0;
 const LEVEL_UPPER = 1;
 /** Сколько ярусов на карте. */
 const LEVEL_COUNT = 2;
+
+/**
+ * Длина полосы пандуса в тайлах.
+ *
+ * Полоса идёт от нижнего этажа к верхнему: тайл с индексом 0 — это
+ * «вход» на земле, тайл с индексом 2 — вершина у верхней площадки.
+ */
+const RAMP_LEN = 3;
+/** Индекс тайла в начале полосы (нижний край). */
+const RAMP_BOTTOM = 0;
+/** Индекс тайла в конце полосы (верхний край). */
+const RAMP_TOP = RAMP_LEN - 1;
+/**
+ * Высота подъёма пандуса в мировых пикселях.
+ *
+ * Это чисто визуальная величина: коллизии остаются плоскими, но танк
+ * на полосе плавно поднимается, а под ним идёт тень по земле.
+ */
+const RAMP_HEIGHT = 26;
 
 /**
  * Насколько быстро проявляется и гаснет тайл тумана.
@@ -96,6 +117,8 @@ const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d', { alpha: false });
 const minimapCanvas = document.getElementById('minimap');
 const mctx = minimapCanvas.getContext('2d');
+const minimapPanel = document.getElementById('minimap-panel');
+const minimapToggle = document.getElementById('minimap-toggle');
 const leaderboardEl = document.getElementById('leaderboard');
 const connectionEl = document.getElementById('connection');
 const overlayEl = document.getElementById('overlay');
@@ -117,6 +140,20 @@ const statDeck = document.getElementById('stat-deck');
 const soundButton = document.getElementById('sound-toggle');
 const abilityBar = document.getElementById('ability-bar');
 const abilityHint = document.getElementById('ability-hint');
+
+/**
+ * Регуляторы громкости: отдельный слайдер на каждую категорию звука.
+ *
+ * Ключ объекта совпадает с ключом в `audio.gains`.
+ */
+const VOLUME_INPUTS = {
+  master: document.getElementById('vol-master'),
+  shots: document.getElementById('vol-shots'),
+  explosions: document.getElementById('vol-explosions'),
+  engine: document.getElementById('vol-engine'),
+  hits: document.getElementById('vol-hits'),
+};
+
 
 // ---------------------------------------------------------------------------
 // Состояние
@@ -197,8 +234,14 @@ const pred = {
   shielded: false,
   /** Ярус, на котором находится танк. */
   deck: LEVEL_GROUND,
-  /** Стоял ли танк на трамплине в прошлом кадре. */
-  onRamp: false,
+  /** Направление полосы пандуса под танком (0..3) или -1, если пандуса нет. */
+  rampDir: -1,
+  /** Индекс тайла пандуса под танком (0 — низ, 2 — вершина) или -1. */
+  rampIndex: -1,
+  /** Край полосы, на котором меняется ярус: RAMP_TOP вверх, RAMP_BOTTOM вниз, -1 — нет. */
+  rampTarget: -1,
+  /** Пандус уже сменил ярус — повторно переключаться нельзя, пока стоим на тайле. */
+  rampSwitched: false,
   /** Остаток перезарядки — по нему клиент играет звук выстрела. */
   cooldown: 0,
 };
@@ -219,10 +262,40 @@ const particles = [];
 let terrainCanvases = [];
 let terrainCtxs = [];
 let sprites = null;
+/** Развёрнута ли мини-карта на весь экран. */
+let minimapExpanded = false;
 
 // ---------------------------------------------------------------------------
 // Звук
 // ---------------------------------------------------------------------------
+
+/**
+ * Категории звука: у каждой свой регулятор громкости.
+ *
+ * 'master' — общая громкость, остальные — отдельные регуляторы под каждое
+ * действие: выстрелы, взрывы, мотор, попадания и интерфейс.
+ */
+const VOLUME_CATEGORIES = ['master', 'shots', 'explosions', 'engine', 'hits'];
+
+/** Значения регуляторов по умолчанию. */
+const VOLUME_DEFAULTS = Object.freeze({
+  master: 0.9,
+  shots: 0.8,
+  explosions: 0.8,
+  engine: 0.7,
+  hits: 0.8,
+});
+
+/** К какой категории относится тот или иной звук. */
+const SFX_CATEGORY = Object.freeze({
+  shot: 'shots',
+  shot_foe: 'shots',
+  explosion: 'explosions',
+  hit: 'hits',
+  damage: 'hits',
+  pickup: 'hits',
+  powerup: 'hits',
+});
 
 /**
  * Простой звуковой движок на Web Audio API.
@@ -233,17 +306,109 @@ let sprites = null;
 const audio = {
   ctx: null,
   master: null,
+  /** Узлы громкости по категориям: shots / explosions / engine / hits. */
+  gains: {},
+  /** Текущие значения регуляторов (0..1). */
+  volumes: { ...VOLUME_DEFAULTS },
   buffers: new Map(),
   enabled: true,
   loading: false,
   /** Процедурный звук мотора (без внешних файлов). */
   engine: null,
+  /** Общий буфер белого шума — используется выстрелами и взрывами. */
+  noise: null,
 };
 
-const SFX_NAMES = ['shot', 'shot_foe', 'explosion', 'hit', 'pickup', 'powerup', 'damage'];
+/**
+ * Звуки, которые грузятся с диска.
+ *
+ * Выстрела здесь нет: он синтезируется процедурно (`playTankShot`), чтобы
+ * звучал как танковый, а не как лазерный.
+ */
+const SFX_NAMES = ['explosion', 'hit', 'pickup', 'powerup', 'damage'];
 
 /** Звуки из серверного канала: 0 — выстрел, 1 — взрыв, 2 — попадание. */
 const SPATIAL_SFX = ['shot_foe', 'explosion', 'hit'];
+
+/**
+ * Перевод строки с запасным вариантом.
+ *
+ * Если ключа нет в словаре, `t()` вернёт сам ключ — тогда показываем
+ * русский текст по умолчанию, чтобы интерфейс не остался пустым.
+ */
+function tr(key, fallback) {
+  let value = '';
+  try {
+    value = t(key);
+  } catch (err) {
+    value = '';
+  }
+  return !value || value === key ? fallback : value;
+}
+
+/** Читает сохранённые регуляторы из localStorage. */
+function loadVolumes() {
+  try {
+    for (const cat of VOLUME_CATEGORIES) {
+      const raw = localStorage.getItem(`tanchiki.vol.${cat}`);
+      if (raw === null) continue;
+      const num = Number(raw);
+      if (Number.isFinite(num)) {
+        audio.volumes[cat] = Math.max(0, Math.min(1, num));
+      }
+    }
+  } catch (err) {
+    // Приватный режим браузера — просто остаёмся на значениях по умолчанию.
+  }
+}
+
+/** Сохраняет регуляторы в localStorage. */
+function saveVolumes() {
+  try {
+    for (const cat of VOLUME_CATEGORIES) {
+      localStorage.setItem(`tanchiki.vol.${cat}`, String(audio.volumes[cat]));
+    }
+  } catch (err) {
+    // Сохранение недоступно — на игру это не влияет.
+  }
+}
+
+/** Применяет текущие значения регуляторов к узлам громкости. */
+function applyVolumes() {
+  if (!audio.ctx || !audio.master) return;
+  const now = audio.ctx.currentTime;
+  // Общая громкость — общий регулятор плюс кнопка «звук вкл/выкл».
+  const master = audio.enabled ? audio.volumes.master : 0;
+  audio.master.gain.setTargetAtTime(master, now, 0.03);
+  for (const cat of ['shots', 'explosions', 'engine', 'hits']) {
+    const node = audio.gains[cat];
+    if (node) node.gain.setTargetAtTime(audio.volumes[cat], now, 0.03);
+  }
+}
+
+/**
+ * Подключает слайдеры панели к регуляторам звука.
+ *
+ * Значения сразу подставляются в input и в подписи, поэтому панель
+ * показывает реальные настройки, а не пустые дефолты.
+ */
+function bindVolumeControls() {
+  for (const cat of VOLUME_CATEGORIES) {
+    const input = VOLUME_INPUTS[cat];
+    if (!input) continue;
+    input.value = String(Math.round(audio.volumes[cat] * 100));
+    const output = input.parentElement ? input.parentElement.querySelector('output') : null;
+    if (output) output.textContent = `${Math.round(audio.volumes[cat] * 100)}%`;
+    input.addEventListener('input', () => {
+      const num = Number(input.value);
+      if (!Number.isFinite(num)) return;
+      audio.volumes[cat] = Math.max(0, Math.min(1, num / 100));
+      if (output) output.textContent = `${Math.round(num)}%`;
+      applyVolumes();
+      saveVolumes();
+    });
+  }
+}
 
 /** Загружает и декодирует звуки. Вызывается по первому действию игрока. */
 async function initAudio() {
@@ -257,8 +422,13 @@ async function initAudio() {
   try {
     audio.ctx = new Ctx();
     audio.master = audio.ctx.createGain();
-    audio.master.gain.value = 0.9;
     audio.master.connect(audio.ctx.destination);
+    // По узлу на каждую категорию — так регуляторы независимы друг от друга.
+    for (const cat of ['shots', 'explosions', 'engine', 'hits']) {
+      const gain = audio.ctx.createGain();
+      gain.connect(audio.master);
+      audio.gains[cat] = gain;
+    }
     await Promise.all(
       SFX_NAMES.map(async (name) => {
         try {
@@ -272,6 +442,7 @@ async function initAudio() {
       }),
     );
     initEngineSound();
+    applyVolumes();
   } catch (err) {
     console.warn('звук недоступен:', err);
   }
@@ -302,7 +473,8 @@ function initEngineSound() {
   osc.connect(filter);
   sub.connect(filter);
   filter.connect(gain);
-  gain.connect(audio.master);
+  // Мотор идёт через собственный регулятор громкости.
+  gain.connect(audio.gains.engine ?? audio.master);
   osc.start();
   sub.start();
   audio.engine = { osc, sub, filter, gain };
@@ -364,6 +536,87 @@ function updateAudioListener() {
   }
 }
 
+/** Общий буфер белого шума (создаётся один раз). */
+function noiseBuffer() {
+  if (audio.noise) return audio.noise;
+  const ctx = audio.ctx;
+  const len = Math.max(1, Math.floor(ctx.sampleRate * 0.6));
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  audio.noise = buf;
+  return buf;
+}
+
+/**
+ * Процедурный звук танкового выстрела.
+ *
+ * Три слоя складываются в характерный «бум» пушки:
+ *  1) низкочастотный свип синуса 150 → 45 Гц — сама тяга выстрела;
+ *  2) шумовой всплеск через lowpass — выстрел как таковой;
+ *  3) короткий металлический отзвук — ствол и отдача.
+ *
+ * Звук собирается из генераторов прямо в браузере: никаких внешних
+ * файлов, лицензионных вопросов и полного контроля над тембром.
+ *
+ * @param {AudioNode} dest  куда подключить (узел категории или панораму);
+ * @param {number}   volume общая громкость (0..1);
+ * @param {number}   pitch  сдвиг тона (1 — штатный выстрел);
+ */
+function playTankShot(dest, volume = 1, pitch = 1) {
+  if (!audio.enabled || !audio.ctx || !dest) return;
+  const ctx = audio.ctx;
+  if (ctx.state === 'suspended') ctx.resume();
+  const now = ctx.currentTime;
+
+  // 1) Низкочастотная «ударная волна».
+  const osc = ctx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(150 * pitch, now);
+  osc.frequency.exponentialRampToValueAtTime(45 * pitch, now + 0.3);
+  const og = ctx.createGain();
+  og.gain.setValueAtTime(0.0001, now);
+  og.gain.exponentialRampToValueAtTime(0.95 * volume, now + 0.014);
+  og.gain.exponentialRampToValueAtTime(0.0001, now + 0.45);
+
+  // 2) Шумовой всплеск — «порох».
+  const noise = ctx.createBufferSource();
+  noise.buffer = noiseBuffer();
+  const lp = ctx.createBiquadFilter();
+  lp.type = 'lowpass';
+  lp.frequency.setValueAtTime(2800, now);
+  lp.frequency.exponentialRampToValueAtTime(300, now + 0.28);
+  lp.Q.value = 0.9;
+  const ng = ctx.createGain();
+  ng.gain.setValueAtTime(0.0001, now);
+  ng.gain.exponentialRampToValueAtTime(0.5 * volume, now + 0.008);
+  ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+
+  // 3) Металлический отзвук ствола.
+  const ring = ctx.createOscillator();
+  ring.type = 'triangle';
+  ring.frequency.setValueAtTime(430 * pitch, now);
+  const rg = ctx.createGain();
+  rg.gain.setValueAtTime(0.0001, now);
+  rg.gain.exponentialRampToValueAtTime(0.2 * volume, now + 0.006);
+  rg.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+
+  osc.connect(og);
+  noise.connect(lp);
+  lp.connect(ng);
+  ring.connect(rg);
+  og.connect(dest);
+  ng.connect(dest);
+  rg.connect(dest);
+
+  osc.start(now);
+  osc.stop(now + 0.5);
+  noise.start(now);
+  noise.stop(now + 0.35);
+  ring.start(now);
+  ring.stop(now + 0.2);
+}
+
 /**
  * Проигрывает звук с пространственным позиционированием.
  *
@@ -374,14 +627,7 @@ function updateAudioListener() {
  */
 function playSpatialSound(kind, x, y, deck) {
   if (!audio.enabled || !audio.ctx) return;
-  const name = SPATIAL_SFX[kind] ?? 'shot_foe';
-  const buf = audio.buffers.get(name);
-  if (!buf) return;
   if (audio.ctx.state === 'suspended') audio.ctx.resume();
-
-  const src = audio.ctx.createBufferSource();
-  src.buffer = buf;
-  src.playbackRate.value = 0.88 + Math.random() * 0.24;
 
   const panner = audio.ctx.createPanner();
   panner.panningModel = 'HRTF';
@@ -394,10 +640,23 @@ function playSpatialSound(kind, x, y, deck) {
   const gain = audio.ctx.createGain();
   // Звук с другого этажа слышен глуше — этаж перекрывает.
   gain.gain.value = deck === pred.deck ? 0.8 : 0.45;
-
-  src.connect(panner);
   panner.connect(gain);
-  gain.connect(audio.master);
+
+  const category = kind === 0 ? 'shots' : kind === 1 ? 'explosions' : 'hits';
+  gain.connect(audio.gains[category] ?? audio.master);
+
+  if (kind === 0) {
+    // Выстрел противника — тот же танковый бум, только в пространстве.
+    playTankShot(panner, 0.95, 0.9 + Math.random() * 0.16);
+    return;
+  }
+  const name = SPATIAL_SFX[kind];
+  const buf = audio.buffers.get(name);
+  if (!buf) return;
+  const src = audio.ctx.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = 0.88 + Math.random() * 0.24;
+  src.connect(panner);
   src.start();
 }
 
@@ -413,21 +672,34 @@ function playSound(name, volume = 1, rate = 1) {
   const gain = audio.ctx.createGain();
   gain.gain.value = volume;
   src.connect(gain);
-  gain.connect(audio.master);
+  const category = SFX_CATEGORY[name] ?? 'hits';
+  gain.connect(audio.gains[category] ?? audio.master);
   src.start();
+}
+
+/** Выстрел из пушки игрока — процедурный танковый бум. */
+function playOwnShot() {
+  playTankShot(audio.gains.shots ?? audio.master, 1);
+}
+
+/** Короткий глухой «пуск» способности (миномёт, авиаподдержка). */
+function playAbilityLaunch() {
+  playTankShot(audio.gains.shots ?? audio.master, 0.4, 1.7);
 }
 
 function toggleSound() {
   audio.enabled = !audio.enabled;
   if (audio.enabled && audio.ctx && audio.ctx.state === 'suspended') audio.ctx.resume();
+  applyVolumes();
   updateSoundButton();
 }
 
 function updateSoundButton() {
   if (!soundButton) return;
-  soundButton.textContent = audio.enabled ? '🔊 ЗВУК' : '🔇 ЗВУК ВЫКЛ';
+  soundButton.textContent = audio.enabled ? tr('hud.soundOn', '🔊 ЗВУК') : tr('hud.soundOff', '🔇 ЗВУК ВЫКЛ');
   soundButton.classList.toggle('off', !audio.enabled);
 }
+
 
 // ---------------------------------------------------------------------------
 // Подключение
@@ -509,7 +781,7 @@ function handleMessage(msg) {
       pred.vel = 0;
       // Возрождение всегда на нижнем ярусе.
       pred.deck = LEVEL_GROUND;
-      pred.onRamp = false;
+      resetRampState();
       state.deck = LEVEL_GROUND;
       correction.x = 0;
       correction.y = 0;
@@ -555,8 +827,32 @@ function applyMap(map) {
   fog.width = 0;
   fog.height = 0;
   ensureFog();
+  // Полосы пандуса заранее считаем исследованными на обоих этажах:
+  // иначе при подъёме экран на мгновение проваливался бы в черноту.
+  markRampsExplored();
   // Если карта сменилась — сбросим предсказание, чтобы не телепортировать танк.
   pred.active = false;
+  resetRampState();
+  resizeMinimap();
+}
+
+/**
+ * Помечает тайлы пандусов исследованными на всех этажах.
+ *
+ * Пандус — единственное место, где игрок переходит между этажами, поэтому
+ * видеть его нужно заранее, а не в момент перехода.
+ */
+function markRampsExplored() {
+  const m = state.map;
+  if (!m) return;
+  for (let d = 0; d < m.levels; d++) {
+    const layer = m.layers[d];
+    const explored = fog.explored[d];
+    if (!layer || !explored) continue;
+    for (let i = 0; i < layer.length; i++) {
+      if ((layer[i] & 7) === TILE.RAMP) explored[i] = 1;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +870,7 @@ function applySnapshot(msg) {
     const serverDeck = mine.deck ?? LEVEL_GROUND;
     if (serverDeck !== pred.deck) {
       pred.deck = serverDeck;
-      pred.onRamp = false;
+      resetRampState();
     }
     state.deck = pred.deck;
   }
@@ -749,6 +1045,20 @@ window.addEventListener('keydown', (e) => {
     toggleSound();
     return;
   }
+  // F — развернуть или свернуть карту на весь экран.
+  if (e.code === 'KeyF') {
+    e.preventDefault();
+    setMinimapExpanded(!minimapExpanded);
+    return;
+  }
+  // Esc — свернуть развёрнутую карту.
+  if (e.code === 'Escape') {
+    if (minimapExpanded) {
+      e.preventDefault();
+      setMinimapExpanded(false);
+    }
+    return;
+  }
   // Выбор способности: 1 — миномёт, 2 — авиаподдержка.
   // Обычная пушка отдельной кнопкой не нужна: она на левой кнопке мыши.
   if (e.code === 'Digit1') {
@@ -779,6 +1089,14 @@ if (soundButton) {
   });
 }
 
+if (minimapToggle) {
+  minimapToggle.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMinimapExpanded(!minimapExpanded);
+  });
+}
+
 /**
  * Выбирает способность.
  * @param {number} ability
@@ -802,7 +1120,7 @@ canvas.addEventListener('mousedown', (e) => {
       return;
     }
     state.pendingUse = true;
-    playSound('shot', 0.35, 0.7);
+    playAbilityLaunch();
   }
 });
 window.addEventListener('mouseup', () => {
@@ -864,34 +1182,105 @@ function isOnIce(x, y, deck = pred.deck) {
   return (layer[ty * m.width + tx] & 7) === TILE.ICE;
 }
 
-/** Стоит ли тайл на трамплине (переходе между ярусами). */
-function isRampAt(x, y, deck = pred.deck) {
-  const m = state.map;
-  if (!m) return false;
-  const layer = m.layers[deck];
-  if (!layer) return false;
-  const tx = Math.floor((x + TANK_SIZE / 2) / m.tileSize);
-  const ty = Math.floor((y + TANK_SIZE / 2) / m.tileSize);
-  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
-  return (layer[ty * m.width + tx] & 7) === TILE.RAMP;
+/** Сбрасывает состояние пандуса (после смены яруса или возрождения). */
+function resetRampState() {
+  pred.rampDir = -1;
+  pred.rampIndex = -1;
+  pred.rampTarget = -1;
+  pred.rampSwitched = false;
 }
 
 /**
- * Меняет ярус при заезде на трамплин.
+ * Данные о полосе пандуса под точкой.
  *
- * Переход работает как дверной порог: этаж меняется только при входе на
- * трамплин, поэтому танк не «прыгает» между этажами, стоя на нём.
+ * В байте тайла пандуса закодированы: вид тайла (младшие 3 бита),
+ * направление полосы (биты 3–4) и индекс тайла в полосе (биты 5–6).
+ *
+ * Направление полосы: 0 — вправо, 1 — вниз, 2 — влево, 3 — вверх.
+ * Индекс: 0 — нижний край (уровень земли), 2 — вершина (верхний этаж).
+ *
+ * @returns {{dir:number, idx:number, tx:number, ty:number}|null}
+ */
+function rampInfoAt(x, y, deck = pred.deck) {
+  const m = state.map;
+  if (!m) return null;
+  const layer = m.layers[deck];
+  if (!layer) return null;
+  const cx = x + TANK_SIZE / 2;
+  const cy = y + TANK_SIZE / 2;
+  const tx = Math.floor(cx / m.tileSize);
+  const ty = Math.floor(cy / m.tileSize);
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return null;
+  const v = layer[ty * m.width + tx];
+  if ((v & 7) !== TILE.RAMP) return null;
+  return { dir: (v >> 3) & 3, idx: (v >> 5) & 3, tx, ty };
+}
+
+/**
+ * Высота подъёма пандуса под точкой (в мировых пикселях).
+ *
+ * Вне пандуса высота этажа постоянна: земля — ноль, верхняя площадка —
+ * полная высота подъёма. На самом пандусе высота растёт линейно от
+ * нижнего края полосы к верхнему, поэтому подъём выглядит непрерывным.
+ */
+function rampHeightAt(x, y, deck = pred.deck) {
+  const info = rampInfoAt(x, y, deck);
+  if (!info) return deck === LEVEL_UPPER ? RAMP_HEIGHT : 0;
+  const m = state.map;
+  const ts = m.tileSize;
+  const cx = x + TANK_SIZE / 2;
+  const cy = y + TANK_SIZE / 2;
+  // Доля тайла вдоль направления подъёма: 0 — внизу полосы, 1 — вверху.
+  let frac;
+  if (info.dir === 0) frac = (cx - info.tx * ts) / ts;
+  else if (info.dir === 1) frac = (cy - info.ty * ts) / ts;
+  else if (info.dir === 2) frac = 1 - (cx - info.tx * ts) / ts;
+  else frac = 1 - (cy - info.ty * ts) / ts;
+  frac = Math.max(0, Math.min(1, frac));
+  // Прогресс по полосе: 0 — нижний край, RAMP_LEN — верхний.
+  const progress = info.idx + frac;
+  return (progress / RAMP_LEN) * RAMP_HEIGHT;
+}
+
+/**
+ * Непрерывный переход между ярусами по пандусу.
+ *
+ * Пандус — полоса из трёх тайлов: тайл 0 — нижний край (уровень земли),
+ * тайл 1 — середина, тайл 2 — верхний край (верхняя площадка). Полоса —
+ * это наклонная поверхность: на нижнем ярусе ею поднимаются наверх, на
+ * верхнем — спускаются вниз.
+ *
+ * Цель перехода задаёт этаж, а не направление езда: снизу цель — верхний
+ * край полосы, сверху — нижний. Поэтому заезд сбоку или с «не того» края
+ * тоже отрабатывает правильно, и ярус не меняется случайно.
+ *
+ * Логика — зеркало серверной `Game::update_deck`.
  */
 function updatePredictedDeck() {
-  const onRamp = isRampAt(pred.x, pred.y, pred.deck);
-  if (onRamp && !pred.onRamp) {
+  const info = rampInfoAt(pred.x, pred.y, pred.deck);
+  if (!info) {
+    // Сход с пандуса: следующий заезд начнётся заново.
+    resetRampState();
+    return;
+  }
+  if (pred.rampDir === -1) {
+    // Только что въехали на пандус: запоминаем полосу и наш тайл в ней.
+    pred.rampDir = info.dir;
+    pred.rampIndex = info.idx;
+    pred.rampSwitched = false;
+  }
+  // Снизу едем к вершине полосы, сверху — к её основанию.
+  pred.rampTarget = pred.deck === LEVEL_GROUND ? RAMP_TOP : RAMP_BOTTOM;
+  if (info.idx === pred.rampTarget && !pred.rampSwitched) {
     const next = pred.deck === LEVEL_GROUND ? LEVEL_UPPER : LEVEL_GROUND;
+    // Переключаемся только если на новом ярусе тоже можно стоять.
     if (mapRectFree(pred.x, pred.y, TANK_SIZE, next)) {
       pred.deck = next;
       state.deck = next;
+      pred.rampSwitched = true;
     }
   }
-  pred.onRamp = onRamp;
+  pred.rampIndex = info.idx;
 }
 
 function alignToGrid(dir) {
@@ -975,7 +1364,7 @@ function stepPrediction(dt) {
   // Перезарядка: по ней клиент понимает, когда прозвучит выстрел.
   pred.cooldown = Math.max(0, pred.cooldown - dt);
   if ((input & BIT.FIRE) !== 0 && pred.cooldown <= 0) {
-    playSound('shot', 0.5);
+    playOwnShot();
     pred.cooldown = fireCooldown(pred.level);
   }
 }
@@ -1500,6 +1889,8 @@ function drawTiles(now, deck, alpha, withFog) {
 
 function drawPickups(pickups) {
   for (const p of pickups.values()) {
+    // Бонусы соседнего этажа не видны.
+    if ((p.deck ?? LEVEL_GROUND) !== pred.deck) continue;
     // Бонус виден только там, где игрок уже был.
     const explored = fog.explored[pred.deck];
     if (explored) {
@@ -1556,6 +1947,8 @@ function drawStar(cx, cy, r, fill, stroke) {
 
 function drawBullets(bullets) {
   for (const b of bullets.values()) {
+    // Снаряды соседнего этажа не видны.
+    if ((b.deck ?? LEVEL_GROUND) !== pred.deck) continue;
     const x = worldToScreenX(b.x);
     const y = worldToScreenY(b.y);
     const dir = aimDelta(b.dir);
@@ -1593,10 +1986,25 @@ function isInForest(x, y, deck = pred.deck) {
 function drawTank(p, opts = {}) {
   const size = TANK_SIZE * camera.zoom;
   const x = worldToScreenX(p.x);
-  const y = worldToScreenY(p.y);
+  const groundY = worldToScreenY(p.y);
+  // Подъём на пандусе: корпус рисуется выше, а тень остаётся на земле —
+  // так видно, что танк едет вверх, а не «перепрыгнул» этаж.
+  const lift = (opts.lift ?? 0) * camera.zoom;
+  const y = groundY - lift;
   const hue = opts.hue ?? 40;
   const level = p.level ?? 1;
   const aim = p.aim ?? 4;
+
+  // Тень на земле.
+  if (lift > 0.5) {
+    ctx.save();
+    ctx.globalAlpha = 0.38 * (1 - Math.min(1, lift / (RAMP_HEIGHT * camera.zoom)) * 0.45);
+    ctx.fillStyle = '#000000';
+    ctx.beginPath();
+    ctx.ellipse(x + size / 2, groundY + size * 0.74, size * 0.42, size * 0.17, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
 
   ctx.save();
   // В чаще танк частично маскируется — становится полупрозрачным.
@@ -1729,15 +2137,9 @@ function renderWorld(now) {
   ctx.fillRect(0, 0, w, h);
 
   const deck = pred.deck;
-  const other = deck === LEVEL_GROUND ? LEVEL_UPPER : LEVEL_GROUND;
 
-  // Соседний этаж рисуем первым и приглушённо: так видно планировку
-  // верхнего (или нижнего) уровня, но он не путается с текущим.
-  drawTiles(now, other, 0.32, false);
-  // Лёгкая тень «потолка» над чужим этажом.
-  ctx.fillStyle = 'rgba(6,10,16,0.45)';
-  ctx.fillRect(0, 0, w, h);
-
+  // Виден только свой этаж: соседний ярус не рисуется вовсе, чтобы не
+  // путать планировку и не спорить с туманом.
   drawTiles(now, deck, 1, true);
 
   // Слой тумана: неисследованное закрыто, исследованное приглушено.
@@ -1777,22 +2179,30 @@ function renderWorld(now) {
     // --- Танки ---
     for (const [id, pb] of b.players) {
       if (id === state.myId) continue;
+      // Чужие танки с другого этажа не видны — этаж перекрывает.
+      if ((pb.deck ?? LEVEL_GROUND) !== deck) continue;
       const pa = a.players.get(id);
       const p = {
         ...pb,
         x: pa ? pa.x + (pb.x - pa.x) * f : pb.x,
         y: pa ? pa.y + (pb.y - pa.y) * f : pb.y,
       };
-      drawTank(p, { hue: hueFor(id), trackPhase: (performance.now() / 60) % 6 });
+      drawTank(p, {
+        hue: hueFor(id),
+        trackPhase: (performance.now() / 60) % 6,
+        lift: rampHeightAt(p.x, p.y, p.deck ?? deck),
+      });
     }
   }
 
   // --- Свой танк (предсказание + мягкая коррекция) ---
   if (pred.active) {
+    const selfX = pred.x + correction.x;
+    const selfY = pred.y + correction.y;
     drawTank(
       {
-        x: pred.x + correction.x,
-        y: pred.y + correction.y,
+        x: selfX,
+        y: selfY,
         dir: pred.dir,
         aim: pred.aim,
         level: pred.level,
@@ -1801,7 +2211,12 @@ function renderWorld(now) {
         shielded: pred.shielded,
         name: '',
       },
-      { hue: hueFor(state.myId), self: true, trackPhase: (performance.now() / 60) % 6 },
+      {
+        hue: hueFor(state.myId),
+        self: true,
+        trackPhase: (performance.now() / 60) % 6,
+        lift: rampHeightAt(selfX, selfY, pred.deck),
+      },
     );
   }
 
@@ -1850,6 +2265,8 @@ function drawCursor() {
 function drawEffects(effects) {
   if (!effects) return;
   for (const e of effects.values()) {
+    // Эффекты соседнего этажа не видны.
+    if ((e.deck ?? LEVEL_GROUND) !== pred.deck) continue;
     const t = Math.max(0, Math.min(1, e.phase / 100));
     if (e.kind === EFFECT.MORTAR) {
       // Миномёт летит по дуге: горизонталь — по прямой, высота — по параболе.
@@ -1934,7 +2351,7 @@ function updateStatus() {
   statPing.textContent = state.pingSeen ? `${state.ping} мс` : '—';
   if (statDeck) {
     const upper = pred.deck === LEVEL_UPPER;
-    statDeck.textContent = upper ? 'ВЕРХНИЙ' : 'НИЖНИЙ';
+    statDeck.textContent = upper ? tr('hud.deck.upper', 'ВЕРХНИЙ') : tr('hud.deck.lower', 'НИЖНИЙ');
     statDeck.classList.toggle('upper', upper);
   }
 }
@@ -1943,11 +2360,22 @@ function updateStatus() {
  * Описания способностей для панели выбора.
  *
  * Обычная пушка сюда не входит: она и так на левой кнопке мыши, отдельная
- * кнопка для неё только занимает место.
+ * кнопка для неё только занимает место. Названия и подписи берутся из
+ * словаря i18n, поэтому переключение языка меняет и их.
  */
 const ABILITY_INFO = [
-  { id: ABILITY.MORTAR, key: '1', name: 'Миномёт', desc: 'через стены · урон 2' },
-  { id: ABILITY.AIR_STRIKE, key: '2', name: 'Авиаподдержка', desc: 'удар с воздуха · урон 3' },
+  {
+    id: ABILITY.MORTAR,
+    key: '1',
+    name: () => tr('ability.mortar.name', 'Миномёт'),
+    desc: () => tr('ability.mortar.desc', 'через стены · урон 2'),
+  },
+  {
+    id: ABILITY.AIR_STRIKE,
+    key: '2',
+    name: () => tr('ability.airstrike.name', 'Авиаподдержка'),
+    desc: () => tr('ability.airstrike.desc', 'удар с воздуха · урон 3'),
+  },
 ];
 
 /** Кэш кнопок панели способностей: id -> { el, cd }. */
@@ -1970,11 +2398,11 @@ function buildAbilityBar() {
 
     const name = document.createElement('span');
     name.className = 'ability-name';
-    name.textContent = info.name;
+    name.textContent = info.name();
 
     const desc = document.createElement('span');
     desc.className = 'ability-desc';
-    desc.textContent = info.desc;
+    desc.textContent = info.desc();
 
     const cd = document.createElement('span');
     cd.className = 'ability-cd';
@@ -1998,7 +2426,7 @@ function renderAbilityBar() {
     el.classList.toggle('cooling', cooldownOf(id) > 0);
     // Кулдаун показывается ВСЕГДА: сколько секунд осталось до готовности.
     const left = cooldownOf(id);
-    cd.textContent = left > 0 ? `${(left / 30).toFixed(1)} с` : 'ГОТОВ';
+    cd.textContent = left > 0 ? `${(left / 30).toFixed(1)} с` : tr('ability.ready', 'ГОТОВ');
     cd.classList.toggle('ready', left === 0);
   }
 }
@@ -2014,9 +2442,55 @@ function cooldownOf(ability) {
 function updateAbilityHint() {
   if (!abilityHint) return;
   if (state.ability === ABILITY.MORTAR) {
-    abilityHint.textContent = 'Миномёт: ПКМ по точке — перелетает стены · 1 / 2 — выбор';
+    abilityHint.textContent = tr('ability.hint.mortar', 'Миномёт: ПКМ по точке — перелетает стены · 1 / 2 — выбор');
   } else {
-    abilityHint.textContent = 'Авиаподдержка: ПКМ по точке — удар с воздуха · 1 / 2 — выбор';
+    abilityHint.textContent = tr(
+      'ability.hint.airstrike',
+      'Авиаподдержка: ПКМ по точке — удар с воздуха · 1 / 2 — выбор',
+    );
+  }
+}
+
+/**
+ * Перерисовывает все динамические части интерфейса после смены языка.
+ *
+ * Статические подписи переводятся модулем i18n по атрибутам `data-i18n`,
+ * а всё, что клиент рисует сам (способности, кулдауны, ярус, кнопка
+ * звука), обновляется здесь.
+ */
+function refreshLocalizedUi() {
+  try {
+    buildAbilityBar();
+    updateAbilityHint();
+    updateSoundButton();
+    updateStatus();
+    renderLeaderboard();
+    if (minimapToggle) {
+      const label = minimapExpanded
+        ? tr('hud.collapse', 'СВЕРНУТЬ')
+        : tr('hud.expand', 'РАЗВЕРНУТЬ');
+      minimapToggle.title = label;
+      minimapToggle.setAttribute('aria-label', label);
+    }
+  } catch (err) {
+    console.warn('не удалось обновить интерфейс после смены языка:', err);
+  }
+}
+
+/**
+ * Следит за сменой языка.
+ *
+ * Модуль i18n выставляет `document.documentElement.lang`, поэтому
+ * наблюдатель за этим атрибутом — самый надёжный способ узнать о смене
+ * языка и перерисовать динамические подписи.
+ */
+function watchLanguage() {
+  try {
+    const observer = new MutationObserver(() => refreshLocalizedUi());
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] });
+  } catch (err) {
+    // Без наблюдателя язык переключится, но часть подписей останется
+    // на старом языке — это не ломает игру.
   }
 }
 
@@ -2041,46 +2515,142 @@ function renderLeaderboard() {
   }
 }
 
+/**
+ * Разворачивает мини-карту на весь экран и обратно.
+ *
+ * Переключение максимально устойчивое: любая ошибка внутри гасится,
+ * чтобы кнопка не могла «сломать» игру.
+ *
+ * @param {boolean} expanded развернуть ли карту
+ */
+function setMinimapExpanded(expanded) {
+  try {
+    if (!minimapPanel) return;
+    minimapExpanded = !!expanded;
+    minimapPanel.classList.toggle('expanded', minimapExpanded);
+    if (minimapToggle) {
+      minimapToggle.textContent = minimapExpanded ? '⤡' : '⛶';
+      const label = minimapExpanded
+        ? tr('hud.collapse', 'СВЕРНУТЬ')
+        : tr('hud.expand', 'РАЗВЕРНУТЬ');
+      minimapToggle.title = label;
+      minimapToggle.setAttribute('aria-label', label);
+    }
+    resizeMinimap();
+    renderMinimap();
+  } catch (err) {
+    console.warn('не удалось переключить карту:', err);
+  }
+}
+
+/** Текущий масштаб интерфейса из CSS-переменной `--ui`. */
+function uiScale() {
+  try {
+    const raw = getComputedStyle(document.documentElement).getPropertyValue('--ui');
+    const num = parseFloat(raw);
+    return Number.isFinite(num) && num > 0 ? num : 1;
+  } catch (err) {
+    return 1;
+  }
+}
+
+/**
+ * Подгоняет размер холста мини-карты под текущий режим.
+ *
+ * В обычном режиме размер задаёт CSS, в развёрнутом — считаем сами,
+ * чтобы карта занимала весь экран и оставалась резкой на HiDPI.
+ */
+function resizeMinimap() {
+  try {
+    if (!minimapCanvas || !state.map) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    let size;
+    if (minimapExpanded) {
+      const availW = Math.max(240, window.innerWidth - 80);
+      const availH = Math.max(240, window.innerHeight - 170);
+      size = Math.floor(Math.min(availW, availH));
+      minimapCanvas.style.width = `${size}px`;
+      minimapCanvas.style.height = `${size}px`;
+    } else {
+      minimapCanvas.style.width = '';
+      minimapCanvas.style.height = '';
+      size = Math.floor(320 * uiScale());
+    }
+    const px = Math.max(160, Math.min(1600, Math.floor(size * dpr)));
+    if (minimapCanvas.width !== px) {
+      minimapCanvas.width = px;
+      minimapCanvas.height = px;
+    }
+  } catch (err) {
+    console.warn('не удалось изменить размер карты:', err);
+  }
+}
+
 function renderMinimap() {
   if (!state.map || !terrainCanvases.length) return;
   const m = state.map;
   const deck = pred.deck;
-  mctx.clearRect(0, 0, minimapCanvas.width, minimapCanvas.height);
+  const w = minimapCanvas.width;
+  const h = minimapCanvas.height;
+  if (!w || !h) return;
+  mctx.clearRect(0, 0, w, h);
   const terrain = terrainCanvases[deck] ?? terrainCanvases[0];
-  mctx.drawImage(terrain, 0, 0);
+  // Рельеф карты (160×160 тайлов) растягиваем на весь холст: так карта
+  // одинаково чёткая и в маленьком, и в полноэкранном виде.
+  mctx.imageSmoothingEnabled = false;
+  mctx.drawImage(terrain, 0, 0, w, h);
 
   // Поверх рельефа — туман войны: неисследованное чёрное,
   // исследованное приглушено, видимое — как есть.
   if (fog.canvas) {
-    mctx.imageSmoothingEnabled = false;
-    mctx.drawImage(fog.canvas, 0, 0, minimapCanvas.width, minimapCanvas.height);
+    mctx.drawImage(fog.canvas, 0, 0, w, h);
   }
+
+  // Масштаб: сколько пикселей холста приходится на один тайл.
+  const scale = w / m.width;
 
   // Бонусы.
   const snap = state.snapshots[state.snapshots.length - 1];
   if (snap) {
     mctx.fillStyle = '#58a6ff';
     for (const p of snap.pickups.values()) {
-      mctx.fillRect((p.x / m.tileSize) - 0.5, (p.y / m.tileSize) - 0.5, 2, 2);
+      if ((p.deck ?? LEVEL_GROUND) !== deck) continue;
+      const cx = (p.x / m.tileSize) * scale;
+      const cy = (p.y / m.tileSize) * scale;
+      mctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
     }
-    // Танки.
+    // Танки — только с текущего этажа.
     for (const p of snap.players.values()) {
-      const cx = p.x / m.tileSize;
-      const cy = p.y / m.tileSize;
+      if ((p.deck ?? LEVEL_GROUND) !== deck) continue;
+      const cx = (p.x / m.tileSize) * scale;
+      const cy = (p.y / m.tileSize) * scale;
       if (p.id === state.myId) {
         mctx.fillStyle = '#58d68d';
-        mctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
+        mctx.fillRect(cx - 2, cy - 2, 4, 4);
         mctx.strokeStyle = 'rgba(88,214,141,0.6)';
         mctx.lineWidth = 1;
         mctx.beginPath();
-        mctx.arc(cx, cy, 6, 0, Math.PI * 2);
+        mctx.arc(cx, cy, Math.max(4, 6 * scale), 0, Math.PI * 2);
         mctx.stroke();
       } else {
         mctx.fillStyle = p.isBot ? '#f0a202' : '#f85149';
-        mctx.fillRect(cx - 1, cy - 1, 2, 2);
+        mctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
       }
     }
   }
+
+  // Прямоугольник видимой области — в развёрнутой карте это главная
+  // подсказка, где сейчас находится танк.
+  const halfW = canvas.clientWidth / 2 / camera.zoom;
+  const halfH = canvas.clientHeight / 2 / camera.zoom;
+  mctx.strokeStyle = 'rgba(230,237,243,0.45)';
+  mctx.lineWidth = 1;
+  mctx.strokeRect(
+    ((camera.x - halfW) / m.tileSize) * scale,
+    ((camera.y - halfH) / m.tileSize) * scale,
+    ((halfW * 2) / m.tileSize) * scale,
+    ((halfH * 2) / m.tileSize) * scale,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -2092,6 +2662,8 @@ let fpsAccum = 0;
 let fpsFrames = 0;
 /** Накопитель времени для пересчёта тумана войны. */
 let fogAccumulator = 0;
+/** Накопитель времени для обновления мини-карты. */
+let minimapAccumulator = 0;
 
 function frame(now) {
   const dt = Math.min(0.1, (now - lastFrame) / 1000);
@@ -2153,6 +2725,14 @@ function frame(now) {
   renderAbilityBar();
   updateStatus();
 
+  // Мини-карта обновляется реже основной сцены: в развёрнутом виде она
+  // крупная, и перерисовывать её 60 раз в секунду незачем.
+  minimapAccumulator += dt;
+  if (minimapAccumulator >= (minimapExpanded ? 1 / 15 : 1 / 30)) {
+    minimapAccumulator = 0;
+    renderMinimap();
+  }
+
   fpsAccum += dt;
   fpsFrames += 1;
   if (fpsAccum >= 0.5) {
@@ -2180,6 +2760,18 @@ function boot() {
   const saved = localStorage.getItem('tanchiki.nick');
   if (saved) nicknameInput.value = saved;
 
+  // Язык интерфейса: применяем сохранённый и следим за переключением.
+  try {
+    initI18n();
+  } catch (err) {
+    console.warn('не удалось инициализировать язык:', err);
+  }
+  watchLanguage();
+
+  // Регуляторы громкости: восстанавливаем сохранённые значения.
+  loadVolumes();
+  bindVolumeControls();
+
   // Спрайты тайлов рисуем один раз в offscreen-холст.
   buildSprites();
 
@@ -2188,7 +2780,11 @@ function boot() {
   updateAbilityHint();
 
   resizeCanvas();
-  window.addEventListener('resize', resizeCanvas);
+  resizeMinimap();
+  window.addEventListener('resize', () => {
+    resizeCanvas();
+    resizeMinimap();
+  });
 
   showWelcome();
   connect();

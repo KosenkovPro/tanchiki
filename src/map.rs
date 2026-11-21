@@ -2,8 +2,9 @@
 //!
 //! Карта состоит из нескольких **ярусов** (уровней по высоте). Вид сверху,
 //! но этажей несколько: нижний ярус — земля, верхний — площадки и перекрытия.
-//! Переход между ярусами — тайл-«трамплин» (`TileKind::Ramp`), он есть
-//! сразу на обоих ярусах: заехав на него, танк меняет этаж.
+//! Переход между ярусами — пандус (`TileKind::Ramp`): полоса из трёх тайлов,
+//! у каждого тайла записаны направление полосы и его номер в ней. Пандус есть
+//! сразу на обоих ярусах: проехав его целиком, танк меняет этаж.
 
 pub const TILE_SIZE: f32 = 32.0;
 
@@ -25,6 +26,23 @@ pub const LEVELS: u8 = 2;
 pub const LEVEL_GROUND: u8 = 0;
 /// Верхний ярус — площадки и перекрытия.
 pub const LEVEL_UPPER: u8 = 1;
+
+/// Длина пандуса в тайлах: полоса из трёх тайлов.
+pub const RAMP_LEN: u8 = 3;
+
+/// Направление пандуса: подъём вправо.
+pub const RAMP_DIR_RIGHT: u8 = 0;
+/// Направление пандуса: спуск вниз.
+pub const RAMP_DIR_DOWN: u8 = 1;
+/// Направление пандуса: подъём влево.
+pub const RAMP_DIR_LEFT: u8 = 2;
+/// Направление пандуса: подъём вверх.
+pub const RAMP_DIR_UP: u8 = 3;
+/// Пандуса нет: значение для «танк не на пандусе».
+///
+/// Вынесено за пределы направлений (0..=3): иначе полосу «вправо» (0) нельзя
+/// было бы отличить от простоя.
+pub const RAMP_DIR_NONE: u8 = 4;
 
 /// Тип тайла.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +106,38 @@ impl TileKind {
     /// Является ли тайл переходом между ярусами.
     pub fn is_ramp(self) -> bool {
         matches!(self, TileKind::Ramp)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Формат тайла-пандуса
+// ---------------------------------------------------------------------------
+
+/// Направление пандуса, закодированное в значении тайла.
+///
+/// Младшие три бита занимает базовый тип тайла, биты 3..4 — направление:
+/// от нижнего края полосы (номер 0) к верхнему (номер 2).
+pub fn ramp_dir(value: u8) -> u8 {
+    (value >> 3) & 0x03
+}
+
+/// Номер тайла в полосе пандуса: 0 — нижний край, 1 — середина, 2 — верхний.
+pub fn ramp_index(value: u8) -> u8 {
+    (value >> 5) & 0x03
+}
+
+/// Собирает значение тайла-пандуса: тип, направление и номер в полосе.
+pub fn ramp_value(dir: u8, idx: u8) -> u8 {
+    TileKind::Ramp.bits() | ((dir & 0x03) << 3) | ((idx & 0x03) << 5)
+}
+
+/// Смещение соседнего тайла в направлении пандуса.
+pub fn ramp_dir_delta(dir: u8) -> (i32, i32) {
+    match dir & 0x03 {
+        RAMP_DIR_RIGHT => (1, 0),
+        RAMP_DIR_DOWN => (0, 1),
+        RAMP_DIR_LEFT => (-1, 0),
+        _ => (0, -1),
     }
 }
 // ---------------------------------------------------------------------------
@@ -229,8 +279,15 @@ impl GameMap {
     }
 
     /// Стадия повреждения тайла.
+    ///
+    /// Повреждения бывают только у кирпича: у пандуса старшие биты заняты
+    /// направлением полосы и номером тайла в ней.
     pub fn damage(&self, tx: u32, ty: u32, level: u8) -> u8 {
-        self.value(tx, ty, level) >> 3
+        let value = self.value(tx, ty, level);
+        if TileKind::from_bits(value) != TileKind::Brick {
+            return 0;
+        }
+        value >> 3
     }
 
     /// Записывает упакованное значение тайла.
@@ -462,7 +519,10 @@ impl GameMap {
         }
     }
 
-    /// Строит верхний ярус: площадки-перекрытия и трамплины вниз.
+    /// Строит верхний ярус: площадки-перекрытия и пандусы между ярусами.
+    ///
+    /// Сначала ставятся площадки, потом к их краям привязываются пандусы —
+    /// полосы из трёх тайлов, по которым танк поднимается на верхний этаж.
     fn build_upper_level(&mut self, seed: u64) {
         let mut rng = Rng::new(seed);
         let w = self.width;
@@ -471,6 +531,7 @@ impl GameMap {
         // 1. Площадки на верхнем ярусе. Ставим их над свободными местами
         //    нижнего яруса, чтобы они не «замуровывали» нижний этаж.
         let blocks = 14 + rng.below(8);
+        let mut platforms: Vec<Vec<(u32, u32)>> = Vec::with_capacity(blocks as usize);
         for _ in 0..blocks {
             let bw = rng.range(3, 9);
             let bh = rng.range(3, 7);
@@ -481,6 +542,7 @@ impl GameMap {
             } else {
                 TileKind::Steel
             };
+            let mut tiles: Vec<(u32, u32)> = Vec::new();
             for dy in 0..bh {
                 for dx in 0..bw {
                     let px = bx + dx;
@@ -494,49 +556,124 @@ impl GameMap {
                         continue;
                     }
                     self.set_kind(px, py, LEVEL_UPPER, kind);
+                    tiles.push((px, py));
+                }
+            }
+            if !tiles.is_empty() {
+                platforms.push(tiles);
+            }
+        }
+
+        // 2. Кандидаты на пандус: крайний тайл площадки и направление, в
+        //    котором полоса уходит наружу. Подъём по пандусу идёт в обратную
+        //    сторону — от нижнего края полосы к площадке.
+        let mut candidates: Vec<(u32, u32, u8)> = Vec::new();
+        for platform in &platforms {
+            for &(px, py) in platform {
+                for out in [
+                    RAMP_DIR_RIGHT,
+                    RAMP_DIR_DOWN,
+                    RAMP_DIR_LEFT,
+                    RAMP_DIR_UP,
+                ] {
+                    let (dx, dy) = ramp_dir_delta(out);
+                    let (nx, ny) = (px as i64 + dx as i64, py as i64 + dy as i64);
+                    if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
+                        continue;
+                    }
+                    // Внутрь площадки полосу не кладём.
+                    if platform.contains(&(nx as u32, ny as u32)) {
+                        continue;
+                    }
+                    candidates.push((px, py, out));
                 }
             }
         }
 
-        // 2. Трамплины: переходы между ярусами. Один и тот же тайл есть
-        //    на обоих ярусах, поэтому заехав на него, танк меняет этаж.
-        let ramps = 10 + rng.below(6);
+        // 3. Пандусы: полосы из трёх тайлов, ведущие к площадкам. Один и тот же
+        //    тайл стоит на обоих ярусах, поэтому заезд работает и вверх, и вниз.
+        let strips = 8 + rng.below(6);
+        let mut occupied = vec![false; (w * h) as usize];
         let mut placed = 0u32;
         let mut attempts = 0u32;
-        while placed < ramps && attempts < 4096 {
+        while placed < strips && attempts < 20000 {
             attempts += 1;
-            let tx = rng.range(4, w.saturating_sub(5));
-            let ty = rng.range(4, h.saturating_sub(5));
-            // Место должно быть свободно на обоих ярусах.
-            if self.kind(tx, ty, LEVEL_GROUND).blocks_tank()
-                || self.kind(tx, ty, LEVEL_UPPER).blocks_tank()
-            {
+            if candidates.is_empty() {
+                break;
+            }
+            let &(px, py, out) = &candidates[rng.below(candidates.len() as u32) as usize];
+            // Край площадки нельзя выкалывать: он может принадлежать другому
+            // пандусу.
+            if occupied[(py * w + px) as usize] || self.kind(px, py, LEVEL_UPPER).is_ramp() {
                 continue;
             }
-            // И вокруг должен быть проход, чтобы к трамплину можно было подъехать.
-            let mut ok = true;
-            for (dx, dy) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
-                let nx = tx as i64 + dx;
-                let ny = ty as i64 + dy;
-                if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
-                    ok = false;
+            let (dx, dy) = ramp_dir_delta(out);
+            // Подъём по пандусу идёт в сторону, противоположную его уходу.
+            let dir = (out + 2) & 0x03;
+            // Тайлы полосы: от края площадки (верх, номер 2) наружу (низ, 0).
+            let mut strip = [(0u32, 0u32); RAMP_LEN as usize];
+            let mut fits = true;
+            for k in 0..RAMP_LEN as usize {
+                let step = k as i64 + 1;
+                let (nx, ny) = (px as i64 + dx as i64 * step, py as i64 + dy as i64 * step);
+                if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
+                    fits = false;
                     break;
                 }
-                let (nx, ny) = (nx as u32, ny as u32);
-                if self.kind(nx, ny, LEVEL_GROUND).blocks_tank()
-                    || self.kind(nx, ny, LEVEL_UPPER).blocks_tank()
-                {
-                    ok = false;
+                let (tx, ty) = (nx as u32, ny as u32);
+                // Полосы не должны налезать друг на друга.
+                if occupied[(ty * w + tx) as usize] {
+                    fits = false;
                     break;
                 }
+                strip[k] = (tx, ty);
             }
-            if !ok {
+            if !fits {
                 continue;
             }
-            self.set_kind(tx, ty, LEVEL_GROUND, TileKind::Ramp);
-            self.set_kind(tx, ty, LEVEL_UPPER, TileKind::Ramp);
+            // Дверь в площадку: крайний тайл делаем проходимым, иначе с
+            // пандуса нельзя было бы въехать на этаж.
+            let saved = self.value(px, py, LEVEL_UPPER);
+            self.set_kind(px, py, LEVEL_UPPER, TileKind::Empty);
+            for (tx, ty) in strip {
+                if !self.ramp_area_free(tx, ty) {
+                    fits = false;
+                    break;
+                }
+            }
+            if !fits {
+                self.set_value(px, py, LEVEL_UPPER, saved);
+                continue;
+            }
+            // Ставим полосу одинаково на обоих ярусах.
+            for (k, &(tx, ty)) in strip.iter().enumerate() {
+                let value = ramp_value(dir, RAMP_LEN - 1 - k as u8);
+                self.set_value(tx, ty, LEVEL_GROUND, value);
+                self.set_value(tx, ty, LEVEL_UPPER, value);
+                occupied[(ty * w + tx) as usize] = true;
+            }
             placed += 1;
         }
+    }
+
+    /// Проходимы ли тайл и его соседи на обоих ярусах.
+    ///
+    /// Такое условие нужно пандусу: к нему должно быть где подъехать, и он
+    /// не должен упираться в стену.
+    fn ramp_area_free(&self, tx: u32, ty: u32) -> bool {
+        for (dx, dy) in [(0i64, 0i64), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+            let (nx, ny) = (tx as i64 + dx, ty as i64 + dy);
+            if nx < 0 || ny < 0 || nx >= self.width as i64 || ny >= self.height as i64 {
+                return false;
+            }
+            let (nx, ny) = (nx as u32, ny as u32);
+            if self.kind(nx, ny, LEVEL_GROUND).blocks_tank()
+                || self.kind(nx, ny, LEVEL_UPPER).blocks_tank()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// Пересчитывает идентификаторы лесных массивов (заливка по связности).
@@ -815,6 +952,21 @@ mod tests {
         }
     }
 
+    /// Собирает все тайлы-пандусы нижнего яруса: координаты, направление
+    /// полосы и номер тайла в ней.
+    fn ramp_tiles(map: &GameMap) -> Vec<(u32, u32, u8, u8)> {
+        let mut out = Vec::new();
+        for y in 0..map.height() {
+            for x in 0..map.width() {
+                let value = map.value(x, y, LEVEL_GROUND);
+                if map.kind(x, y, LEVEL_GROUND) == TileKind::Ramp {
+                    out.push((x, y, ramp_dir(value), ramp_index(value)));
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn upper_level_has_ramps_on_both_levels() {
         let map = GameMap::generate(MAP_W, MAP_H, 11);
@@ -823,12 +975,167 @@ mod tests {
             for x in 0..MAP_W {
                 if map.kind(x, y, LEVEL_GROUND) == TileKind::Ramp {
                     ramps += 1;
-                    // Трамплин есть на обоих ярусах: заехав на него, меняем этаж.
+                    // Пандус есть на обоих ярусах: заехав на него, меняем этаж.
                     assert_eq!(map.kind(x, y, LEVEL_UPPER), TileKind::Ramp);
+                    // Значение совпадает: тип, направление и номер в полосе.
+                    assert_eq!(
+                        map.value(x, y, LEVEL_GROUND),
+                        map.value(x, y, LEVEL_UPPER),
+                        "пандус на тайле {x},{y} различается на ярусах"
+                    );
                 }
             }
         }
         assert!(ramps > 0, "на карте должны быть переходы между ярусами");
+    }
+
+    #[test]
+    fn ramp_tile_value_packs_direction_and_index() {
+        for dir in 0..4u8 {
+            for idx in 0..RAMP_LEN {
+                let value = ramp_value(dir, idx);
+                // Базовый тип тайла не ломается: читаются только младшие биты.
+                assert_eq!(TileKind::from_bits(value), TileKind::Ramp);
+                assert_eq!(ramp_dir(value), dir);
+                assert_eq!(ramp_index(value), idx);
+            }
+        }
+        // Повреждения у пандуса нет: старшие биты заняты направлением.
+        let mut map = GameMap::generate(64, 64, 3);
+        map.set_value(5, 5, LEVEL_GROUND, ramp_value(RAMP_DIR_UP, 2));
+        assert_eq!(map.damage(5, 5, LEVEL_GROUND), 0);
+    }
+
+    /// Есть ли тайл пандуса в позиции, смещённой от (x, y) на (dx, dy).
+    fn has_ramp_at(
+        ramps: &[(u32, u32, u8, u8)],
+        x: i64,
+        y: i64,
+        dx: i64,
+        dy: i64,
+        dir: u8,
+        idx: u8,
+    ) -> bool {
+        let (nx, ny) = (x + dx, y + dy);
+        if nx < 0 || ny < 0 || nx > u32::MAX as i64 || ny > u32::MAX as i64 {
+            return false;
+        }
+        ramps
+            .iter()
+            .any(|(rx, ry, rd, ri)| *rx as i64 == nx && *ry as i64 == ny && *rd == dir && *ri == idx)
+    }
+
+    #[test]
+    fn ramp_strips_have_ordered_indexes() {
+        let map = GameMap::generate(MAP_W, MAP_H, 11);
+        let ramps = ramp_tiles(&map);
+        assert!(!ramps.is_empty(), "на карте должны быть пандусы");
+        for (x, y, dir, idx) in &ramps {
+            if *idx != 1 {
+                continue;
+            }
+            let (dx, dy) = ramp_dir_delta(*dir);
+            // У середины полосы снизу — начало (номер 0), сверху — конец (2).
+            assert!(
+                has_ramp_at(&ramps, *x as i64, *y as i64, -dx as i64, -dy as i64, *dir, 0),
+                "у пандуса должен быть нижний тайл"
+            );
+            assert!(
+                has_ramp_at(&ramps, *x as i64, *y as i64, dx as i64, dy as i64, *dir, 2),
+                "у пандуса должен быть верхний тайл"
+            );
+        }
+    }
+
+    #[test]
+    fn ramp_strips_do_not_overlap() {
+        for seed in [11u64, 42, 7] {
+            let map = GameMap::generate(MAP_W, MAP_H, seed);
+            let ramps = ramp_tiles(&map);
+            let mut strips = 0;
+            for (x, y, dir, idx) in &ramps {
+                if *idx != 0 {
+                    continue;
+                }
+                strips += 1;
+                let (dx, dy) = ramp_dir_delta(*dir);
+                assert!(
+                    has_ramp_at(&ramps, *x as i64, *y as i64, dx as i64, dy as i64, *dir, 1),
+                    "у полосы должен быть средний тайл"
+                );
+                assert!(
+                    has_ramp_at(
+                        &ramps,
+                        *x as i64,
+                        *y as i64,
+                        2 * dx as i64,
+                        2 * dy as i64,
+                        *dir,
+                        2
+                    ),
+                    "у полосы должен быть верхний тайл"
+                );
+            }
+            assert!((8..=13).contains(&strips), "пандусов должно быть 8..=13");
+            // Полоса состоит ровно из трёх тайлов — значит, тайлы не делятся
+            // между разными полосами.
+            assert_eq!(ramps.len(), strips * RAMP_LEN as usize);
+            // У каждого среднего тайла ровно один сосед-низ и ровно один
+            // сосед-верх: полосы не пересекаются.
+            for (x, y, dir, idx) in &ramps {
+                if *idx != 1 {
+                    continue;
+                }
+                let (dx, dy) = ramp_dir_delta(*dir);
+                let low = ramps
+                    .iter()
+                    .filter(|(lx, ly, ld, li)| {
+                        *lx as i64 == *x as i64 - dx as i64
+                            && *ly as i64 == *y as i64 - dy as i64
+                            && *ld == *dir
+                            && *li == 0
+                    })
+                    .count();
+                let high = ramps
+                    .iter()
+                    .filter(|(lx, ly, ld, li)| {
+                        *lx as i64 == *x as i64 + dx as i64
+                            && *ly as i64 == *y as i64 + dy as i64
+                            && *ld == *dir
+                            && *li == 2
+                    })
+                    .count();
+                assert_eq!(low, 1, "у среднего тайла должен быть один нижний");
+                assert_eq!(high, 1, "у среднего тайла должен быть один верхний");
+            }
+        }
+    }
+
+    #[test]
+    fn ramp_strips_have_free_approach_on_both_levels() {
+        for seed in [11u64, 42, 7] {
+            let map = GameMap::generate(MAP_W, MAP_H, seed);
+            for (x, y, _, _) in ramp_tiles(&map) {
+                // Сам тайл пандуса и по тайлу вокруг него должны быть
+                // проходимы на обоих ярусах: иначе к пандусу не подъехать.
+                for (dx, dy) in [(0i64, 0i64), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                    let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                    assert!(
+                        nx >= 0 && ny >= 0 && nx < MAP_W as i64 && ny < MAP_H as i64,
+                        "пандус у края карты: {x},{y}"
+                    );
+                    let (nx, ny) = (nx as u32, ny as u32);
+                    assert!(
+                        !map.blocks_tank(nx, ny, LEVEL_GROUND),
+                        "к пандусу {x},{y} нельзя подъехать снизу"
+                    );
+                    assert!(
+                        !map.blocks_tank(nx, ny, LEVEL_UPPER),
+                        "к пандусу {x},{y} нельзя подъехать сверху"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

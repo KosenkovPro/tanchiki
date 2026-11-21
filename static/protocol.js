@@ -18,7 +18,7 @@
  */
 
 /** Версия протокола. Клиент и сервер обязаны иметь одинаковую. */
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /** Максимальная длина никнейма в байтах UTF-8. */
 export const MAX_NICK_LEN = 16;
