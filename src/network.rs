@@ -219,9 +219,24 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         let mut game = state.game.lock().await;
                         game.join_player(player_id, clean);
                     }
-                    Ok(ClientMessage::Input { seq, input }) => {
+                    Ok(ClientMessage::Input {
+                        seq,
+                        input,
+                        aim,
+                        ability,
+                        target_x,
+                        target_y,
+                    }) => {
                         let mut game = state.game.lock().await;
-                        game.apply_input(conn_id, seq, input);
+                        game.apply_input(
+                            conn_id,
+                            seq,
+                            input,
+                            aim,
+                            ability,
+                            target_x,
+                            target_y,
+                        );
                     }
                     Ok(ClientMessage::Respawn) => {
                         let mut game = state.game.lock().await;

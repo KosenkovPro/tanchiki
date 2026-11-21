@@ -16,3 +16,6 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+
+# Логи сервера
+*.err

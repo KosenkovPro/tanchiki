@@ -13,8 +13,10 @@ use std::fmt;
 /// Версия протокола. Клиент и сервер обязаны иметь одинаковую.
 ///
 /// * `1` — четыре направления, лидерборд без убийств;
-/// * `2` — восемь направлений (включая диагонали), в лидерборде есть убийства.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// * `2` — восемь направлений (включая диагонали), в лидерборде есть убийства;
+/// * `3` — башня смотрит в 16 направлений (наведение мышью), добавлены
+///   способности (миномёт, авиаподдержка) и туман войны по конусу взгляда.
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Максимальная длина никнейма в байтах UTF-8.
 pub const MAX_NICK_LEN: usize = 16;
@@ -60,6 +62,18 @@ pub mod input_bit {
     pub const LEFT: u8 = 1 << 2;
     pub const RIGHT: u8 = 1 << 3;
     pub const FIRE: u8 = 1 << 4;
+    /// Применить выбранную способность (миномёт / авиаподдержка).
+    pub const USE: u8 = 1 << 5;
+}
+
+/// Специальные способности, доступные игроку.
+pub mod ability {
+    /// Обычная пушка.
+    pub const NONE: u8 = 0;
+    /// Миномёт: снаряд летит по дуге и перелетает стены.
+    pub const MORTAR: u8 = 1;
+    /// Авиаподдержка: удар с воздуха по точке.
+    pub const AIR_STRIKE: u8 = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +182,37 @@ impl Direction {
 }
 
 // ---------------------------------------------------------------------------
+// Наведение (башня)
+// ---------------------------------------------------------------------------
+
+/// Количество направлений наведения башни (шаг 22.5°).
+pub const AIM_COUNT: u8 = 16;
+
+/// Единичный вектор направления наведения.
+///
+/// Угол `0` — вправо, дальше по часовой стрелке: в экранных координатах
+/// ось Y направлена вниз.
+pub fn aim_delta(aim: u8) -> (f32, f32) {
+    let a = aim as f32 * (std::f32::consts::PI / 8.0);
+    (a.cos(), a.sin())
+}
+
+/// Направление наведения по вектору: округление до ближайшего из 16.
+pub fn aim_from_vector(dx: f32, dy: f32) -> u8 {
+    if dx.abs() < f32::EPSILON && dy.abs() < f32::EPSILON {
+        return 0;
+    }
+    let step = std::f32::consts::PI / 8.0;
+    let idx = (dy.atan2(dx) / step).round() as i32;
+    idx.rem_euclid(AIM_COUNT as i32) as u8
+}
+
+/// Направление наведения от одной точки к другой.
+pub fn aim_towards(x0: f32, y0: f32, x1: f32, y1: f32) -> u8 {
+    aim_from_vector(x1 - x0, y1 - y0)
+}
+
+// ---------------------------------------------------------------------------
 // Ввод
 // ---------------------------------------------------------------------------
 
@@ -179,6 +224,11 @@ pub struct InputFlags {
     pub left: bool,
     pub right: bool,
     pub fire: bool,
+    /// Применить выбранную способность (миномёт / авиаподдержка).
+    ///
+    /// Флаг одноразовый: клиент выставляет его ровно в одном пакете,
+    /// иначе способность срабатывала бы каждый кадр.
+    pub use_ability: bool,
 }
 
 impl InputFlags {
@@ -190,6 +240,7 @@ impl InputFlags {
             left: b & input_bit::LEFT != 0,
             right: b & input_bit::RIGHT != 0,
             fire: b & input_bit::FIRE != 0,
+            use_ability: b & input_bit::USE != 0,
         }
     }
 
@@ -224,7 +275,10 @@ pub struct PlayerView {
     pub is_bot: bool,
     pub x: f32,
     pub y: f32,
+    /// Направление корпуса (восемь направлений движения).
     pub dir: Direction,
+    /// Направление башни (16 направлений) — по нему летят снаряды.
+    pub aim: u8,
     pub level: u8,
     pub hp: u8,
     pub max_hp: u8,
@@ -232,6 +286,10 @@ pub struct PlayerView {
     pub shielded: bool,
     pub score: u32,
     pub kills: u32,
+    /// Выбранная способность игрока.
+    pub ability: u8,
+    /// Через сколько тиков способность снова будет доступна.
+    pub ability_cd: u16,
 }
 
 /// Состояние снаряда.
@@ -240,8 +298,24 @@ pub struct BulletView {
     pub id: u32,
     pub x: f32,
     pub y: f32,
-    pub dir: Direction,
+    /// Направление полёта (16 направлений).
+    pub dir: u8,
     pub level: u8,
+}
+
+/// Визуальный эффект: снаряд миномёта, вызов авиаподдержки и т. п.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectView {
+    pub id: u32,
+    /// `1` — миномёт в полёте, `2` — авиаподдержка.
+    pub kind: u8,
+    pub x: f32,
+    pub y: f32,
+    /// Точка падения / удара.
+    pub x2: f32,
+    pub y2: f32,
+    /// Ход процесса: `0..=100`.
+    pub phase: u8,
 }
 
 /// Состояние бонуса.
@@ -276,6 +350,8 @@ pub enum GameEvent {
     Kill { killer: u32, victim: u32 },
     /// Повышение уровня.
     LevelUp { id: u32, level: u8 },
+    /// Применена способность (миномёт, авиаподдержка).
+    AbilityUsed { x: f32, y: f32, ability: u8 },
 }
 
 impl GameEvent {
@@ -286,6 +362,7 @@ impl GameEvent {
             GameEvent::PickupCollected { .. } => 2,
             GameEvent::Kill { .. } => 3,
             GameEvent::LevelUp { .. } => 4,
+            GameEvent::AbilityUsed { .. } => 5,
         }
     }
 }
@@ -314,6 +391,8 @@ pub struct Snapshot {
     pub pickups: Vec<PickupView>,
     pub tiles: Vec<TileUpdate>,
     pub events: Vec<GameEvent>,
+    /// Визуальные эффекты (миномёты, авиаподдержка).
+    pub effects: Vec<EffectView>,
 }
 
 /// Данные карты для начальной синхронизации.
@@ -329,10 +408,24 @@ pub struct MapData {
 /// Сообщение, разобранное из клиентского пакета.
 #[derive(Debug, Clone)]
 pub enum ClientMessage {
-    Join { nickname: String },
-    Input { seq: u32, input: InputFlags },
+    Join {
+        nickname: String,
+    },
+    Input {
+        seq: u32,
+        input: InputFlags,
+        /// Направление башни (0..16).
+        aim: u8,
+        /// Запрошенная способность.
+        ability: u8,
+        /// Мировая точка применения способности.
+        target_x: f32,
+        target_y: f32,
+    },
     Respawn,
-    Ping { client_time: u64 },
+    Ping {
+        client_time: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +551,12 @@ impl<'a> Reader<'a> {
         ]))
     }
 
+    /// Читает `f32`.
+    pub fn f32(&mut self) -> ProtocolResult<f32> {
+        let b = self.take(4)?;
+        Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     /// Читает строку с префиксом-длиной `u16`.
     pub fn string(&mut self) -> ProtocolResult<String> {
         let len = self.u16()? as usize;
@@ -484,9 +583,17 @@ pub fn decode_client(payload: &[u8]) -> ProtocolResult<ClientMessage> {
         client_msg::INPUT => {
             let seq = r.u32()?;
             let flags = r.u8()?;
+            let aim = r.u8()?;
+            let ability = r.u8()?;
+            let target_x = r.f32()?;
+            let target_y = r.f32()?;
             Ok(ClientMessage::Input {
                 seq,
                 input: InputFlags::from_byte(flags),
+                aim: aim % AIM_COUNT,
+                ability,
+                target_x,
+                target_y,
             })
         }
         client_msg::RESPAWN => Ok(ClientMessage::Respawn),
@@ -547,11 +654,14 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.f32(p.x);
         w.f32(p.y);
         w.u8(p.dir as u8);
+        w.u8(p.aim);
         w.u8(p.level);
         w.u8(p.hp);
         w.u8(p.max_hp);
         w.u32(p.score);
         w.u32(p.kills);
+        w.u8(p.ability);
+        w.u16(p.ability_cd);
     }
 
     w.u16(snap.bullets.len() as u16);
@@ -559,7 +669,7 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.u32(b.id);
         w.f32(b.x);
         w.f32(b.y);
-        w.u8(b.dir as u8);
+        w.u8(b.dir);
         w.u8(b.level);
     }
 
@@ -577,6 +687,17 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
         w.u16(t.x);
         w.u16(t.y);
         w.u8(t.value);
+    }
+
+    w.u16(snap.effects.len() as u16);
+    for e in &snap.effects {
+        w.u32(e.id);
+        w.u8(e.kind);
+        w.f32(e.x);
+        w.f32(e.y);
+        w.f32(e.x2);
+        w.f32(e.y2);
+        w.u8(e.phase);
     }
 
     w.u16(snap.events.len() as u16);
@@ -604,6 +725,11 @@ pub fn encode_snapshot(snap: &Snapshot) -> Vec<u8> {
             GameEvent::LevelUp { id, level } => {
                 w.u32(id);
                 w.u8(level);
+            }
+            GameEvent::AbilityUsed { x, y, ability } => {
+                w.f32(x);
+                w.f32(y);
+                w.u8(ability);
             }
         }
     }
@@ -711,6 +837,52 @@ mod tests {
     }
 
     #[test]
+    fn input_carries_aim_and_ability() {
+        let mut w = Writer::new();
+        w.u8(client_msg::INPUT);
+        w.u32(7);
+        w.u8(input_bit::UP | input_bit::RIGHT | input_bit::FIRE | input_bit::USE);
+        w.u8(9);
+        w.u8(ability::MORTAR);
+        w.f32(123.5);
+        w.f32(-45.25);
+        let bytes = w.finish();
+        match decode_client(&bytes).expect("decode") {
+            ClientMessage::Input {
+                seq,
+                input,
+                aim,
+                ability: ab,
+                target_x,
+                target_y,
+            } => {
+                assert_eq!(seq, 7);
+                assert!(input.up && input.right && input.fire);
+                assert_eq!(aim, 9);
+                assert_eq!(ab, ability::MORTAR);
+                assert!((target_x - 123.5).abs() < 0.001);
+                assert!((target_y + 45.25).abs() < 0.001);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aim_has_sixteen_directions() {
+        // Вправо — 0, вниз — 4, влево — 8, вверх — 12.
+        assert_eq!(aim_from_vector(1.0, 0.0), 0);
+        assert_eq!(aim_from_vector(0.0, 1.0), 4);
+        assert_eq!(aim_from_vector(-1.0, 0.0), 8);
+        assert_eq!(aim_from_vector(0.0, -1.0), 12);
+        // Диагональ вправо-вниз — между 0 и 4, то есть 2.
+        assert_eq!(aim_from_vector(1.0, 1.0), 2);
+        let (dx, dy) = aim_delta(0);
+        assert!((dx - 1.0).abs() < 0.001 && dy.abs() < 0.001);
+        let (dx, dy) = aim_delta(4);
+        assert!(dx.abs() < 0.001 && (dy - 1.0).abs() < 0.001);
+    }
+
+    #[test]
     fn truncated_message_is_error_not_panic() {
         let bytes = vec![client_msg::INPUT, 0x01, 0x02];
         assert!(decode_client(&bytes).is_err());
@@ -741,6 +913,7 @@ mod tests {
                 x: 1.0,
                 y: 2.0,
                 dir: Direction::Left,
+                aim: 5,
                 level: 2,
                 hp: 3,
                 max_hp: 4,
@@ -748,17 +921,28 @@ mod tests {
                 shielded: false,
                 score: 10,
                 kills: 1,
+                ability: ability::MORTAR,
+                ability_cd: 12,
             }],
             bullets: vec![BulletView {
                 id: 9,
                 x: 5.0,
                 y: 6.0,
-                dir: Direction::Up,
+                dir: 3,
                 level: 1,
             }],
             pickups: Vec::new(),
             tiles: vec![TileUpdate { x: 3, y: 4, value: 8 }],
             events: vec![GameEvent::Kill { killer: 1, victim: 2 }],
+            effects: vec![EffectView {
+                id: 4,
+                kind: 1,
+                x: 1.0,
+                y: 2.0,
+                x2: 3.0,
+                y2: 4.0,
+                phase: 50,
+            }],
         };
         let bytes = encode_snapshot(&snap);
         assert_eq!(bytes[0], server_msg::SNAPSHOT);

@@ -5,7 +5,7 @@
  * строки кодируются как `u16 len + utf8 bytes`.
  */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /** Клиент -> сервер. */
 export const MSG = Object.freeze({
@@ -27,7 +27,7 @@ export const SVR = Object.freeze({
   ERROR: 0x17,
 });
 
-/** Направления: четыре кардинальных и четыре диагональных. */
+/** Направления корпуса: четыре кардинальных и четыре диагональных. */
 export const DIR = Object.freeze({
   UP: 0,
   DOWN: 1,
@@ -39,8 +39,41 @@ export const DIR = Object.freeze({
   DOWN_RIGHT: 7,
 });
 
+/** Количество направлений наведения башни (шаг 22.5°). */
+export const AIM_COUNT = 16;
+
+/**
+ * Единичный вектор направления башни.
+ * Угол 0 — вправо, дальше по часовой стрелке (ось Y вниз).
+ * @param {number} aim
+ * @returns {{x: number, y: number}}
+ */
+export function aimDelta(aim) {
+  const a = aim * (Math.PI / 8);
+  return { x: Math.cos(a), y: Math.sin(a) };
+}
+
+/**
+ * Направление башни по вектору: округление до ближайшего из 16.
+ * @param {number} dx
+ * @param {number} dy
+ * @returns {number}
+ */
+export function aimFromVector(dx, dy) {
+  if (Math.abs(dx) < 1e-6 && Math.abs(dy) < 1e-6) return 0;
+  const step = Math.PI / 8;
+  const idx = Math.round(Math.atan2(dy, dx) / step);
+  return ((idx % AIM_COUNT) + AIM_COUNT) % AIM_COUNT;
+}
+
 /** Биты ввода. */
-export const BIT = Object.freeze({ UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8, FIRE: 16 });
+export const BIT = Object.freeze({ UP: 1, DOWN: 2, LEFT: 4, RIGHT: 8, FIRE: 16, USE: 32 });
+
+/** Специальные способности. */
+export const ABILITY = Object.freeze({ NONE: 0, MORTAR: 1, AIR_STRIKE: 2 });
+
+/** Типы визуальных эффектов. */
+export const EFFECT = Object.freeze({ MORTAR: 1, AIR_STRIKE: 2 });
 
 /** Типы тайлов. */
 export const TILE = Object.freeze({
@@ -210,9 +243,22 @@ export function encodeJoin(nickname) {
   return new Writer().u8(MSG.JOIN).str(nickname).finish();
 }
 
-/** `INPUT { seq, flags }` */
-export function encodeInput(seq, flags) {
-  return new Writer().u8(MSG.INPUT).u32(seq).u8(flags).finish();
+/**
+ * `INPUT { seq, flags, aim, ability, target_x, target_y }`
+ *
+ * `aim` — направление башни (0..15), `ability` — выбранная способность,
+ * `target_x/target_y` — мировая точка, куда её применить.
+ */
+export function encodeInput(seq, flags, aim, ability, targetX, targetY) {
+  return new Writer()
+    .u8(MSG.INPUT)
+    .u32(seq)
+    .u8(flags)
+    .u8(aim)
+    .u8(ability)
+    .f32(targetX)
+    .f32(targetY)
+    .finish();
 }
 
 /** `RESPAWN` */
@@ -254,11 +300,14 @@ function readSnapshot(r) {
     const x = r.f32();
     const y = r.f32();
     const dir = r.u8();
+    const aim = r.u8();
     const level = r.u8();
     const hp = r.u8();
     const maxHp = r.u8();
     const score = r.u32();
     const kills = r.u32();
+    const ability = r.u8();
+    const abilityCd = r.u16();
     players.push({
       id,
       name,
@@ -268,11 +317,14 @@ function readSnapshot(r) {
       x,
       y,
       dir,
+      aim,
       level,
       hp,
       maxHp,
       score,
       kills,
+      ability,
+      abilityCd,
     });
   }
 
@@ -306,6 +358,20 @@ function readSnapshot(r) {
     tiles.push({ x: r.u16(), y: r.u16(), value: r.u8() });
   }
 
+  const effects = [];
+  const nEffects = r.u16();
+  for (let i = 0; i < nEffects; i++) {
+    effects.push({
+      id: r.u32(),
+      kind: r.u8(),
+      x: r.f32(),
+      y: r.f32(),
+      x2: r.f32(),
+      y2: r.f32(),
+      phase: r.u8(),
+    });
+  }
+
   const events = [];
   const nEvents = r.u16();
   for (let i = 0; i < nEvents; i++) {
@@ -326,12 +392,15 @@ function readSnapshot(r) {
       case 4:
         events.push({ kind: 'levelUp', id: r.u32(), level: r.u8() });
         break;
+      case 5:
+        events.push({ kind: 'abilityUsed', x: r.f32(), y: r.f32(), ability: r.u8() });
+        break;
       default:
         throw new ProtocolError('неизвестное событие: ' + kind);
     }
   }
 
-  return { type: 'snapshot', tick, focusX, focusY, players, bullets, pickups, tiles, events };
+  return { type: 'snapshot', tick, focusX, focusY, players, bullets, pickups, tiles, effects, events };
 }
 
 function readLeaderboard(r) {

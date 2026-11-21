@@ -10,8 +10,8 @@ use tokio::sync::mpsc::Sender;
 
 use crate::map::{GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, MAP_H, MAP_W, TILE_SIZE};
 use crate::protocol::{
-    self, BulletView, Direction, GameEvent, InputFlags, LeaderboardEntry, PlayerView, PickupView,
-    Snapshot, TileUpdate,
+    self, BulletView, Direction, EffectView, GameEvent, InputFlags, LeaderboardEntry, PlayerView,
+    PickupView, Snapshot, TileUpdate,
 };
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,140 @@ pub fn level_max_hp(level: u8) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
+// Обзор (туман войны)
+// ---------------------------------------------------------------------------
+
+/// Дальность обзора в пикселях: столько видно по конусу взгляда.
+pub const VISION_RANGE: f32 = 900.0;
+
+/// Половина угла обзора в радианах: 60°, то есть конус в 120°.
+pub const VISION_HALF_ANGLE: f32 = std::f32::consts::PI / 3.0;
+
+/// Косая косинуса половины угла обзора — порог угла между взглядом и целью.
+///
+/// Ровно 0.5 — это cos(60°). Связь с углом проверяется в отладочной сборке,
+/// чтобы случайная правка одного из двух чисел не исказила конус.
+pub const VISION_COS: f32 = 0.5;
+
+// ---------------------------------------------------------------------------
+// Способности
+// ---------------------------------------------------------------------------
+
+/// Кулдаун миномёта (в тиках).
+pub const MORTAR_COOLDOWN: u64 = 180;
+
+/// Кулдаун авиаподдержки (в тиках).
+pub const AIR_STRIKE_COOLDOWN: u64 = 450;
+
+/// Время полёта миномётного снаряда (в тиках).
+pub const MORTAR_FLIGHT_TICKS: u64 = 45;
+
+/// Задержка удара авиаподдержки (в тиках).
+pub const AIR_STRIKE_DELAY: u64 = 75;
+
+/// Радиус поражения миномёта.
+pub const MORTAR_RADIUS: f32 = 48.0;
+
+/// Радиус поражения авиаудара.
+pub const AIR_STRIKE_RADIUS: f32 = 66.0;
+
+/// Урон миномёта.
+pub const MORTAR_DAMAGE: u8 = 2;
+
+/// Урон авиаудара.
+pub const AIR_STRIKE_DAMAGE: u8 = 3;
+
+/// Максимальная дальность применения способности от танка.
+pub const ABILITY_RANGE: f32 = 1400.0;
+
+// ---------------------------------------------------------------------------
+// Сложность ботов
+// ---------------------------------------------------------------------------
+
+/// Уровень сложности ИИ-бота.
+///
+/// Главное правило: **бот всегда медленнее игрока**. Раньше боты делили с
+/// игроком одну и ту же скорость, да ещё и качались от звёзд — отсюда
+/// ощущение, что враги быстрее и сильнее. Теперь у каждого уровня свои
+/// скорость, меткость, реакция и темп стрельбы.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BotSkill {
+    /// Новичок: медленный, мажет, реагирует с задержкой.
+    Easy = 0,
+    /// Средний: заметно медленнее игрока, стреляет регулярно.
+    Normal = 1,
+    /// Сложный: быстрый, почти не мажет — но всё равно медленнее игрока.
+    Hard = 2,
+}
+
+impl BotSkill {
+    /// Множитель скорости: всегда меньше единицы.
+    pub fn speed_mult(self) -> f32 {
+        match self {
+            BotSkill::Easy => 0.55,
+            BotSkill::Normal => 0.72,
+            BotSkill::Hard => 0.88,
+        }
+    }
+
+    /// Ошибка наводки в шестнадцатых долях поворота башни.
+    pub fn aim_error(self) -> i32 {
+        match self {
+            BotSkill::Easy => 3,
+            BotSkill::Normal => 2,
+            BotSkill::Hard => 1,
+        }
+    }
+
+    /// Множитель перезарядки: чем больше, тем реже стреляет бот.
+    pub fn fire_mult(self) -> f32 {
+        match self {
+            BotSkill::Easy => 1.8,
+            BotSkill::Normal => 1.4,
+            BotSkill::Hard => 1.15,
+        }
+    }
+
+    /// Задержка реакции на цель (в тиках).
+    pub fn reaction_ticks(self) -> u64 {
+        match self {
+            BotSkill::Easy => 36,
+            BotSkill::Normal => 20,
+            BotSkill::Hard => 10,
+        }
+    }
+
+    /// Дальность обнаружения цели (в пикселях).
+    pub fn sight_range(self) -> f32 {
+        match self {
+            BotSkill::Easy => 520.0,
+            BotSkill::Normal => 700.0,
+            BotSkill::Hard => 860.0,
+        }
+    }
+
+    /// Человекочитаемое название уровня.
+    pub fn label(self) -> &'static str {
+        match self {
+            BotSkill::Easy => "лёгкий",
+            BotSkill::Normal => "средний",
+            BotSkill::Hard => "сложный",
+        }
+    }
+
+    /// Разбирает название уровня из переменной окружения.
+    pub fn from_name(name: &str) -> Option<BotSkill> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "easy" | "лёгкий" | "легкий" | "0" => Some(BotSkill::Easy),
+            "normal" | "средний" | "1" => Some(BotSkill::Normal),
+            "hard" | "сложный" | "2" => Some(BotSkill::Hard),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Конфигурация
 // ---------------------------------------------------------------------------
 
@@ -157,6 +291,10 @@ pub struct GameConfig {
     pub min_population: usize,
     /// Максимум ботов.
     pub max_bots: usize,
+    /// Уровень сложности ботов.
+    ///
+    /// `None` — смешанный состав: часть ботов лёгкие, часть сложные.
+    pub bot_skill: Option<BotSkill>,
     /// Зерно генерации карты.
     pub seed: u64,
     /// Включён ли подробный профайлинг тиков (`TANCHIKI_PROFILE=1`).
@@ -172,6 +310,7 @@ impl Default for GameConfig {
             tile_size: TILE_SIZE,
             min_population: 20,
             max_bots: 24,
+            bot_skill: None,
             seed: 0x7A4C_1E55_D1CE_2026,
             profile: false,
         }
@@ -202,6 +341,19 @@ impl GameConfig {
         }
         if let Some(v) = env_u64("TANCHIKI_MAX_BOTS") {
             cfg.max_bots = v as usize;
+        }
+        if let Ok(v) = std::env::var("TANCHIKI_BOT_SKILL") {
+            // `mixed` (по умолчанию) — состав ботов разный.
+            if !v.trim().eq_ignore_ascii_case("mixed") && !v.trim().is_empty() {
+                cfg.bot_skill = BotSkill::from_name(&v);
+            }
+        }
+        match cfg.bot_skill {
+            Some(skill) => tracing::info!(
+                skill = skill.label(),
+                "уровень сложности ботов задан переменной окружения"
+            ),
+            None => tracing::info!("сложность ботов смешанная: лёгкие, средние и сложные"),
         }
         if let Some(v) = env_u64("TANCHIKI_SEED") {
             cfg.seed = v;
@@ -247,6 +399,11 @@ pub struct Tank {
     /// У человека совпадает с направлением движения, у бота — с направлением
     /// на цель (бот может идти прямо и стрелять по диагонали).
     pub dir: Direction,
+    /// Направление башни: 16 направлений (шаг 22.5°).
+    ///
+    /// У человека башня смотрит туда, куда стоит курсор мыши, и не зависит
+    /// от направления корпуса: можно ехать вбок и целиться в другую сторону.
+    pub aim: u8,
     /// Направление движения: скорость направлена вдоль него.
     pub move_dir: Direction,
     /// Скорость вдоль текущего направления движения.
@@ -277,6 +434,7 @@ impl Tank {
             x,
             y,
             dir: Direction::Down,
+            aim: 4,
             move_dir: Direction::Down,
             vel: 0.0,
             level,
@@ -334,10 +492,39 @@ pub struct Bullet {
     pub owner: u32,
     pub x: f32,
     pub y: f32,
-    pub dir: Direction,
+    /// Направление полёта: 16 направлений (шаг 22.5°).
+    pub dir: u8,
     pub level: u8,
     pub damage: u8,
     pub speed: f32,
+}
+
+/// Миномётный снаряд в полёте: летит по дуге и перелетает стены.
+#[derive(Debug, Clone, Copy)]
+pub struct Mortar {
+    pub id: u32,
+    pub owner: u32,
+    /// Точка запуска.
+    pub x0: f32,
+    pub y0: f32,
+    /// Точка падения.
+    pub x1: f32,
+    pub y1: f32,
+    /// Тик запуска.
+    pub start_tick: u64,
+    /// Длительность полёта в тиках.
+    pub flight_ticks: u64,
+}
+
+/// Вызов авиаподдержки: удар приходит в точку с задержкой.
+#[derive(Debug, Clone, Copy)]
+pub struct AirStrike {
+    pub id: u32,
+    pub owner: u32,
+    pub x: f32,
+    pub y: f32,
+    /// Тик, в который приходится удар.
+    pub hit_tick: u64,
 }
 
 /// Состояние ИИ-бота.
@@ -351,8 +538,14 @@ pub struct BotState {
     pub next_plan_tick: u64,
     /// Текущая цель (id игрока).
     pub target: Option<u32>,
-    /// Направление наводки: бот может идти прямо и стрелять по диагонали.
-    pub aim: Option<Direction>,
+    /// Направление башни на цель: 16 направлений.
+    pub aim: Option<u8>,
+    /// Уровень сложности.
+    pub skill: BotSkill,
+    /// Тик, в котором бот заметил текущую цель: реакция не мгновенная.
+    pub target_seen_at: u64,
+    /// Ошибка наводки в шагах башни (1/16 оборота): у «лёгких» ботов больше.
+    pub aim_error: i32,
 }
 
 /// Игрок: человек или бот.
@@ -370,6 +563,17 @@ pub struct Player {
     pub deaths: u32,
     /// Текущий ввод.
     pub input: InputFlags,
+    /// Направление башни: 16 направлений (у человека — по курсору мыши).
+    pub aim: u8,
+    /// Выбранная способность (миномёт, авиаподдержка).
+    pub ability: u8,
+    /// Мировая точка, куда применяется способность.
+    pub target_x: f32,
+    pub target_y: f32,
+    /// Тик, начиная с которого снова доступен миномёт.
+    pub mortar_ready_at: u64,
+    /// Тик, начиная с которого снова доступна авиаподдержка.
+    pub airstrike_ready_at: u64,
     /// Порядковый номер последнего пакета ввода.
     pub last_seq: u32,
     /// Канал отправки в клиент.
@@ -397,6 +601,10 @@ pub struct Game {
     pub players: HashMap<u32, Player>,
     pub bullets: HashMap<u32, Bullet>,
     pub pickups: HashMap<u32, Pickup>,
+    /// Миномётные снаряды в полёте.
+    pub mortars: HashMap<u32, Mortar>,
+    /// Запросы авиаподдержки.
+    pub airstrikes: HashMap<u32, AirStrike>,
     /// Текущий тик.
     pub tick: u64,
     pub rng: Rng,
@@ -436,6 +644,8 @@ impl Game {
             players: HashMap::new(),
             bullets: HashMap::new(),
             pickups: HashMap::new(),
+            mortars: HashMap::new(),
+            airstrikes: HashMap::new(),
             tick: 0,
             rng: Rng::new(0x51DE_2026_BEEF),
             next_entity_id: 1,
@@ -473,6 +683,10 @@ impl Game {
         let t_bullets = phase.elapsed();
 
         let phase = Instant::now();
+        self.update_effects();
+        let t_effects = phase.elapsed();
+
+        let phase = Instant::now();
         self.update_pickups();
         let t_pickups = phase.elapsed();
 
@@ -493,6 +707,7 @@ impl Game {
                 bots = ?t_bots,
                 players = ?t_players,
                 bullets = ?t_bullets,
+                effects = ?t_effects,
                 pickups = ?t_pickups,
                 population = ?t_population,
                 grids = ?t_grids,
@@ -521,15 +736,22 @@ impl Game {
     }
 
     fn update_player_movement(&mut self, pid: u32) {
-        let (input, cur_move, level, vel, aim) = {
+        let (input, cur_move, level, vel, skill, aim) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
             let Some(tank) = player.tank.as_ref() else {
                 return;
             };
-            let aim = player.bot.as_ref().and_then(|b| b.aim);
-            (player.input, tank.move_dir, tank.level, tank.vel, aim)
+            let skill = player.bot.as_ref().map(|b| b.skill);
+            (
+                player.input,
+                tank.move_dir,
+                tank.level,
+                tank.vel,
+                skill,
+                player.aim,
+            )
         };
 
         // Направление движения выводится из осей ввода: диагональ получается
@@ -543,7 +765,9 @@ impl Game {
         };
 
         let on_ice = self.is_on_ice(tank.x, tank.y);
-        let speed = level_speed(level);
+        // Боты всегда медленнее игрока — иначе они ощущаются сильнее человека.
+        let speed_mult = skill.map(|s| s.speed_mult()).unwrap_or(1.0);
+        let speed = level_speed(level) * speed_mult;
         let accel = if on_ice { 220.0 } else { 1100.0 };
         let decel = if on_ice { 120.0 } else { 1800.0 };
 
@@ -574,8 +798,10 @@ impl Game {
             tank.move_dir = next;
         }
 
-        // Куда «смотрит» танк: бот наводится на цель, человек — по движению.
-        tank.dir = aim.unwrap_or_else(|| desired_move.unwrap_or(tank.dir));
+        // Корпус смотрит туда, куда едет. Башня — независимо от корпуса:
+        // у человека по курсору мыши, у бота на цель.
+        tank.dir = desired_move.unwrap_or(tank.dir);
+        tank.aim = aim % protocol::AIM_COUNT;
         tank.vel = new_vel;
 
         let dist = new_vel * TICK_DT;
@@ -640,7 +866,7 @@ impl Game {
     }
 
     fn update_player_fire(&mut self, pid: u32) {
-        let (fire, level, dir, cx, cy) = {
+        let (fire, level, aim, cx, cy, fire_mult) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
@@ -653,8 +879,10 @@ impl Game {
             if tank.cooldown > 0.0 {
                 return;
             }
+            // У ботов перезарядка длиннее: чем выше сложность, тем чаще они стреляют.
+            let fire_mult = player.bot.as_ref().map(|b| b.skill.fire_mult()).unwrap_or(1.0);
             let c = tank.center();
-            (true, tank.level, tank.dir, c.0, c.1)
+            (true, tank.level, tank.aim, c.0, c.1, fire_mult)
         };
         if !fire {
             return;
@@ -666,7 +894,8 @@ impl Game {
             return;
         }
 
-        let (dx, dy) = dir.delta();
+        // Снаряды летят по направлению башни, а не корпуса.
+        let (dx, dy) = protocol::aim_delta(aim);
         // Перпендикуляр к направлению выстрела: по нему разводятся стволы.
         let (px, py) = (-dy, dx);
 
@@ -699,7 +928,7 @@ impl Game {
                     owner: pid,
                     x: bx,
                     y: by,
-                    dir,
+                    dir: aim,
                     level,
                     damage: level_bullet_damage(level),
                     speed: level_bullet_speed(level),
@@ -709,7 +938,7 @@ impl Game {
 
         if let Some(player) = self.players.get_mut(&pid) {
             if let Some(tank) = player.tank.as_mut() {
-                tank.cooldown = level_fire_cooldown(level);
+                tank.cooldown = level_fire_cooldown(level) * fire_mult;
                 tank.revealed_until = self.tick + REVEAL_TICKS;
             }
         }
@@ -723,7 +952,7 @@ impl Game {
         let bullets = std::mem::take(&mut self.bullets);
         let mut kept: HashMap<u32, Bullet> = HashMap::with_capacity(bullets.len());
         for mut b in bullets.into_values() {
-            let (dx, dy) = b.dir.delta();
+            let (dx, dy) = protocol::aim_delta(b.dir);
             b.x += dx * b.speed * TICK_DT;
             b.y += dy * b.speed * TICK_DT;
 
@@ -745,6 +974,85 @@ impl Game {
             kept.insert(b.id, b);
         }
         self.bullets = kept;
+    }
+
+    // -----------------------------------------------------------------------
+    // Способности: миномёты и авиаподдержка
+    // -----------------------------------------------------------------------
+
+    /// Обновляет миномёты в полёте и запросы авиаподдержки.
+    fn update_effects(&mut self) {
+        let now = self.tick;
+
+        // Миномёты: летят по дуге, перелетают стены, падают в точку прицела.
+        let mortars = std::mem::take(&mut self.mortars);
+        let mut kept_mortars: HashMap<u32, Mortar> = HashMap::with_capacity(mortars.len());
+        for m in mortars.into_values() {
+            let elapsed = now.saturating_sub(m.start_tick);
+            if elapsed >= m.flight_ticks {
+                self.explode(m.x1, m.y1, MORTAR_RADIUS, MORTAR_DAMAGE, m.owner);
+                continue;
+            }
+            kept_mortars.insert(m.id, m);
+        }
+        self.mortars = kept_mortars;
+
+        // Авиаподдержка: удар приходит с задержкой — сначала виден вызов.
+        let strikes = std::mem::take(&mut self.airstrikes);
+        let mut kept_strikes: HashMap<u32, AirStrike> = HashMap::with_capacity(strikes.len());
+        for s in strikes.into_values() {
+            if now >= s.hit_tick {
+                self.explode(s.x, s.y, AIR_STRIKE_RADIUS, AIR_STRIKE_DAMAGE, s.owner);
+                continue;
+            }
+            kept_strikes.insert(s.id, s);
+        }
+        self.airstrikes = kept_strikes;
+    }
+
+    /// Взрыв в точке: урон по танкам в радиусе и разрушение кирпича.
+    fn explode(&mut self, x: f32, y: f32, radius: f32, damage: u8, owner: u32) {
+        let r2 = radius * radius;
+        let hit: Vec<u32> = self
+            .players
+            .iter()
+            .filter(|(_, p)| {
+                p.tank.as_ref().is_some_and(|t| {
+                    let (cx, cy) = t.center();
+                    let dx = cx - x;
+                    let dy = cy - y;
+                    dx * dx + dy * dy <= r2
+                })
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in hit {
+            self.apply_damage(id, damage, owner);
+        }
+
+        // Кирпичные стены рядом с эпицентром получают повреждения.
+        let (tx0, ty0) = self.map.tile_at(x - radius, y - radius);
+        let (tx1, ty1) = self.map.tile_at(x + radius, y + radius);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                let cx = tx as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+                let cy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
+                let dx = cx - x;
+                let dy = cy - y;
+                if dx * dx + dy * dy > r2 {
+                    continue;
+                }
+                if self.map.kind(tx, ty) == crate::map::TileKind::Brick {
+                    self.hit_tile(tx, ty, 3, damage, owner);
+                }
+            }
+        }
+
+        self.events.push(GameEvent::Explosion {
+            x,
+            y,
+            size: (radius / 8.0).round().clamp(1.0, 24.0) as u8,
+        });
     }
 
     /// Обрабатывает попадание снаряда в тайл.
@@ -1040,19 +1348,19 @@ impl Game {
     }
 
     fn update_bot(&mut self, pid: u32) {
-        let (bx, by, next_plan, prev_target) = {
+        let (bx, by, next_plan, prev_target, skill) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
             let Some(tank) = player.tank.as_ref() else {
                 return;
             };
-            let (next_plan, prev_target) = player
+            let (next_plan, prev_target, skill) = player
                 .bot
                 .as_ref()
-                .map(|b| (b.next_plan_tick, b.target))
-                .unwrap_or((0, None));
-            (tank.x, tank.y, next_plan, prev_target)
+                .map(|b| (b.next_plan_tick, b.target, b.skill))
+                .unwrap_or((0, None, BotSkill::Normal));
+            (tank.x, tank.y, next_plan, prev_target, skill)
         };
 
         let now = self.tick;
@@ -1060,7 +1368,7 @@ impl Game {
         let mut target = prev_target;
 
         if replan {
-            target = self.find_bot_target(pid, bx, by);
+            target = self.find_bot_target(pid, bx, by, skill);
         }
 
         // Пересчитываем маршрут к цели.
@@ -1085,7 +1393,19 @@ impl Game {
                 if let Some(bot) = player.bot.as_mut() {
                     bot.path = path;
                     bot.path_idx = 0;
+                    // Новая цель — новое время обнаружения (реакция не мгновенная).
+                    if target != bot.target {
+                        bot.target_seen_at = now;
+                    }
                     bot.target = target;
+                    // Ошибка наводки пересчитывается вместе с маршрутом:
+                    // иначе башня дёргалась бы на каждом тике.
+                    let span = skill.aim_error() * 2 + 1;
+                    bot.aim_error = if span > 0 {
+                        self.rng.below(span as u32) as i32 - skill.aim_error()
+                    } else {
+                        0
+                    };
                     // Перепланировки разводим по тикам: иначе все боты
                     // одновременно запускают поиск пути.
                     bot.next_plan_tick = now + 30 + (pid % 20) as u64;
@@ -1095,7 +1415,7 @@ impl Game {
 
         // Принимаем решение: стрелять и куда двигаться.
         let mut input = InputFlags::default();
-        let mut aim: Option<Direction> = None;
+        let mut aim: Option<u8> = None;
 
         if let Some(tid) = target {
             let target_center = self
@@ -1106,16 +1426,33 @@ impl Game {
             if let Some(tc) = target_center {
                 let bcx = bx + TANK_SIZE * 0.5;
                 let bcy = by + TANK_SIZE * 0.5;
-                // Видим цель — наводимся и стреляем (в том числе по диагонали).
+                // Видим цель — наводимся (с ошибкой по уровню сложности)
+                // и стреляем, если реакция уже прошла.
                 if self.map.bullet_line_of_sight(bcx, bcy, tc.0, tc.1) {
-                    aim = Some(direction_towards(bcx, bcy, tc.0, tc.1));
-                    input.fire = true;
+                    let error = self
+                        .players
+                        .get(&pid)
+                        .and_then(|p| p.bot.as_ref())
+                        .map(|b| b.aim_error)
+                        .unwrap_or(0);
+                    let base = aim_towards(bcx, bcy, tc.0, tc.1) as i32;
+                    let dir = base + error;
+                    aim = Some(dir.rem_euclid(protocol::AIM_COUNT as i32) as u8);
+                    let seen_at = self
+                        .players
+                        .get(&pid)
+                        .and_then(|p| p.bot.as_ref())
+                        .map(|b| b.target_seen_at)
+                        .unwrap_or(now);
+                    if now >= seen_at + skill.reaction_ticks() {
+                        input.fire = true;
+                    }
                 }
             }
         }
 
-        // Идём по маршруту: движение кардинальное, направление наводки
-        // при этом может быть диагональным.
+        // Идём по маршруту: движение кардинальное, башня при этом
+        // смотрит в другую сторону — так же, как у человека с мышью.
         {
             let path = self
                 .players
@@ -1151,6 +1488,10 @@ impl Game {
             if let Some(bot) = player.bot.as_mut() {
                 bot.aim = aim;
             }
+            // Башня бота: держим последнее известное направление, если цели нет.
+            if let Some(a) = aim {
+                player.aim = a;
+            }
         }
     }
 
@@ -1175,10 +1516,12 @@ impl Game {
     /// Выбирает ближайшую разумную цель для бота.
     ///
     /// Приоритет — цели, которые видно: так боты дерутся и друг с другом,
-    /// а не только с игроками.
-    fn find_bot_target(&self, bot_id: u32, bx: f32, by: f32) -> Option<u32> {
+    /// а не только с игроками. Дальность обзора зависит от сложности:
+    /// «лёгкий» бот в принципе не замечает врага за 800 пикселей.
+    fn find_bot_target(&self, bot_id: u32, bx: f32, by: f32, skill: BotSkill) -> Option<u32> {
         let bcx = bx + TANK_SIZE * 0.5;
         let bcy = by + TANK_SIZE * 0.5;
+        let sight = skill.sight_range();
         let mut best_visible: Option<(u32, f32)> = None;
         let mut best_any: Option<(u32, f32)> = None;
         for (pid, player) in self.players.iter() {
@@ -1193,7 +1536,7 @@ impl Game {
             let dx = tcx - bcx;
             let dy = tcy - bcy;
             let dist = dx * dx + dy * dy;
-            if dist > 900.0 * 900.0 {
+            if dist > sight * sight {
                 continue;
             }
             if best_any.is_none_or(|(_, bd)| dist < bd) {
@@ -1358,6 +1701,23 @@ impl Game {
             2 => Direction::Left,
             _ => Direction::Right,
         };
+        tank.aim = match tank.dir {
+            Direction::Up => 12,
+            Direction::Down => 4,
+            Direction::Left => 8,
+            Direction::Right => 0,
+            _ => 0,
+        };
+        let bot_aim = tank.aim;
+        // Уровень сложности: либо задан на весь сервер, либо смешанный состав.
+        let skill = match self.cfg.bot_skill {
+            Some(skill) => skill,
+            None => match self.rng.below(100) {
+                0..=44 => BotSkill::Easy,
+                45..=84 => BotSkill::Normal,
+                _ => BotSkill::Hard,
+            },
+        };
         self.players.insert(
             id,
             Player {
@@ -1370,6 +1730,12 @@ impl Game {
                 kills: 0,
                 deaths: 0,
                 input: InputFlags::default(),
+                aim: bot_aim,
+                ability: protocol::ability::NONE,
+                target_x: 0.0,
+                target_y: 0.0,
+                mortar_ready_at: 0,
+                airstrike_ready_at: 0,
                 last_seq: 0,
                 tx: None,
                 joined: true,
@@ -1381,6 +1747,9 @@ impl Game {
                     next_plan_tick: self.tick,
                     target: None,
                     aim: None,
+                    skill,
+                    target_seen_at: 0,
+                    aim_error: 0,
                 }),
                 removal_at: None,
             },
@@ -1527,6 +1896,12 @@ impl Game {
                 kills: 0,
                 deaths: 0,
                 input: InputFlags::default(),
+                aim: 4,
+                ability: protocol::ability::NONE,
+                target_x: 0.0,
+                target_y: 0.0,
+                mortar_ready_at: 0,
+                airstrike_ready_at: 0,
                 last_seq: 0,
                 tx: Some(tx.clone()),
                 joined: false,
@@ -1613,7 +1988,19 @@ impl Game {
     }
 
     /// Применяет ввод от клиента.
-    pub fn apply_input(&mut self, conn_id: u64, seq: u32, input: InputFlags) {
+    ///
+    /// Помимо клавиш приходит направление башни (по курсору мыши), выбранная
+    /// способность и точка, куда её применить.
+    pub fn apply_input(
+        &mut self,
+        conn_id: u64,
+        seq: u32,
+        input: InputFlags,
+        aim: u8,
+        ability: u8,
+        target_x: f32,
+        target_y: f32,
+    ) {
         let ids: Vec<u32> = self
             .players
             .values()
@@ -1621,6 +2008,7 @@ impl Game {
             .map(|p| p.id)
             .collect();
         for id in ids {
+            let mut wants_ability = false;
             if let Some(player) = self.players.get_mut(&id) {
                 if seq <= player.last_seq && player.last_seq != 0 {
                     // Старый или повторный пакет — игнорируем.
@@ -1628,8 +2016,113 @@ impl Game {
                 }
                 player.last_seq = seq;
                 player.input = input;
+                player.aim = aim % protocol::AIM_COUNT;
+                player.ability = ability;
+                player.target_x = target_x;
+                player.target_y = target_y;
+                wants_ability = input.use_ability;
+            }
+            if wants_ability {
+                self.try_use_ability(id);
             }
         }
+    }
+
+    /// Пытается применить выбранную способность в точке курсора.
+    ///
+    /// Миномёт летит по дуге через стены, авиаподдержка бьёт с задержкой.
+    /// У каждой способности свой кулдаун, а дальность ограничена.
+    fn try_use_ability(&mut self, pid: u32) {
+        let now = self.tick;
+        let (ability, mortar_ready, airstrike_ready, origin, target) = {
+            let Some(player) = self.players.get(&pid) else {
+                return;
+            };
+            let Some(tank) = player.tank.as_ref() else {
+                return;
+            };
+            (
+                player.ability,
+                player.mortar_ready_at,
+                player.airstrike_ready_at,
+                tank.center(),
+                (player.target_x, player.target_y),
+            )
+        };
+
+        if ability == protocol::ability::NONE {
+            return;
+        }
+        // У каждой способности свой кулдаун.
+        let ready_at = match ability {
+            protocol::ability::MORTAR => mortar_ready,
+            protocol::ability::AIR_STRIKE => airstrike_ready,
+            _ => return,
+        };
+        if now < ready_at {
+            return;
+        }
+
+        // Точка приведения приводится к границам мира: иначе миномёт
+        // улетел бы за карту и пропал.
+        let tx = target.0.clamp(0.0, self.cfg.world_w() - 1.0);
+        let ty = target.1.clamp(0.0, self.cfg.world_h() - 1.0);
+        let dx = tx - origin.0;
+        let dy = ty - origin.1;
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > ABILITY_RANGE {
+            return;
+        }
+        if dist < 1.0 {
+            return;
+        }
+
+        match ability {
+            protocol::ability::MORTAR => {
+                let id = self.next_entity_id;
+                self.next_entity_id += 1;
+                self.mortars.insert(
+                    id,
+                    Mortar {
+                        id,
+                        owner: pid,
+                        x0: origin.0,
+                        y0: origin.1,
+                        x1: tx,
+                        y1: ty,
+                        start_tick: now,
+                        flight_ticks: MORTAR_FLIGHT_TICKS,
+                    },
+                );
+                if let Some(player) = self.players.get_mut(&pid) {
+                    player.mortar_ready_at = now + MORTAR_COOLDOWN;
+                }
+            }
+            protocol::ability::AIR_STRIKE => {
+                let id = self.next_entity_id;
+                self.next_entity_id += 1;
+                self.airstrikes.insert(
+                    id,
+                    AirStrike {
+                        id,
+                        owner: pid,
+                        x: tx,
+                        y: ty,
+                        hit_tick: now + AIR_STRIKE_DELAY,
+                    },
+                );
+                if let Some(player) = self.players.get_mut(&pid) {
+                    player.airstrike_ready_at = now + AIR_STRIKE_COOLDOWN;
+                }
+            }
+            _ => return,
+        }
+
+        self.events.push(GameEvent::AbilityUsed {
+            x: tx,
+            y: ty,
+            ability,
+        });
     }
 
     /// Отправляет сообщение игроку, если канал готов.
@@ -1667,6 +2160,13 @@ impl Game {
             ..Snapshot::default()
         };
 
+        // Направление башни наблюдателя задаёт конус обзора.
+        let (viewer_aim, alive) = viewer
+            .tank
+            .as_ref()
+            .map(|t| (t.aim, true))
+            .unwrap_or((0, false));
+
         // --- Танки ---
         for pid in self.player_grid.query(cx0, cy0, cx1, cy1) {
             let Some(player) = self.players.get(&pid) else {
@@ -1675,7 +2175,16 @@ impl Game {
             let Some(tank) = player.tank.as_ref() else {
                 continue;
             };
-            if !self.can_see(viewer_id, focus_x, focus_y, ccx, ccy, player, tank) {
+            if !self.can_see(
+                viewer_id,
+                focus_x,
+                focus_y,
+                viewer_aim,
+                alive,
+                ccx,
+                ccy,
+                tank,
+            ) {
                 continue;
             }
             snap.players.push(PlayerView {
@@ -1685,6 +2194,7 @@ impl Game {
                 x: tank.x,
                 y: tank.y,
                 dir: tank.dir,
+                aim: tank.aim,
                 level: tank.level,
                 hp: tank.hp,
                 max_hp: tank.max_hp,
@@ -1692,6 +2202,16 @@ impl Game {
                 shielded: tank.shield_until > self.tick,
                 score: player.score,
                 kills: player.kills,
+                ability: player.ability,
+                ability_cd: {
+                    // Кулдаун именно выбранной способности.
+                    let ready = match player.ability {
+                        protocol::ability::MORTAR => player.mortar_ready_at,
+                        protocol::ability::AIR_STRIKE => player.airstrike_ready_at,
+                        _ => 0,
+                    };
+                    ready.saturating_sub(self.tick).min(u16::MAX as u64) as u16
+                },
             });
         }
 
@@ -1700,6 +2220,10 @@ impl Game {
             let Some(bullet) = self.bullets.get(&bid) else {
                 continue;
             };
+            // Снаряд за пределами конуса не виден — как и противник.
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, bullet.x, bullet.y) {
+                continue;
+            }
             snap.bullets.push(BulletView {
                 id: bullet.id,
                 x: bullet.x,
@@ -1723,6 +2247,43 @@ impl Game {
             });
         }
 
+        // --- Эффекты: миномёты в полёте и вызовы авиаподдержки ---
+        for m in self.mortars.values() {
+            let (mx, my) = mortar_position(m, self.tick);
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, mx, my) {
+                continue;
+            }
+            // Клиенту нужны обе точки: из начала и в цель — по ним он
+            // рисует дугу полёта.
+            let phase = mortar_phase(m, self.tick);
+            snap.effects.push(EffectView {
+                id: m.id,
+                kind: EFFECT_MORTAR,
+                x: m.x0,
+                y: m.y0,
+                x2: m.x1,
+                y2: m.y1,
+                phase,
+            });
+        }
+        for s in self.airstrikes.values() {
+            if alive && !self.in_vision(focus_x, focus_y, viewer_aim, s.x, s.y) {
+                continue;
+            }
+            let total = AIR_STRIKE_DELAY.max(1);
+            let left = s.hit_tick.saturating_sub(self.tick);
+            let phase = ((total.saturating_sub(left)) * 100 / total) as u8;
+            snap.effects.push(EffectView {
+                id: s.id,
+                kind: EFFECT_AIR_STRIKE,
+                x: s.x,
+                y: s.y,
+                x2: s.x,
+                y2: s.y,
+                phase,
+            });
+        }
+
         // --- Дельты карты ---
         for update in self.tile_updates.iter() {
             let ux = update.x as u32 / CHUNK_TILES;
@@ -1737,6 +2298,7 @@ impl Game {
             let (ex, ey) = match *event {
                 GameEvent::Explosion { x, y, .. } => (x, y),
                 GameEvent::PickupCollected { x, y, .. } => (x, y),
+                GameEvent::AbilityUsed { x, y, .. } => (x, y),
                 GameEvent::TileBroken { x, y } => (
                     x as f32 * TILE_SIZE + TILE_SIZE * 0.5,
                     y as f32 * TILE_SIZE + TILE_SIZE * 0.5,
@@ -1755,20 +2317,55 @@ impl Game {
         Some(snap)
     }
 
-    /// Виден ли танк наблюдателю (с учётом чащи и радиуса чанков).
+    /// Находится ли точка в конусе обзора наблюдателя.
+    ///
+    /// Конус шириной 120° вокруг направления башни, дальность — 900 пикселей.
+    /// Кирпичные и бетонные стены перекрывают обзор, вода и лес — нет.
+    pub fn in_vision(&self, vx: f32, vy: f32, aim: u8, x: f32, y: f32) -> bool {
+        debug_assert!(
+            (VISION_COS - VISION_HALF_ANGLE.cos()).abs() < 1e-6,
+            "порог обзора разошёлся с углом конуса"
+        );
+        let dx = x - vx;
+        let dy = y - vy;
+        let dist2 = dx * dx + dy * dy;
+        if dist2 > VISION_RANGE * VISION_RANGE {
+            return false;
+        }
+        if dist2 < 1.0 {
+            return true;
+        }
+        let (ax, ay) = protocol::aim_delta(aim);
+        let dist = dist2.sqrt();
+        let cos = (dx * ax + dy * ay) / dist;
+        if cos < VISION_COS {
+            return false;
+        }
+        self.map.bullet_line_of_sight(vx, vy, x, y)
+    }
+
+    /// Виден ли танк наблюдателю (конус обзора, чаща и радиус чанков).
     fn can_see(
         &self,
         viewer_id: u32,
-        _vx: f32,
-        _vy: f32,
+        vx: f32,
+        vy: f32,
+        aim: u8,
+        alive: bool,
         ccx: u32,
         ccy: u32,
-        other: &Player,
         tank: &Tank,
     ) -> bool {
         let (ocx, ocy) = self.map.chunk_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
         let radius = crate::map::VIEW_CHUNK_RADIUS as i64;
         if (ocx as i64 - ccx as i64).abs() > radius || (ocy as i64 - ccy as i64).abs() > radius {
+            return false;
+        }
+
+        // Главное правило тумана войны: противник виден только там,
+        // куда «смотрит» башня наблюдателя.
+        if alive && !self.in_vision(vx, vy, aim, tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5)
+        {
             return false;
         }
 
@@ -1789,9 +2386,25 @@ impl Game {
                 }
             }
         }
-        let _ = other;
         true
     }
+}
+
+/// Тип эффекта: миномёт в полёте.
+pub const EFFECT_MORTAR: u8 = 1;
+/// Тип эффекта: вызов авиаподдержки.
+pub const EFFECT_AIR_STRIKE: u8 = 2;
+
+/// Текущая позиция миномёта: он летит по прямой, высота дуги рисуется клиентом.
+fn mortar_position(m: &Mortar, now: u64) -> (f32, f32) {
+    let t = (now.saturating_sub(m.start_tick) as f32 / m.flight_ticks.max(1) as f32).clamp(0.0, 1.0);
+    (m.x0 + (m.x1 - m.x0) * t, m.y0 + (m.y1 - m.y0) * t)
+}
+
+/// Ход полёта миномёта в процентах.
+fn mortar_phase(m: &Mortar, now: u64) -> u8 {
+    let t = (now.saturating_sub(m.start_tick) as f32 / m.flight_ticks.max(1) as f32).clamp(0.0, 1.0);
+    (t * 100.0) as u8
 }
 
 // ---------------------------------------------------------------------------
@@ -1812,28 +2425,14 @@ pub fn aabb_overlap(
     ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
-/// Направление от точки к точке: восемь направлений по знакам разностей.
+/// Направление башни от точки к точке: 16 направлений (шаг 22.5°).
 ///
-/// Небольшой порог по каждой оси не даёт «дрожать» наводке, когда цель
-/// почти точно по курсу.
-pub fn direction_towards(x0: f32, y0: f32, x1: f32, y1: f32) -> Direction {
-    const EPS: f32 = 8.0;
-    let v = if y1 - y0 < -EPS {
-        -1
-    } else if y1 - y0 > EPS {
-        1
-    } else {
-        0
-    };
-    let h = if x1 - x0 < -EPS {
-        -1
-    } else if x1 - x0 > EPS {
-        1
-    } else {
-        0
-    };
-    Direction::from_axes(v, h).unwrap_or(Direction::Down)
+/// Это «точная» наводка, в отличие от `Direction`, который описывает
+/// только перемещение корпуса.
+pub fn aim_towards(x0: f32, y0: f32, x1: f32, y1: f32) -> u8 {
+    protocol::aim_towards(x0, y0, x1, y1)
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -1849,7 +2448,13 @@ mod tests {
             max_bots: 0,
             seed: 1234,
             profile: false,
+            bot_skill: None,
         })
+    }
+
+    /// Отправляет ввод без наводки и способностей — для тестов движения.
+    fn send_input(game: &mut Game, conn_id: u64, seq: u32, input: InputFlags) {
+        game.apply_input(conn_id, seq, input, 4, protocol::ability::NONE, 0.0, 0.0);
     }
 
     #[test]
@@ -1885,17 +2490,15 @@ mod tests {
     }
 
     #[test]
-    fn direction_towards_picks_quadrant() {
-        assert_eq!(direction_towards(0.0, 0.0, 0.0, -100.0), Direction::Up);
-        assert_eq!(direction_towards(0.0, 0.0, 100.0, 0.0), Direction::Right);
-        assert_eq!(
-            direction_towards(0.0, 0.0, 100.0, 100.0),
-            Direction::DownRight
-        );
-        assert_eq!(
-            direction_towards(0.0, 0.0, -100.0, 100.0),
-            Direction::DownLeft
-        );
+    fn aim_towards_picks_sixteen_directions() {
+        // Угол 0 — вправо, дальше по часовой стрелке (ось Y вниз).
+        assert_eq!(aim_towards(0.0, 0.0, 100.0, 0.0), 0);
+        assert_eq!(aim_towards(0.0, 0.0, 0.0, 100.0), 4);
+        assert_eq!(aim_towards(0.0, 0.0, -100.0, 0.0), 8);
+        assert_eq!(aim_towards(0.0, 0.0, 0.0, -100.0), 12);
+        // Диагональ 45° попадает между кардинальными: шаг башни 22.5°.
+        assert_eq!(aim_towards(0.0, 0.0, 100.0, 100.0), 2);
+        assert_eq!(aim_towards(0.0, 0.0, -100.0, 100.0), 6);
     }
 
     #[test]
@@ -1948,7 +2551,8 @@ mod tests {
                     },
                 );
             }
-            game.apply_input(
+            send_input(
+                &mut game,
                 1,
                 1,
                 InputFlags {
@@ -2018,7 +2622,8 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "Тест".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "Тест".into());
-        game.apply_input(
+        send_input(
+            &mut game,
             1,
             1,
             InputFlags {
@@ -2168,5 +2773,284 @@ mod tests {
     fn aabb_overlap_works() {
         assert!(aabb_overlap(0.0, 0.0, 10.0, 10.0, 5.0, 5.0, 10.0, 10.0));
         assert!(!aabb_overlap(0.0, 0.0, 10.0, 10.0, 20.0, 20.0, 10.0, 10.0));
+    }
+
+    // -----------------------------------------------------------------------
+    // Механики v3: башня, сложность, способности, туман войны
+    // -----------------------------------------------------------------------
+
+    /// Расчищает прямоугольник тайлов — чтобы тест не зависел от карты.
+    fn clear_tiles(game: &mut Game, x0: u32, y0: u32, x1: u32, y1: u32) {
+        for ty in y0..=y1 {
+            for tx in x0..=x1 {
+                game.map.set_kind(tx, ty, TileKind::Empty);
+            }
+        }
+    }
+
+    /// Ставит танк игрока в заданную точку: без стен, без защиты при спавне.
+    fn place_tank(game: &mut Game, pid: u32, x: f32, y: f32, aim: u8) {
+        if let Some(player) = game.players.get_mut(&pid) {
+            player.aim = aim;
+            if let Some(tank) = player.tank.as_mut() {
+                tank.x = x;
+                tank.y = y;
+                tank.aim = aim;
+                tank.dir = Direction::Down;
+                tank.cooldown = 0.0;
+                tank.spawn_protect_until = 0;
+                tank.shield_until = 0;
+            }
+        }
+    }
+
+    #[test]
+    fn bots_are_always_slower_than_the_player() {
+        // Ключевое требование: ни один бот не должен бежать быстрее человека.
+        for skill in [BotSkill::Easy, BotSkill::Normal, BotSkill::Hard] {
+            assert!(
+                skill.speed_mult() < 1.0,
+                "бот уровня «{}» быстрее игрока",
+                skill.label()
+            );
+        }
+        // И чем сложнее бот, тем он быстрее — но всё равно не быстрее игрока.
+        assert!(BotSkill::Easy.speed_mult() < BotSkill::Normal.speed_mult());
+        assert!(BotSkill::Normal.speed_mult() < BotSkill::Hard.speed_mult());
+        // Сложный бот точнее и реактивнее лёгкого.
+        assert!(BotSkill::Hard.aim_error() < BotSkill::Easy.aim_error());
+        assert!(BotSkill::Hard.reaction_ticks() < BotSkill::Easy.reaction_ticks());
+        assert!(BotSkill::Hard.sight_range() > BotSkill::Easy.sight_range());
+    }
+
+    #[test]
+    fn tower_aims_by_mouse_while_body_follows_keys() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 2, 2, 20, 20);
+        // Корпус смотрит вниз, башня — вправо.
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                fire: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::NONE,
+            0.0,
+            0.0,
+        );
+        game.tick();
+
+        let bullet = game.bullets.values().next().expect("снаряд");
+        assert_eq!(bullet.dir, 0, "снаряд должен лететь по башне, а не по корпусу");
+        let (dx, dy) = protocol::aim_delta(bullet.dir);
+        assert!(dx > 0.9, "снаряд должен лететь вправо");
+        assert!(dy.abs() < 0.01, "снаряд не должен отклоняться вниз");
+        let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("tank");
+        assert_eq!(tank.dir, Direction::Down, "корпус остаётся направленным вниз");
+    }
+
+    #[test]
+    fn enemies_are_hidden_outside_the_view_cone() {
+        let mut game = test_game();
+        let viewer = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        let behind = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        let ahead = game.add_player(3, "C".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(viewer, "A".into());
+        game.join_player(behind, "B".into());
+        game.join_player(ahead, "C".into());
+        clear_tiles(&mut game, 0, 6, 30, 14);
+
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        // Башня смотрит вправо: цель спереди (C) и цель за спиной (B).
+        place_tank(&mut game, viewer, x, y, 0);
+        place_tank(&mut game, ahead, x + 200.0, y, 0);
+        place_tank(&mut game, behind, x - 200.0, y, 0);
+
+        game.tick();
+        let snap = game.snapshot_for(viewer).expect("снимок");
+        assert!(
+            snap.players.iter().any(|p| p.id == ahead),
+            "противник впереди должен быть виден"
+        );
+        assert!(
+            !snap.players.iter().any(|p| p.id == behind),
+            "противник за спиной не должен попадать в снимок"
+        );
+    }
+
+    #[test]
+    fn mortar_flies_over_walls_and_damages_the_area() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        let victim = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        game.join_player(victim, "B".into());
+
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank(&mut game, pid, x, y, 0);
+        place_tank(&mut game, victim, x + 150.0, y, 0);
+        // Между стрелком и целью — стена: миномёт её перелетает.
+        clear_tiles(&mut game, 8, 9, 12, 11);
+        game.map.set_kind(13, 10, TileKind::Steel);
+
+        let hp_before = game
+            .players
+            .get(&victim)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp)
+            .expect("танк");
+
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::MORTAR,
+            x + 150.0,
+            y,
+        );
+        assert_eq!(game.mortars.len(), 1, "миномёт должен вылететь");
+
+        for _ in 0..MORTAR_FLIGHT_TICKS + 2 {
+            game.tick();
+        }
+        assert!(game.mortars.is_empty(), "миномёт должен упасть");
+        let hp_after = game
+            .players
+            .get(&victim)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp);
+        assert!(
+            hp_after.map(|hp| hp < hp_before).unwrap_or(true),
+            "миномёт должен нанести урон"
+        );
+    }
+
+    #[test]
+    fn air_strike_hits_after_a_delay() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        let victim = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        game.join_player(victim, "B".into());
+        clear_tiles(&mut game, 8, 9, 12, 11);
+
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank(&mut game, pid, x, y, 0);
+        place_tank(&mut game, victim, x + 150.0, y, 0);
+        let hp_before = game
+            .players
+            .get(&victim)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp)
+            .expect("танк");
+
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::AIR_STRIKE,
+            x + 150.0,
+            y,
+        );
+        assert_eq!(game.airstrikes.len(), 1, "вызов авиаподдержки должен принять");
+
+        // До задержки удара цела.
+        for _ in 0..AIR_STRIKE_DELAY - 2 {
+            game.tick();
+        }
+        let hp_mid = game
+            .players
+            .get(&victim)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp)
+            .expect("танк");
+        assert_eq!(hp_mid, hp_before, "удар не должен приходить мгновенно");
+
+        for _ in 0..4 {
+            game.tick();
+        }
+        // Удар может и убить — тогда танка просто не остаётся.
+        let hp_after = game
+            .players
+            .get(&victim)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp);
+        assert!(
+            hp_after.map(|hp| hp < hp_before).unwrap_or(true),
+            "авиаудар должен нанести урон"
+        );
+        assert!(game.airstrikes.is_empty(), "вызов должен завершиться");
+    }
+
+    #[test]
+    fn abilities_respect_cooldown_and_range() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 9, 12, 11);
+        let x = 10.0 * TILE_SIZE;
+        let y = 10.0 * TILE_SIZE;
+        place_tank(&mut game, pid, x, y, 0);
+
+        // Миномёт.
+        game.apply_input(
+            1,
+            1,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::MORTAR,
+            x + 200.0,
+            y,
+        );
+        assert_eq!(game.mortars.len(), 1);
+        // Повторный вызов до кулдауна игнорируется.
+        game.apply_input(
+            1,
+            2,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::MORTAR,
+            x + 200.0,
+            y,
+        );
+        assert_eq!(game.mortars.len(), 1, "кулдаун должен блокировать повтор");
+
+        // Цель за пределами дальности — вызов не проходит.
+        game.apply_input(
+            1,
+            3,
+            InputFlags {
+                use_ability: true,
+                ..Default::default()
+            },
+            0,
+            protocol::ability::AIR_STRIKE,
+            x + ABILITY_RANGE + 500.0,
+            y,
+        );
+        assert!(game.airstrikes.is_empty(), "дальность способности ограничена");
     }
 }

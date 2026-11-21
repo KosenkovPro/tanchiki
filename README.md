@@ -123,20 +123,59 @@ docker run -d --name tanchiki -p 3000:3000 tanchiki
 
 | Клавиша | Действие |
 |---------|----------|
-| `W` `A` `S` `D` / стрелки | движение — **в том числе по диагонали** (8 направлений) |
-| `Пробел` / ЛКМ | выстрел |
+| `W` `A` `S` `D` / стрелки | **корпус** танка — в том числе по диагонали (8 направлений) |
+| Мышь | **башня** — поворачивается за курсором, 16 направлений |
+| `Пробел` / ЛКМ | выстрел (по направлению башни) |
+| **ПКМ** | применить выбранную способность в точке курсора |
+| `1` `2` `3` | выбор способности: пушка / миномёт / авиаподдержка |
 | `Enter` | начать бой / возродиться |
 | `M` | включить / выключить звук |
 | Колесо мыши | зум камеры (0.55×…1.6×) |
 
+**Корпус и башня независимы.** Корпус едет по WASD, а башня крутится за курсором мыши:
+можно ехать вбок и целиться в другую сторону, а можно стоять на месте и вести огонь
+вокруг себя. Снаряды летят **по башне**, а не по корпусу.
+
 Диагональ получается одновременным нажатием двух клавиш (`W`+`D`, `S`+`A` и т. д.):
-сервер выводит направление из знаков осей, поэтому формат пакета `INPUT` не менялся.
+сервер выводит направление из знаков осей, поэтому корпус по-прежнему имеет 8 направлений.
 
 При повороте танк **автоматически выравнивается по сетке тайлов** — как в классическом
 Battle City, поэтому он не застревает в узких проходах. Диагональный ход по сетке
 не выравнивается — он свободный.
 
 Камера **не трясётся**: ни при попаданиях, ни при взрывах.
+
+---
+
+## 💣 Способности
+
+Три режима на панели «СПОСОБНОСТИ · ПКМ» (клавиши `1`–`3` или клик по кнопке).
+Выбранная способность применяется **правой кнопкой мыши** в точке курсора.
+
+| Способность | Урон | Радиус | Дальность | Кулдаун | Особенность |
+|-------------|------|--------|-----------|---------|-------------|
+| Пушка (`1`) | 1–3 | — | — | 1.65 / 1.35 / 1.05 с | обычная стрельба по башне |
+| Миномёт (`2`) | 2 | 48 px | 1400 px | 6 с | летит **по дуге и перелетает стены** |
+| Авиаподдержка (`3`) | 3 | 66 px | 1400 px | 15 с | удар с воздуха **с задержкой 2.5 с** |
+
+У каждой способности **свой** кулдаун: миномёт и авиаподдержка не мешают друг другу.
+Остаток кулдауна показан прямо на кнопке способности.
+
+---
+
+## 🌫 Туман войны (как в Age of Empires 2)
+
+Мир такой же, как в AoE2: **противники видны только там, куда «смотрит» башня.**
+
+* **Конус обзора** — 120° (полуугол 60°) вокруг направления башни, дальность **900 px**.
+* **Стены перекрывают обзор**: кирпич и бетон останавливают взгляд, вода и лес — нет.
+* Сервер — источник истины: танк вне конуса **вообще не попадает в снимок мира**,
+  поэтому врага нельзя увидеть даже с помощью модификации клиента.
+* Пройденная территория **остаётся на карте**, но в «старом» виде: стена, которую вы
+  разрушили минуту назад, изображается такой, какой была, когда вы в последний раз
+  смотрели в ту сторону. Неисследованные области закрыты полностью.
+* На мини-карте видно ровно то же: исследованное — приглушено, видимое — как есть.
+* Лес работает как в AoE2: танк внутри массива не виден врагам снаружи, пока не выстрелит.
 
 ---
 
@@ -216,6 +255,23 @@ Battle City, поэтому он не застревает в узких про�
 настоящие бои. Если цели нет, бот блуждает по карте. Когда приходят люди,
 лишние боты уходят плавно: исчезают со взрывом и удаляются через 1.5 секунды.
 
+#### Уровни сложности
+
+| Уровень | Скорость | Ошибка наводки | Перезарядка | Реакция | Дальность обзора |
+|---------|----------|----------------|-------------|---------|-----------------|
+| Лёгкий | **0.55×** | ±3 шага башни | ×1.8 | 1.2 с | 520 px |
+| Средний | **0.72×** | ±2 шага башни | ×1.4 | 0.67 с | 700 px |
+| Сложный | **0.88×** | ±1 шаг башни | ×1.15 | 0.33 с | 860 px |
+
+Главное правило: **ни один бот не быстрее игрока** — множитель скорости всегда меньше
+единицы, поэтому в скорости танка игрок всегда выигрывает. Сложность влияет ещё и на
+ошибку наводки, задержку реакции, длительность перезарядки и дальность обзора: «сложный»
+бот первым замечает противника, но всё равно не догоняет человека.
+
+По умолчанию состав смешанный: 45 % лёгких, 40 % средних, 15 % сложных. Весь сервер
+можно перевести на один уровень переменной окружения `TANCHIKI_BOT_SKILL`
+(`easy` / `normal` / `hard` / `mixed`).
+
 ---
 
 ## ⚙️ Настройки сервера
@@ -230,6 +286,7 @@ Battle City, поэтому он не застревает в узких про�
 | `TANCHIKI_MAP_H` | `160` | высота карты в тайлах (32…512) |
 | `TANCHIKI_MIN_PLAYERS` | `20` | минимальный размер населения (люди + боты) |
 | `TANCHIKI_MAX_BOTS` | `24` | максимум ботов |
+| `TANCHIKI_BOT_SKILL` | `mixed` | сложность ботов: `easy` / `normal` / `hard` / `mixed` |
 | `TANCHIKI_SEED` | фиксированный | зерно генерации карты |
 | `TANCHIKI_PROFILE` | выкл. | `1` — подробный профайлинг тиков в лог |
 
@@ -283,14 +340,17 @@ static/
 с фиксированным тикрейтом **30 TPS** (`tokio::time::interval`). Клиент присылает только
 состояние управления и получает готовый снимок мира.
 
-### Interest management (чанки)
+### Interest management и туман войны
 
 Карта `160 × 160` тайлов по `32 × 32` px — это `5120 × 5120` px. Она делится на чанки
 `16 × 16` тайлов (всего `10 × 10` чанков).
 
-Каждому игроку сервер отправляет **только сущности из его чанка и восьми соседних**
-(зона `3 × 3` чанка ≈ `1536 × 1536` px). Танк в чаще дополнительно скрывается от
-наблюдателей, находящихся вне того же лесного массива.
+Снимок мира фильтруется **по конусу взгляда**, а не только по чанкам: в снимок попадают
+только тела, снаряды и эффекты, что попадают в 120°-конус башни наблюдателя на расстоянии
+до 900 px и не закрыты стеной. Пространственная сетка чанков используется как быстрый
+отбор кандидатов (радиус 3 чанка), а окончательное решение принимает проверка конуса.
+Танк в чаще дополнительно скрывается от наблюдателей, находящихся вне того же лесного
+массива.
 
 ### Синхронизация карты
 
@@ -330,11 +390,16 @@ static/
 | Тип | Код | Тело |
 |-----|-----|------|
 | `JOIN` | `0x01` | `nickname: string` |
-| `INPUT` | `0x02` | `seq: u32`, `flags: u8` |
+| `INPUT` | `0x02` | `seq: u32`, `flags: u8`, `aim: u8`, `ability: u8`, `target_x: f32`, `target_y: f32` |
 | `RESPAWN` | `0x03` | — |
 | `PING` | `0x04` | `client_time: u64` |
 
-`flags` — битовая маска: `1` вверх, `2` вниз, `4` влево, `8` вправо, `16` огонь.
+`flags` — битовая маска: `1` вверх, `2` вниз, `4` влево, `8` вправо, `16` огонь,
+`32` применить способность (одноразовый флаг).
+
+`aim` — направление башни, `0…15` (шаг 22.5°): `0` вправо, дальше по часовой стрелке.
+`ability` — `0` пушка, `1` миномёт, `2` авиаподдержка. `target_x/target_y` — мировая
+точка, куда применяется способность (по ней рисуется прицел).
 
 ### Сервер → клиент
 
@@ -357,21 +422,31 @@ static/
 tick: u64
 focus_x: f32, focus_y: f32          // точка, вокруг которой центрировать камеру
 players: u16 × { id: u32, name: string, flags: u8, x: f32, y: f32,
-                  dir: u8, level: u8, hp: u8, max_hp: u8, score: u32, kills: u32 }
+                  dir: u8, aim: u8, level: u8, hp: u8, max_hp: u8,
+                  score: u32, kills: u32, ability: u8, ability_cd: u16 }
 bullets: u16 × { id: u32, x: f32, y: f32, dir: u8, level: u8 }
 pickups: u16 × { id: u32, x: f32, y: f32, kind: u8, ttl: u32 }
 tiles:   u16 × { x: u16, y: u16, value: u8 }
+effects: u16 × { id: u32, kind: u8, x: f32, y: f32, x2: f32, y2: f32, phase: u8 }
 events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тайл, 2 подобран бонус,
-                                     // 3 убийство, 4 повышение уровня
+                                     // 3 убийство, 4 повышение уровня, 5 способность
 ```
 
 Значение тайла упаковано в один байт: биты `0..=2` — базовый тип, биты `3..=5` — стадия
 повреждения (0–3 для кирпича).
 
 `dir`: `0` вверх, `1` вниз, `2` влево, `3` вправо, `4` вверх-влево, `5` вверх-вправо,
-`6` вниз-влево, `7` вниз-вправо.
+`6` вниз-влево, `7` вниз-вправо. Это направление **корпуса**.
 
-Версия протокола — **2** (в первой было 4 направления, а в лидерборде не было убийств).
+`aim` — направление **башни**, 16 значений с шагом 22.5°; по нему летят снаряды.
+`ability_cd` — остаток кулдауна выбранной способности в тиках.
+
+`effects` — визуальные эффекты: `kind = 1` миномёт в полёте (`x,y` — точка запуска,
+`x2,y2` — точка падения, `phase` — ход полёта в процентах), `kind = 2` вызов
+авиаподдержки (`x,y` — точка удара, `phase` — ход вызова).
+
+Версия протокола — **3**: в первой было 4 направления, во второй добавились 8 направлений
+и счётчик убийств, в третьей — независимая башня (16 направлений), способности и туман войны.
 
 ---
 
@@ -392,14 +467,16 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 
 ```bash
 cargo check --all-targets   # 0 ошибок, 0 предупреждений
-cargo test                  # 25 тестов
+cargo test                  # 33 теста
 cargo build --release
 ```
 
 Покрыты: RLE round-trip, связность карты, разрушаемость кирпича и бетона, разрешение
 направлений, движение по диагонали, темп стрельбы по перезарядке, застревание танка
 в стенах, сбор бонусов, поведение population при входе людей, корректность протокола
-на битых данных.
+на битых данных, независимость башни от корпуса, скорость ботов относительно игрока,
+сокрытие противников вне конуса обзора, полёт миномёта и удар авиаподдержки с задержкой,
+кулдауны и дальность способностей.
 
 Полезные команды во время разработки:
 
@@ -521,20 +598,61 @@ polls `/healthz`, so `docker ps` reflects the real state of the container.
 
 | Key | Action |
 |-----|--------|
-| `W` `A` `S` `D` / arrow keys | movement — **including diagonals** (8 directions) |
-| `Space` / left mouse button | fire |
+| `W` `A` `S` `D` / arrow keys | **hull** movement — **including diagonals** (8 directions) |
+| Mouse | **turret** — follows the cursor, 16 directions |
+| `Space` / left mouse button | fire (along the turret) |
+| **Right mouse button** | apply the selected ability at the cursor |
+| `1` `2` `3` | select ability: gun / mortar / air strike |
 | `Enter` | join the battle / respawn |
 | `M` | toggle sound on / off |
 | Mouse wheel | camera zoom (0.55×…1.6×) |
 
+**Hull and turret are independent.** The hull drives on WASD while the turret tracks the
+mouse cursor: you can strafe and aim somewhere else, or stand still and fire in any
+direction. Bullets fly **along the turret**, not along the hull.
+
 A diagonal move is just two keys at once (`W`+`D`, `S`+`A`, …): the server derives the
-direction from the axis signs, so the `INPUT` packet format did not change.
+hull direction from the axis signs, so the hull still has 8 directions.
 
 When the tank turns, it is **automatically aligned to the tile grid** — exactly like in
 classic Battle City — so it never gets stuck in narrow passages. A diagonal step is not
 snapped to the grid; it stays free.
 
 The camera **never shakes**: not on hits, not on explosions.
+
+---
+
+## 💣 Abilities
+
+Three modes on the “СПОСОБНОСТИ · ПКМ / ABILITIES · RMB” panel (keys `1`–`3` or a click
+on the button). The selected ability is applied with the **right mouse button** at the
+cursor position.
+
+| Ability | Damage | Radius | Range | Cooldown | Notes |
+|---------|--------|--------|-------|----------|-------|
+| Gun (`1`) | 1–3 | — | — | 1.65 / 1.35 / 1.05 s | normal fire along the turret |
+| Mortar (`2`) | 2 | 48 px | 1400 px | 6 s | flies **in an arc and clears walls** |
+| Air strike (`3`) | 3 | 66 px | 1400 px | 15 s | hit from the sky **after a 2.5 s delay** |
+
+Each ability has **its own** cooldown: mortar and air strike never block each other. The
+remaining cooldown is shown right on the ability button.
+
+---
+
+## 🌫 Fog of war (Age of Empires 2 style)
+
+The world works like AoE2: **enemies are only visible where the turret looks.**
+
+* **Vision cone** — 120° (60° half-angle) around the turret direction, range **900 px**.
+* **Walls block sight**: brick and steel stop the gaze, water and forest do not.
+* The server is the authority: a tank outside the cone **never enters the world
+  snapshot**, so an enemy cannot be seen even by tampering with the client.
+* Explored territory **stays on the map**, but in its “old” look: a wall you destroyed a
+  minute ago is drawn as it was when you last looked that way. Unexplored areas are
+  covered completely.
+* The minimap shows exactly the same: explored is dimmed, visible is bright.
+* Forest works like in AoE2: a tank inside a forest block is hidden from enemies outside
+  it until it fires.
 
 ---
 
@@ -612,6 +730,23 @@ If the server has fewer than 20 active players, it maintains the population with
 all over the map. With no target around, a bot wanders around the map. When real players
 join, the extra bots leave gracefully: they explode and are removed 1.5 seconds later.
 
+#### Difficulty levels
+
+| Level | Speed | Aim error | Reload | Reaction | Sight range |
+|-------|-------|-----------|--------|----------|-------------|
+| Easy | **0.55×** | ±3 turret steps | ×1.8 | 1.2 s | 520 px |
+| Normal | **0.72×** | ±2 turret steps | ×1.4 | 0.67 s | 700 px |
+| Hard | **0.88×** | ±1 turret step | ×1.15 | 0.33 s | 860 px |
+
+The main rule: **no bot is ever faster than the player** — the speed multiplier is always
+below 1, so the player always wins the race. Difficulty also changes aim error, reaction
+delay, reload time and sight range: a “hard” bot spots you first, but still cannot
+outrun you.
+
+By default the mix is 45 % easy, 40 % normal, 15 % hard. The whole server can be switched
+to a single level with the `TANCHIKI_BOT_SKILL` environment variable
+(`easy` / `normal` / `hard` / `mixed`).
+
 ---
 
 ## ⚙️ Server configuration
@@ -627,6 +762,7 @@ Everything is configured through environment variables (see `src/game.rs`,
 | `TANCHIKI_MAP_H` | `160` | map height in tiles (32…512) |
 | `TANCHIKI_MIN_PLAYERS` | `20` | minimum population (humans + bots) |
 | `TANCHIKI_MAX_BOTS` | `24` | maximum number of bots |
+| `TANCHIKI_BOT_SKILL` | `mixed` | bot difficulty: `easy` / `normal` / `hard` / `mixed` |
 | `TANCHIKI_SEED` | fixed | map generation seed |
 | `TANCHIKI_PROFILE` | off | `1` — detailed per-tick profiling in the log |
 
@@ -681,14 +817,16 @@ All physics, hit detection and wall destruction are computed **exclusively on th
 at a fixed tick rate of **30 TPS** (`tokio::time::interval`). The client only sends input
 state and receives finished world snapshots.
 
-### Interest management (chunks)
+### Interest management and fog of war
 
 The map is `160 × 160` tiles of `32 × 32` px — that is `5120 × 5120` px. It is split into
 chunks of `16 × 16` tiles (`10 × 10` chunks in total).
 
-Each player receives **only the entities from their own chunk and the eight neighbouring
-ones** (a `3 × 3` chunk area ≈ `1536 × 1536` px). A tank hidden in the forest additionally
-disappears from observers that are outside the same forest block.
+The world snapshot is filtered **by the vision cone**, not by chunks alone: only bodies,
+bullets and effects that fall inside the viewer's 120° cone within 900 px and are not
+blocked by a wall are included. The chunk grid is used as a fast candidate filter (radius
+3 chunks), and the cone check makes the final decision. A tank hidden in the forest
+additionally disappears from observers that are outside the same forest block.
 
 ### Map synchronization
 
@@ -728,11 +866,16 @@ Every message starts with a single type byte.
 | Type | Code | Body |
 |------|------|------|
 | `JOIN` | `0x01` | `nickname: string` |
-| `INPUT` | `0x02` | `seq: u32`, `flags: u8` |
+| `INPUT` | `0x02` | `seq: u32`, `flags: u8`, `aim: u8`, `ability: u8`, `target_x: f32`, `target_y: f32` |
 | `RESPAWN` | `0x03` | — |
 | `PING` | `0x04` | `client_time: u64` |
 
-`flags` is a bit mask: `1` up, `2` down, `4` left, `8` right, `16` fire.
+`flags` is a bit mask: `1` up, `2` down, `4` left, `8` right, `16` fire,
+`32` apply ability (a one-shot flag).
+
+`aim` is the turret direction, `0…15` (22.5° per step): `0` is right, then clockwise.
+`ability` is `0` gun, `1` mortar, `2` air strike. `target_x/target_y` is the world point
+where the ability is applied (the crosshair is drawn there).
 
 ### Server → client
 
@@ -755,21 +898,32 @@ Every message starts with a single type byte.
 tick: u64
 focus_x: f32, focus_y: f32          // the point the camera should centre on
 players: u16 × { id: u32, name: string, flags: u8, x: f32, y: f32,
-                  dir: u8, level: u8, hp: u8, max_hp: u8, score: u32, kills: u32 }
+                  dir: u8, aim: u8, level: u8, hp: u8, max_hp: u8,
+                  score: u32, kills: u32, ability: u8, ability_cd: u16 }
 bullets: u16 × { id: u32, x: f32, y: f32, dir: u8, level: u8 }
 pickups: u16 × { id: u32, x: f32, y: f32, kind: u8, ttl: u32 }
 tiles:   u16 × { x: u16, y: u16, value: u8 }
+effects: u16 × { id: u32, kind: u8, x: f32, y: f32, x2: f32, y2: f32, phase: u8 }
 events:  u16 × { kind: u8, ... }     // 0 explosion, 1 tile destroyed, 2 pickup taken,
-                                     // 3 kill, 4 level up
+                                     // 3 kill, 4 level up, 5 ability used
 ```
 
 A tile value is packed into a single byte: bits `0..=2` hold the base type, bits `3..=5`
 hold the damage stage (0–3 for brick).
 
 `dir`: `0` up, `1` down, `2` left, `3` right, `4` up-left, `5` up-right, `6` down-left,
-`7` down-right.
+`7` down-right. That is the **hull** direction.
 
-The protocol version is **2** (version 1 had 4 directions and a leaderboard without kills).
+`aim` is the **turret** direction, 16 values with a 22.5° step; bullets fly along it.
+`ability_cd` is the remaining cooldown of the selected ability, in ticks.
+
+`effects` holds visual effects: `kind = 1` a mortar in flight (`x,y` is the launch point,
+`x2,y2` the impact point, `phase` the flight progress in percent), `kind = 2` an air strike
+call (`x,y` is the impact point, `phase` the call progress).
+
+The protocol version is **3**: version 1 had 4 directions, version 2 added 8 directions
+and a kill counter, version 3 added the independent turret (16 directions), abilities and
+fog of war.
 
 ---
 
@@ -790,14 +944,16 @@ The protocol version is **2** (version 1 had 4 directions and a leaderboard with
 
 ```bash
 cargo check --all-targets   # 0 errors, 0 warnings
-cargo test                  # 25 tests
+cargo test                  # 33 tests
 cargo build --release
 ```
 
 Covered: RLE round-trip, map connectivity, brick and steel damageability, direction
 resolution, diagonal movement, the fire cadence following the reload timer, tanks getting
-stuck in walls, pickup collection, population behaviour when humans join, and protocol
-robustness against corrupted input.
+stuck in walls, pickup collection, population behaviour when humans join, protocol
+robustness against corrupted input, the turret being independent of the hull, bot speed
+relative to the player, hiding enemies outside the vision cone, the mortar flight and the
+delayed air strike, ability cooldowns and range limits.
 
 Useful commands while developing:
 

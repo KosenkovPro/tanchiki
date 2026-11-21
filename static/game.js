@@ -15,6 +15,11 @@ import {
   BIT,
   TILE,
   PICKUP,
+  ABILITY,
+  EFFECT,
+  AIM_COUNT,
+  aimDelta,
+  aimFromVector,
   decodeServer,
   decodeRle,
   encodeJoin,
@@ -33,6 +38,18 @@ const BASE_SPEED = 140;
 const TICK_DT = 1 / 30;
 const INTERP_DELAY = 100; // мс задержки для интерполяции чужих объектов
 const SNAP_HISTORY = 24;
+
+/** Дальность конуса обзора в пикселях. */
+const VISION_RANGE = 900;
+/** Половина угла конуса обзора (60°, то есть конус 120°). */
+const VISION_HALF_ANGLE = Math.PI / 3;
+/** Сколько лучей используется для расчёта видимой области. */
+const VISION_RAYS = 56;
+/** Дальность применения способности. */
+const ABILITY_RANGE = 1400;
+/** Кулдауны способностей в тиках (30 тиков в секунду). */
+const MORTAR_COOLDOWN = 180;
+const AIR_STRIKE_COOLDOWN = 450;
 
 /** Угол поворота спрайта для каждого направления (радианы). */
 const ROT = [
@@ -82,6 +99,8 @@ const statKills = document.getElementById('stat-kills');
 const statPing = document.getElementById('stat-ping');
 const statFps = document.getElementById('stat-fps');
 const soundButton = document.getElementById('sound-toggle');
+const abilityBar = document.getElementById('ability-bar');
+const abilityHint = document.getElementById('ability-hint');
 
 // ---------------------------------------------------------------------------
 // Состояние
@@ -106,6 +125,30 @@ const state = {
   deaths: 0,
   focus: { x: 0, y: 0 },
   seq: 0,
+  /** Выбранная способность: NONE / MORTAR / AIR_STRIKE. */
+  ability: ABILITY.NONE,
+  /** Флаг «применить способность» — одноразовый, живёт до отправки пакета. */
+  pendingUse: false,
+  /** Остаток кулдауна способности в тиках (приходит с сервера). */
+  abilityCd: 0,
+};
+
+/**
+ * Туман войны в духе Age of Empires 2.
+ *
+ * `explored` — тайлы, где игрок уже был;
+ * `visible` — тайлы, которые видно прямо сейчас (конус взгляда);
+ * `seen` — «старый» вид тайла: тем, что было в момент последнего взгляда.
+ */
+const fog = {
+  explored: null,
+  visible: null,
+  seen: null,
+  canvas: null,
+  ctx: null,
+  /** Версия карты, для которой построены массивы. */
+  width: 0,
+  height: 0,
 };
 
 /** Локально предсказанный танк игрока. */
@@ -114,6 +157,8 @@ const pred = {
   x: 0,
   y: 0,
   dir: DIR.DOWN,
+  /** Направление башни: 16 направлений, задаётся курсором мыши. */
+  aim: 4,
   /** Направление движения: скорость направлена вдоль него. */
   moveDir: DIR.DOWN,
   vel: 0,
@@ -124,6 +169,9 @@ const pred = {
   /** Остаток перезарядки — по нему клиент играет звук выстрела. */
   cooldown: 0,
 };
+
+/** Курсор мыши: экранные координаты и пересчитанные мировые. */
+const mouse = { sx: 0, sy: 0, x: 0, y: 0, inside: false };
 
 /** Визуальное смещение, которое плавно гасится после серверной коррекции. */
 const correction = { x: 0, y: 0 };
@@ -323,6 +371,13 @@ function applyMap(map) {
     tiles,
   };
   buildTerrainCanvas();
+  // Новая карта — память исследованного сбрасывается.
+  fog.explored = null;
+  fog.visible = null;
+  fog.seen = null;
+  fog.width = 0;
+  fog.height = 0;
+  ensureFog();
   // Если карта сменилась — сбросим предсказание, чтобы не телепортировать танк.
   pred.active = false;
 }
@@ -343,12 +398,15 @@ function applySnapshot(msg) {
   for (const b of msg.bullets) bullets.set(b.id, b);
   const pickups = new Map();
   for (const p of msg.pickups) pickups.set(p.id, p);
+  const effects = new Map();
+  for (const e of msg.effects ?? []) effects.set(e.id, e);
 
   state.snapshots.push({
     t: performance.now(),
     players,
     bullets,
     pickups,
+    effects,
   });
   if (state.snapshots.length > SNAP_HISTORY) state.snapshots.shift();
 
@@ -393,6 +451,10 @@ function applySnapshot(msg) {
     } else if (ev.kind === 'pickup') {
       spawnSparkle(ev.x, ev.y);
       playSound('pickup', 0.55);
+    } else if (ev.kind === 'abilityUsed') {
+      spawnAbilityMark(ev.x, ev.y, ev.ability);
+      const dist = Math.hypot(ev.x - camera.x, ev.y - camera.y);
+      if (dist < 900) playSound('explosion', 0.35 * (1 - dist / 900));
     } else if (ev.kind === 'levelUp') {
       if (ev.id === state.myId) playSound('powerup', 0.75);
     }
@@ -404,6 +466,9 @@ function applySnapshot(msg) {
     state.score = mine.score;
     state.kills = mine.kills;
     pred.level = mine.level;
+    // Башня: направление считает клиент (по курсору мыши) — так наводка
+    // не запаздывает на один круг по сети. Сервер получает его во вводе.
+    state.abilityCd = mine.abilityCd ?? 0;
     const hpBefore = pred.hp;
     pred.hp = mine.hp;
     pred.maxHp = mine.maxHp;
@@ -453,6 +518,8 @@ function currentInput() {
   if (keys.has('KeyA') || keys.has('ArrowLeft')) bits |= BIT.LEFT;
   if (keys.has('KeyD') || keys.has('ArrowRight')) bits |= BIT.RIGHT;
   if (keys.has('Space') || mouseDown) bits |= BIT.FIRE;
+  // Правая кнопка мыши — применение выбранной способности.
+  if (state.pendingUse) bits |= BIT.USE;
   return bits;
 }
 
@@ -495,6 +562,19 @@ window.addEventListener('keydown', (e) => {
     toggleSound();
     return;
   }
+  // Выбор способности: 1 — пушка, 2 — миномёт, 3 — авиаподдержка.
+  if (e.code === 'Digit1') {
+    selectAbility(ABILITY.NONE);
+    return;
+  }
+  if (e.code === 'Digit2') {
+    selectAbility(ABILITY.MORTAR);
+    return;
+  }
+  if (e.code === 'Digit3') {
+    selectAbility(ABILITY.AIR_STRIKE);
+    return;
+  }
   if (e.code === 'Enter' && !overlayEl.classList.contains('hidden')) {
     e.preventDefault();
     initAudio();
@@ -515,13 +595,46 @@ if (soundButton) {
   });
 }
 
+/**
+ * Выбирает способность.
+ * @param {number} ability
+ */
+function selectAbility(ability) {
+  state.ability = ability;
+  renderAbilityBar();
+  updateAbilityHint();
+}
+
 canvas.addEventListener('mousedown', (e) => {
-  if (e.button === 0) mouseDown = true;
+  if (e.button === 0) {
+    mouseDown = true;
+    return;
+  }
+  if (e.button === 2) {
+    // Правая кнопка — применить выбранную способность в точке курсора.
+    e.preventDefault();
+    if (state.ability === ABILITY.NONE) {
+      updateAbilityHint();
+      return;
+    }
+    state.pendingUse = true;
+    playSound('shot', 0.35, 0.7);
+  }
 });
 window.addEventListener('mouseup', () => {
   mouseDown = false;
 });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  mouse.sx = e.clientX - rect.left;
+  mouse.sy = e.clientY - rect.top;
+  mouse.inside = true;
+});
+canvas.addEventListener('mouseleave', () => {
+  mouse.inside = false;
+});
 
 canvas.addEventListener(
   'wheel',
@@ -644,6 +757,134 @@ function stepPrediction(dt) {
     playSound('shot', 0.5);
     pred.cooldown = fireCooldown(pred.level);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Туман войны
+// ---------------------------------------------------------------------------
+
+/**
+ * Пересчитывает мировые координаты курсора.
+ *
+ * Камера следует за танком с задержкой, поэтому мировая точка курсора
+ * меняется даже когда мышь неподвижна.
+ */
+function updateMouseWorld() {
+  mouse.x = camera.x + (mouse.sx - canvas.clientWidth / 2) / camera.zoom;
+  mouse.y = camera.y + (mouse.sy - canvas.clientHeight / 2) / camera.zoom;
+}
+
+/** Подготавливает массивы тумана под размер карты. */
+function ensureFog() {
+  const m = state.map;
+  if (!m) return false;
+  if (fog.width === m.width && fog.height === m.height) return true;
+  fog.width = m.width;
+  fog.height = m.height;
+  const total = m.width * m.height;
+  fog.explored = new Uint8Array(total);
+  fog.visible = new Uint8Array(total);
+  fog.seen = new Uint8Array(m.tiles);
+  fog.canvas = document.createElement('canvas');
+  fog.canvas.width = m.width;
+  fog.canvas.height = m.height;
+  fog.ctx = fog.canvas.getContext('2d');
+  return true;
+}
+
+/** Тайл по мировым координатам. */
+function tileIndexAt(x, y) {
+  const m = state.map;
+  if (!m) return -1;
+  const tx = Math.floor(x / m.tileSize);
+  const ty = Math.floor(y / m.tileSize);
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return -1;
+  return ty * m.width + tx;
+}
+
+/** Мешает ли тайл видеть дальше. */
+function blocksSight(tx, ty) {
+  const m = state.map;
+  if (!m) return false;
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return true;
+  const kind = m.tiles[ty * m.width + tx] & 7;
+  return kind === TILE.BRICK || kind === TILE.STEEL;
+}
+
+/**
+ * Пересчитывает видимую область: конус взгляда из башни.
+ *
+ * Луч идёт, пока не упрётся в стену: за стеной ничего не видно.
+ * Видимые тайлы запоминаются — их «старый» вид сохраняется в `seen`.
+ */
+function updateVisibility(cx, cy, aim) {
+  const m = state.map;
+  if (!m || !ensureFog()) return;
+  fog.visible.fill(0);
+
+  const base = aim * (Math.PI / 8);
+  const step = 8;
+  const maxSteps = Math.ceil(VISION_RANGE / step);
+
+  for (let i = 0; i <= VISION_RAYS; i++) {
+    const angle = base - VISION_HALF_ANGLE + (2 * VISION_HALF_ANGLE * i) / VISION_RAYS;
+    const dx = Math.cos(angle);
+    const dy = Math.sin(angle);
+    for (let s = 1; s <= maxSteps; s++) {
+      const px = cx + dx * s * step;
+      const py = cy + dy * s * step;
+      const tx = Math.floor(px / m.tileSize);
+      const ty = Math.floor(py / m.tileSize);
+      if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) break;
+      const idx = ty * m.width + tx;
+      fog.visible[idx] = 1;
+      if (blocksSight(tx, ty)) break;
+    }
+  }
+
+  // Свой тайл всегда виден.
+  const own = tileIndexAt(cx, cy);
+  if (own >= 0) fog.visible[own] = 1;
+
+  // Запоминаем текущий вид тайлов, которые видны прямо сейчас.
+  for (let i = 0; i < fog.visible.length; i++) {
+    if (fog.visible[i]) {
+      fog.seen[i] = m.tiles[i];
+      fog.explored[i] = 1;
+    }
+  }
+}
+
+/**
+ * Рисует слой тумана: неисследованное — чёрное, исследованное — приглушённое.
+ */
+function paintFogLayer() {
+  const g = fog.ctx;
+  if (!g || !state.map) return;
+  const m = state.map;
+  g.globalCompositeOperation = 'source-over';
+  g.clearRect(0, 0, m.width, m.height);
+  g.fillStyle = '#000000';
+  g.fillRect(0, 0, m.width, m.height);
+
+  // Исследованное — слегка приглушаем.
+  g.globalCompositeOperation = 'destination-out';
+  g.fillStyle = 'rgba(0,0,0,0.55)';
+  for (let i = 0; i < fog.explored.length; i++) {
+    if (!fog.explored[i]) continue;
+    const tx = i % m.width;
+    const ty = (i / m.width) | 0;
+    g.fillRect(tx, ty, 1, 1);
+  }
+  // Видимое — туман убирается полностью.
+  g.fillStyle = 'rgba(0,0,0,1)';
+  for (let i = 0; i < fog.visible.length; i++) {
+    if (!fog.visible[i]) continue;
+    const tx = i % m.width;
+    const ty = (i / m.width) | 0;
+    g.fillRect(tx, ty, 1, 1);
+  }
+  g.globalCompositeOperation = 'source-over';
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1085,25 @@ function spawnSparkle(x, y) {
   }
 }
 
+/** Кольцо на месте применения способности. */
+function spawnAbilityMark(x, y, ability) {
+  const color = ability === ABILITY.AIR_STRIKE ? '#ff9f1c' : '#8ecae6';
+  for (let i = 0; i < 14; i++) {
+    const angle = (i / 14) * Math.PI * 2;
+    particles.push({
+      x,
+      y,
+      vx: Math.cos(angle) * 110,
+      vy: Math.sin(angle) * 110,
+      life: 0.5,
+      max: 0.5,
+      size: 3,
+      color,
+      gravity: 0,
+    });
+  }
+}
+
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
@@ -888,7 +1148,11 @@ function drawTiles(now) {
 
   for (let ty = y0; ty <= y1; ty++) {
     for (let tx = x0; tx <= x1; tx++) {
-      const v = m.tiles[ty * m.width + tx];
+      const idx = ty * m.width + tx;
+      // Видимые тайлы рисуем как есть, а исследованные — по «старому» виду,
+      // как в Age of Empires 2: устаревшая карта, без живых обновлений.
+      const live = fog.visible && fog.visible[idx];
+      const v = live ? m.tiles[idx] : fog.seen ? fog.seen[idx] : m.tiles[idx];
       const kind = v & 7;
       if (kind === TILE.EMPTY) continue;
       const damage = v >> 3;
@@ -909,6 +1173,11 @@ function drawTiles(now) {
 
 function drawPickups(pickups) {
   for (const p of pickups.values()) {
+    // Бонус виден только там, где игрок уже был.
+    if (fog.explored) {
+      const idx = tileIndexAt(p.x, p.y);
+      if (idx < 0 || !fog.explored[idx]) continue;
+    }
     const x = worldToScreenX(p.x);
     const y = worldToScreenY(p.y);
     const r = 9 * camera.zoom;
@@ -961,8 +1230,9 @@ function drawBullets(bullets) {
   for (const b of bullets.values()) {
     const x = worldToScreenX(b.x);
     const y = worldToScreenY(b.y);
-    const dx = DIR_DX[b.dir] ?? 0;
-    const dy = DIR_DY[b.dir] ?? 0;
+    const dir = aimDelta(b.dir);
+    const dx = dir.x;
+    const dy = dir.y;
     const size = 6 * camera.zoom;
 
     // След снаряда.
@@ -996,15 +1266,19 @@ function drawTank(p, opts = {}) {
   const y = worldToScreenY(p.y);
   const hue = opts.hue ?? 40;
   const level = p.level ?? 1;
+  const aim = p.aim ?? 4;
 
   ctx.save();
   // В чаще танк частично маскируется — становится полупрозрачным.
   ctx.globalAlpha = isInForest(p.x, p.y) ? (opts.self ? 0.62 : 0.45) : 1;
   ctx.translate(x + size / 2, y + size / 2);
-  ctx.rotate(ROT[p.dir] ?? 0);
 
   const half = size / 2;
   const trackW = size * 0.22;
+
+  // --- Корпус: крутится по направлению движения ---
+  ctx.save();
+  ctx.rotate(ROT[p.dir] ?? 0);
 
   // Гусеницы.
   ctx.fillStyle = '#16191d';
@@ -1017,25 +1291,32 @@ function drawTank(p, opts = {}) {
     ctx.fillRect(half - trackW, i + 3 * camera.zoom, trackW, 2 * camera.zoom);
   }
 
-  // Корпус.
+  // Кузов.
   ctx.fillStyle = `hsl(${hue}, 58%, 40%)`;
   ctx.fillRect(-half + trackW, -half + size * 0.14, size - trackW * 2, size * 0.82);
   ctx.fillStyle = `hsl(${hue}, 62%, 52%)`;
   ctx.fillRect(-half + trackW, -half + size * 0.14, size - trackW * 2, size * 0.16);
+  ctx.restore();
+
+  // --- Башня: крутится по курсору мыши, независимо от корпуса ---
+  ctx.save();
+  ctx.rotate(aim * (Math.PI / 8));
 
   // Стволы: на втором уровне появляется вторая пушка.
-  // Обе симметричны относительно продольной оси танка.
   ctx.fillStyle = `hsl(${hue}, 45%, 26%)`;
   if (level >= 2) {
-    ctx.fillRect(-size * 0.313, -half, size * 0.16, size * 0.34);
-    ctx.fillRect(size * 0.153, -half, size * 0.16, size * 0.34);
+    ctx.fillRect(0, -size * 0.19, size * 0.55, size * 0.12);
+    ctx.fillRect(0, size * 0.07, size * 0.55, size * 0.12);
   } else {
-    ctx.fillRect(-size * 0.1, -half, size * 0.2, size * 0.34);
+    ctx.fillRect(0, -size * 0.06, size * 0.55, size * 0.12);
   }
 
   // Башня.
   ctx.fillStyle = `hsl(${hue}, 66%, 56%)`;
-  ctx.fillRect(-size * 0.18, -half + size * 0.24, size * 0.36, size * 0.34);
+  ctx.fillRect(-size * 0.18, -size * 0.18, size * 0.36, size * 0.36);
+  ctx.fillStyle = `hsl(${hue}, 70%, 66%)`;
+  ctx.fillRect(-size * 0.1, -size * 0.1, size * 0.2, size * 0.2);
+  ctx.restore();
 
   ctx.restore();
   ctx.globalAlpha = 1;
@@ -1118,6 +1399,23 @@ function renderWorld(now) {
 
   drawTiles(now);
 
+  // Слой тумана: неисследованное закрыто, исследованное приглушено.
+  if (fog.canvas && state.map) {
+    const ts = state.map.tileSize;
+    ctx.imageSmoothingEnabled = false;
+    ctx.drawImage(
+      fog.canvas,
+      0,
+      0,
+      fog.canvas.width,
+      fog.canvas.height,
+      worldToScreenX(0),
+      worldToScreenY(0),
+      fog.canvas.width * ts * camera.zoom,
+      fog.canvas.height * ts * camera.zoom,
+    );
+  }
+
   const renderTime = performance.now() - INTERP_DELAY;
   const pair = interpolationPair(renderTime);
 
@@ -1129,6 +1427,9 @@ function renderWorld(now) {
 
     // --- Снаряды ---
     drawBullets(b.bullets);
+
+    // --- Способности в полёте ---
+    drawEffects(b.effects);
 
     // --- Танки ---
     for (const [id, pb] of b.players) {
@@ -1150,6 +1451,7 @@ function renderWorld(now) {
         x: pred.x + correction.x,
         y: pred.y + correction.y,
         dir: pred.dir,
+        aim: pred.aim,
         level: pred.level,
         hp: pred.hp,
         maxHp: pred.maxHp,
@@ -1161,6 +1463,111 @@ function renderWorld(now) {
   }
 
   drawParticles();
+  drawCursor();
+}
+
+/** Прицел и подсветка точки применения способности. */
+function drawCursor() {
+  if (!mouse.inside) return;
+  const x = mouse.sx;
+  const y = mouse.sy;
+
+  if (state.ability !== ABILITY.NONE) {
+    // Круг показывает радиус поражения выбранной способности.
+    const radius = (state.ability === ABILITY.MORTAR ? 48 : 66) * camera.zoom;
+    ctx.strokeStyle = 'rgba(255,159,28,0.65)';
+    ctx.setLineDash([6 * camera.zoom, 5 * camera.zoom]);
+    ctx.lineWidth = 1.5 * camera.zoom;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.strokeStyle = 'rgba(240,162,2,0.9)';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(x, y, 9, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(x - 15, y);
+  ctx.lineTo(x - 5, y);
+  ctx.moveTo(x + 5, y);
+  ctx.lineTo(x + 15, y);
+  ctx.moveTo(x, y - 15);
+  ctx.lineTo(x, y - 5);
+  ctx.moveTo(x, y + 5);
+  ctx.lineTo(x, y + 15);
+  ctx.stroke();
+}
+
+/**
+ * Рисует эффекты способностей: дуга миномёта и вызов авиаподдержки.
+ */
+function drawEffects(effects) {
+  if (!effects) return;
+  for (const e of effects.values()) {
+    const t = Math.max(0, Math.min(1, e.phase / 100));
+    if (e.kind === EFFECT.MORTAR) {
+      // Миномёт летит по дуге: горизонталь — по прямой, высота — по параболе.
+      const px = e.x + (e.x2 - e.x) * t;
+      const py = e.y + (e.y2 - e.y) * t;
+      const arc = Math.sin(Math.PI * t) * 90;
+      const sx = worldToScreenX(px);
+      const sy = worldToScreenY(py - arc);
+      const r = 5 * camera.zoom;
+
+      // Тень на земле — видно, куда летит снаряд.
+      ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+      ctx.setLineDash([4 * camera.zoom, 4 * camera.zoom]);
+      ctx.lineWidth = 1.5 * camera.zoom;
+      ctx.beginPath();
+      ctx.moveTo(worldToScreenX(e.x), worldToScreenY(e.y));
+      ctx.lineTo(worldToScreenX(e.x2), worldToScreenY(e.y2));
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Цель удара.
+      ctx.strokeStyle = 'rgba(142,202,230,0.75)';
+      ctx.lineWidth = 2 * camera.zoom;
+      ctx.beginPath();
+      ctx.arc(worldToScreenX(e.x2), worldToScreenY(e.y2), 16 * camera.zoom, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Снаряд.
+      ctx.fillStyle = '#e0fbfc';
+      ctx.beginPath();
+      ctx.arc(sx, sy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#14212b';
+      ctx.beginPath();
+      ctx.arc(sx, sy, r * 0.45, 0, Math.PI * 2);
+      ctx.fill();
+    } else if (e.kind === EFFECT.AIR_STRIKE) {
+      // Авиаподдержка: по точке сходится удар — рисуем сужающийся круг.
+      const cx = worldToScreenX(e.x);
+      const cy = worldToScreenY(e.y);
+      const radius = (14 + (1 - t) * 70) * camera.zoom;
+      ctx.strokeStyle = `rgba(255,159,28,${0.35 + t * 0.6})`;
+      ctx.lineWidth = 2.5 * camera.zoom;
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.fillStyle = `rgba(255,159,28,${0.12 + t * 0.25})`;
+      ctx.fill();
+      // Пикирующий самолёт.
+      if (t > 0.15) {
+        const drop = (1 - t) * 420 * camera.zoom;
+        ctx.fillStyle = '#ffd166';
+        ctx.beginPath();
+        ctx.moveTo(cx, cy - drop);
+        ctx.lineTo(cx - 7 * camera.zoom, cy - drop + 11 * camera.zoom);
+        ctx.lineTo(cx + 7 * camera.zoom, cy - drop + 11 * camera.zoom);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
 }
 
 /** Стабильный цвет танка по id. */
@@ -1182,6 +1589,80 @@ function updateStatus() {
   statScore.textContent = String(state.score);
   statKills.textContent = String(state.kills);
   statPing.textContent = state.pingSeen ? `${state.ping} мс` : '—';
+}
+
+/** Описания способностей для панели выбора. */
+const ABILITY_INFO = [
+  { id: ABILITY.NONE, key: '1', name: 'Пушка', desc: 'обычная стрельба' },
+  { id: ABILITY.MORTAR, key: '2', name: 'Миномёт', desc: 'через стены · урон 2' },
+  { id: ABILITY.AIR_STRIKE, key: '3', name: 'Авиаподдержка', desc: 'удар с воздуха · урон 3' },
+];
+
+/** Кэш кнопок панели способностей: id -> { el, cd }. */
+const abilityButtons = new Map();
+
+/** Создаёт кнопки выбора способности. */
+function buildAbilityBar() {
+  if (!abilityBar) return;
+  abilityBar.innerHTML = '';
+  abilityButtons.clear();
+  for (const info of ABILITY_INFO) {
+    const btn = document.createElement('button');
+    btn.className = 'ability';
+    btn.dataset.ability = String(info.id);
+    btn.type = 'button';
+
+    const key = document.createElement('span');
+    key.className = 'ability-key';
+    key.textContent = info.key;
+
+    const name = document.createElement('span');
+    name.className = 'ability-name';
+    name.textContent = info.name;
+
+    const desc = document.createElement('span');
+    desc.className = 'ability-desc';
+    desc.textContent = info.desc;
+
+    const cd = document.createElement('span');
+    cd.className = 'ability-cd';
+
+    btn.append(key, name, desc, cd);
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      selectAbility(info.id);
+    });
+    abilityBar.append(btn);
+    abilityButtons.set(info.id, { el: btn, cd });
+  }
+  renderAbilityBar();
+}
+
+/** Обновляет подсветку выбранной способности и остаток кулдауна. */
+function renderAbilityBar() {
+  if (abilityButtons.size === 0) return;
+  for (const [id, { el, cd }] of abilityButtons) {
+    el.classList.toggle('active', id === state.ability);
+    if (id === state.ability && state.abilityCd > 0) {
+      cd.textContent = `${(state.abilityCd / 30).toFixed(1)} с`;
+      cd.classList.add('cooling');
+    } else {
+      cd.textContent = '';
+      cd.classList.remove('cooling');
+    }
+  }
+}
+
+/** Подсказка под панелью способностей. */
+function updateAbilityHint() {
+  if (!abilityHint) return;
+  if (state.ability === ABILITY.NONE) {
+    abilityHint.textContent = 'Мышь — наводка башни · ЛКМ — огонь · ПКМ — способность';
+  } else if (state.ability === ABILITY.MORTAR) {
+    abilityHint.textContent = 'Миномёт: ПКМ по точке — перелетает стены';
+  } else {
+    abilityHint.textContent = 'Авиаподдержка: ПКМ по точке — удар с воздуха';
+  }
 }
 
 function renderLeaderboard() {
@@ -1210,6 +1691,13 @@ function renderMinimap() {
   const m = state.map;
   mctx.clearRect(0, 0, minimapCanvas.width, minimapCanvas.height);
   mctx.drawImage(terrainCanvas, 0, 0);
+
+  // Поверх рельефа — туман войны: неисследованное чёрное,
+  // исследованное приглушено, видимое — как есть.
+  if (fog.canvas) {
+    mctx.imageSmoothingEnabled = false;
+    mctx.drawImage(fog.canvas, 0, 0, minimapCanvas.width, minimapCanvas.height);
+  }
 
   // Бонусы.
   const snap = state.snapshots[state.snapshots.length - 1];
@@ -1245,6 +1733,8 @@ function renderMinimap() {
 let lastFrame = performance.now();
 let fpsAccum = 0;
 let fpsFrames = 0;
+/** Накопитель времени для пересчёта тумана войны. */
+let fogAccumulator = 0;
 
 function frame(now) {
   const dt = Math.min(0.1, (now - lastFrame) / 1000);
@@ -1272,8 +1762,31 @@ function frame(now) {
   correction.x *= Math.pow(0.0025, dt);
   correction.y *= Math.pow(0.0025, dt);
 
+  // Курсор мыши задаёт направление башни.
+  updateMouseWorld();
+  if (pred.active && mouse.inside) {
+    const cx = pred.x + correction.x + TANK_SIZE / 2;
+    const cy = pred.y + correction.y + TANK_SIZE / 2;
+    pred.aim = aimFromVector(mouse.x - cx, mouse.y - cy);
+  }
+
+  // Туман войны пересчитываем 30 раз в секунду — как тики сервера.
+  fogAccumulator += dt;
+  if (fogAccumulator >= TICK_DT) {
+    fogAccumulator = 0;
+    if (pred.active) {
+      const cx = pred.x + correction.x + TANK_SIZE / 2;
+      const cy = pred.y + correction.y + TANK_SIZE / 2;
+      updateVisibility(cx, cy, pred.aim);
+    } else if (state.focus.x || state.focus.y) {
+      updateVisibility(state.focus.x, state.focus.y, pred.aim);
+    }
+    paintFogLayer();
+  }
+
   updateParticles(dt);
   renderWorld(now);
+  renderAbilityBar();
 
   fpsAccum += dt;
   fpsFrames += 1;
@@ -1305,6 +1818,10 @@ function boot() {
   // Спрайты тайлов рисуем один раз в offscreen-холст.
   buildSprites();
 
+  // Панель выбора способности.
+  buildAbilityBar();
+  updateAbilityHint();
+
   resizeCanvas();
   window.addEventListener('resize', resizeCanvas);
 
@@ -1315,7 +1832,19 @@ function boot() {
   setInterval(() => {
     if (!state.connected) return;
     state.seq += 1;
-    send(encodeInput(state.seq, currentInput()));
+    const flags = currentInput();
+    send(
+      encodeInput(
+        state.seq,
+        flags,
+        pred.aim % AIM_COUNT,
+        state.ability,
+        mouse.x,
+        mouse.y,
+      ),
+    );
+    // Флаг применения способности одноразовый: отправлен — и сброшен.
+    if ((flags & BIT.USE) !== 0) state.pendingUse = false;
   }, 1000 / 30);
 
   // Пинг для измерения RTT.
