@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
 use crate::map::{
-    ramp_dir, ramp_index, GameMap, Rng, SpatialGrid, TileKind, CHUNK_TILES, LEVEL_GROUND,
-    LEVEL_UPPER, MAP_H, MAP_W, RAMP_DIR_NONE, RAMP_LEN, TILE_SIZE,
+    layer_elev, ramp_dir, ramp_high_layer, ramp_index, ramp_low_layer, GameMap, Rng, SpatialGrid,
+    TileKind, CHUNK_TILES, ELEV_GROUND, ELEV_UPPER, LAYER_GROUND, LAYER_PIT, LAYER_UPPER, MAP_H,
+    MAP_W, RAMP_DIR_NONE, RAMP_LEN, TILE_SIZE,
 };
 use crate::protocol::{
     self, BulletView, Direction, EffectView, GameEvent, InputFlags, LeaderboardEntry, PlayerView,
@@ -139,6 +140,22 @@ pub fn level_max_bullets(level: u8) -> usize {
 /// Максимальное здоровье для уровня прокачки.
 pub fn level_max_hp(level: u8) -> u8 {
     2 + level.clamp(1, 3)
+}
+
+/// Поражает ли настильный снаряд слоя `bullet_layer` танк слоя `target_layer`.
+///
+/// Правила высоты:
+///  - свой слой — всегда;
+///  - с возвышенности (`+1`) достаёт землю (`0`): снаряды не цепляются за
+///    края платформ, и сверху видно землю;
+///  - в ямку (`-1`) настильный огонь **не достаёт** ни с земли, ни сверху:
+///    попасть можно только навесным оружием (миномёт, авиаудар);
+///  - из ямки настильный огонь бьёт только внутри своей низины.
+pub fn flat_shot_hits(bullet_layer: u8, target_layer: u8) -> bool {
+    let bullet_elev = layer_elev(bullet_layer);
+    let target_elev = layer_elev(target_layer);
+    bullet_elev == target_elev
+        || (bullet_elev == ELEV_UPPER && target_elev == ELEV_GROUND)
 }
 
 // ---------------------------------------------------------------------------
@@ -317,6 +334,11 @@ pub struct GameConfig {
     pub min_population: usize,
     /// Максимум ботов.
     pub max_bots: usize,
+    /// Целевая численность ботов на карте.
+    ///
+    /// Боты держат карту живой: двадцать машин патрулируют и сходятся к
+    /// игроку неспешно, каждый со своим темпом.
+    pub bot_target: usize,
     /// Уровень сложности ботов.
     ///
     /// `None` — смешанный состав: часть ботов лёгкие, часть сложные.
@@ -336,6 +358,7 @@ impl Default for GameConfig {
             tile_size: TILE_SIZE,
             min_population: 20,
             max_bots: 24,
+            bot_target: 20,
             bot_skill: None,
             seed: 0x7A4C_1E55_D1CE_2026,
             profile: false,
@@ -367,6 +390,9 @@ impl GameConfig {
         }
         if let Some(v) = env_u64("TANCHIKI_MAX_BOTS") {
             cfg.max_bots = v as usize;
+        }
+        if let Some(v) = env_u64("TANCHIKI_BOT_COUNT") {
+            cfg.bot_target = v as usize;
         }
         if let Ok(v) = std::env::var("TANCHIKI_BOT_SKILL") {
             // `mixed` (по умолчанию) — состав ботов разный.
@@ -480,7 +506,7 @@ impl Tank {
             move_dir: Direction::Down,
             vel: 0.0,
             level,
-            deck: crate::map::LEVEL_GROUND,
+            deck: crate::map::LAYER_GROUND,
             ramp_dir: RAMP_DIR_NONE,
             ramp_index: 0,
             ramp_target: -1,
@@ -601,6 +627,13 @@ pub struct BotState {
     pub target_seen_at: u64,
     /// Ошибка наводки в шагах башни (1/16 оборота): у «лёгких» ботов больше.
     pub aim_error: i32,
+    /// Личный множитель скорости бота: 0.55..0.9 от базовой.
+    ///
+    /// Боты не должны наваливаться толпой: у каждого свой темп, поэтому
+    /// сходятся они неспешно и не одновременно.
+    pub speed_bias: f32,
+    /// Личная задержка реакции на цель в тиках.
+    pub react_delay: u64,
 }
 
 /// Игрок: человек или бот.
@@ -801,7 +834,7 @@ impl Game {
     }
 
     fn update_player_movement(&mut self, pid: u32) {
-        let (input, cur_move, level, vel, skill, aim) = {
+        let (input, cur_move, level, vel, skill, aim, bot_bias, bot_target_pos) = {
             let Some(player) = self.players.get(&pid) else {
                 return;
             };
@@ -809,6 +842,11 @@ impl Game {
                 return;
             };
             let skill = player.bot.as_ref().map(|b| b.skill);
+            let bias = player.bot.as_ref().map(|b| b.speed_bias).unwrap_or(1.0);
+            // Позиция цели бота: к ней он сближается.
+            let target_pos = player.bot.as_ref().and_then(|b| b.target).and_then(|tid| {
+                self.players.get(&tid).and_then(|p| p.tank.as_ref()).map(|t| t.center())
+            });
             (
                 player.input,
                 tank.move_dir,
@@ -816,6 +854,8 @@ impl Game {
                 tank.vel,
                 skill,
                 player.aim,
+                bias,
+                target_pos,
             )
         };
 
@@ -831,7 +871,20 @@ impl Game {
 
         let on_ice = self.is_on_ice(tank.x, tank.y, tank.deck);
         // Боты всегда медленнее игрока — иначе они ощущаются сильнее человека.
-        let speed_mult = skill.map(|s| s.speed_mult()).unwrap_or(1.0);
+        let mut speed_mult = skill.map(|s| s.speed_mult()).unwrap_or(1.0);
+        if skill.is_some() {
+            // Личный темп бота: у каждого своя скорость, поэтому сходятся они
+            // неспешно и не толпой.
+            speed_mult *= bot_bias;
+            // Медленное сближение: чем ближе цель, тем тише едем.
+            if let Some((tx, ty)) = bot_target_pos {
+                let dx = tx - (tank.x + TANK_SIZE * 0.5);
+                let dy = ty - (tank.y + TANK_SIZE * 0.5);
+                if (dx * dx + dy * dy).sqrt() < 260.0 {
+                    speed_mult *= 0.65;
+                }
+            }
+        }
         let speed = level_speed(level) * speed_mult;
         let accel = if on_ice { 220.0 } else { 1100.0 };
         let decel = if on_ice { 120.0 } else { 1800.0 };
@@ -933,12 +986,15 @@ impl Game {
         self.map.kind(tx, ty, deck).is_slippery()
     }
 
-    /// Следит за пандусом и переключает ярус в конце заезда.
+    /// Следит за пандусом и переключает слой в конце заезда.
     ///
-    /// Пандус — полоса из трёх тайлов: наклон от земли (нижний край, номер 0)
-    /// к верхней площадке (верхний край, номер 2). Снизу вверх танк меняет
-    /// ярус на верхнем краю полосы, сверху вниз — на нижнем. Переход выглядит
-    /// как спуск по пандусу, а не как мгновенный скачок между этажами.
+    /// Пандус — полоса из трёх тайлов: у полосы есть **низкая сторона**
+    /// (земля для подъёма, ямка для спуска) и **высокая**. Танк на низкой
+    /// стороне едет к краю высокой (номер 2) и там переходит на высокий слой;
+    /// на высокой стороне — наоборот, к краю низкой (номер 0).
+    ///
+    /// Так заезд работает и вверх, и вниз: полоса одна и та же, а переход
+    /// происходит на её краю — выглядит как спуск, а не как скачок между этажами.
     fn update_deck(&mut self, tank: &mut Tank) {
         let (tx, ty) = self.map.tile_at(tank.x + TANK_SIZE * 0.5, tank.y + TANK_SIZE * 0.5);
         if !self.map.is_ramp(tx, ty, tank.deck) {
@@ -962,21 +1018,26 @@ impl Game {
             // счётчик переключений сбрасываем.
             tank.ramp_switched = false;
         }
-        // Цель перехода задаёт этаж, а не направление езда: снизу вверх —
-        // верхний край полосы, сверху вниз — нижний. Полоса всегда идёт от
-        // земли к площадке, поэтому и заезд сбоку сразу знает, где переход.
-        tank.ramp_target = if tank.deck == LEVEL_GROUND {
+        // Цель перехода задаёт сторона полосы, а не направление езда: на низкой
+        // стороне цель — край высокой, на высокой — край низкой.
+        let low = ramp_low_layer(value);
+        let high = ramp_high_layer(value);
+        tank.ramp_target = if tank.deck == low {
             RAMP_LEN as i8 - 1
         } else {
             0
         };
-        if idx as i8 == tank.ramp_target && !tank.ramp_switched {
-            let next = if tank.deck == LEVEL_GROUND {
-                LEVEL_UPPER
-            } else {
-                LEVEL_GROUND
-            };
-            // Переключаемся только если на новом ярусе тоже можно стоять.
+        // Переход — только если танк реально проехал полосу: въехал с одного
+        // края и доехал до другого. Поэтому перед крайним тайлом полосы должен
+        // быть средний: наехать сбоку на край пандуса — не переход, иначе
+        // игрок «проваливался» на другой уровень без заезда.
+        let prev_index = tank.ramp_index as i8;
+        if idx as i8 == tank.ramp_target
+            && prev_index == RAMP_LEN as i8 - 2
+            && !tank.ramp_switched
+        {
+            let next = if tank.deck == low { high } else { low };
+            // Переключаемся только если на новом слое тоже можно стоять.
             if self.map.rect_is_free(tank.x, tank.y, TANK_SIZE, next) {
                 tank.deck = next;
                 tank.ramp_switched = true;
@@ -1153,8 +1214,9 @@ impl Game {
 
     /// Взрыв в точке: урон по танкам в радиусе и разрушение кирпича.
     ///
-    /// Взрыв действует только на своём ярусе: перекрытие этажей не даёт
-    /// ударить танк внизу.
+    /// Взрыв — **навесное** оружие: он достаёт танки на любой высоте
+    /// (в том числе в ямке, куда настильный огонь не дотягивается) и
+    /// разрушает кирпич на всех слоях.
     fn explode(&mut self, x: f32, y: f32, radius: f32, damage: u8, owner: u32, deck: u8) {
         let r2 = radius * radius;
         let hit: Vec<u32> = self
@@ -1162,9 +1224,6 @@ impl Game {
             .iter()
             .filter(|(_, p)| {
                 p.tank.as_ref().is_some_and(|t| {
-                    if t.deck != deck {
-                        return false;
-                    }
                     let (cx, cy) = t.center();
                     let dx = cx - x;
                     let dy = cy - y;
@@ -1177,7 +1236,8 @@ impl Game {
             self.apply_damage(id, damage, owner);
         }
 
-        // Кирпичные стены рядом с эпицентром получают повреждения.
+        // Кирпичные стены рядом с эпицентром получают повреждения — на всех
+        // слоях: взрыв бьёт и сквозь настил моста, и сквозь стенку ямки.
         let (tx0, ty0) = self.map.tile_at(x - radius, y - radius);
         let (tx1, ty1) = self.map.tile_at(x + radius, y + radius);
         for ty in ty0..=ty1 {
@@ -1189,8 +1249,10 @@ impl Game {
                 if dx * dx + dy * dy > r2 {
                     continue;
                 }
-                if self.map.kind(tx, ty, deck) == crate::map::TileKind::Brick {
-                    self.hit_tile(tx, ty, 3, damage, owner, deck);
+                for layer in [LAYER_GROUND, LAYER_UPPER, LAYER_PIT] {
+                    if self.map.kind(tx, ty, layer) == crate::map::TileKind::Brick {
+                        self.hit_tile(tx, ty, 3, damage, owner, layer);
+                    }
                 }
             }
         }
@@ -1264,8 +1326,13 @@ impl Game {
 
     /// Ищет танк, задетый снарядом.
     ///
-    /// Попасть можно только в танк на том же ярусе: стены верхнего этажа
-    /// не пуляют снизу.
+    /// Правила настильного огня по высоте:
+    ///  - снаряд бьёт танк на своём слое;
+    ///  - снаряд с возвышенности (`+1`) достаёт землю (`0`) — преимущество
+    ///    высоты, снаряды не цепляются за края платформ;
+    ///  - настильный огонь **не достаёт** до ямки (`-1`): из низины и с
+    ///    возвышенности попасть можно только навесным оружием;
+    ///  - из ямки настильный огонь бьёт только внутри своей низины.
     fn find_tank_hit(&self, b: &Bullet) -> Option<u32> {
         let bx = b.x - BULLET_SIZE * 0.5;
         let by = b.y - BULLET_SIZE * 0.5;
@@ -1276,7 +1343,7 @@ impl Game {
             let Some(tank) = player.tank.as_ref() else {
                 continue;
             };
-            if tank.deck != b.deck {
+            if !flat_shot_hits(b.deck, tank.deck) {
                 continue;
             }
             if aabb_overlap(bx, by, BULLET_SIZE, BULLET_SIZE, tank.x, tank.y, TANK_SIZE, TANK_SIZE) {
@@ -1477,8 +1544,8 @@ impl Game {
         for _ in 0..64 {
             let tx = self.rng.range(2, self.cfg.map_w.saturating_sub(2));
             let ty = self.rng.range(2, self.cfg.map_h.saturating_sub(2));
-            if self.map.blocks_tank(tx, ty, LEVEL_GROUND)
-                || self.map.kind(tx, ty, LEVEL_GROUND) == TileKind::Forest
+            if self.map.blocks_tank(tx, ty, LAYER_GROUND)
+                || self.map.kind(tx, ty, LAYER_GROUND) == TileKind::Forest
             {
                 continue;
             }
@@ -1487,7 +1554,7 @@ impl Game {
             let cy = ty as f32 * TILE_SIZE + TILE_SIZE * 0.5;
             let occupied = self.players.values().any(|p| {
                 p.tank.as_ref().is_some_and(|t| {
-                    t.deck == LEVEL_GROUND && (t.x - cx).abs() < 48.0 && (t.y - cy).abs() < 48.0
+                    t.deck == LAYER_GROUND && (t.x - cx).abs() < 48.0 && (t.y - cy).abs() < 48.0
                 })
             });
             if occupied {
@@ -1506,7 +1573,7 @@ impl Game {
             45..=74 => PickupKind::Shield,
             _ => PickupKind::Repair,
         };
-        self.spawn_pickup_at(x, y, kind, LEVEL_GROUND);
+        self.spawn_pickup_at(x, y, kind, LAYER_GROUND);
     }
 
     // -----------------------------------------------------------------------
@@ -1552,6 +1619,7 @@ impl Game {
         // Пересчитываем маршрут к цели.
         if replan {
             let mut path: Vec<(u32, u32)> = Vec::new();
+            let mut crowded = false;
             if let Some(tid) = target {
                 let goal = self
                     .players
@@ -1560,17 +1628,26 @@ impl Game {
                     .filter(|t| t.deck == deck)
                     .map(|t| self.map.tile_at(t.x + TANK_SIZE * 0.5, t.y + TANK_SIZE * 0.5));
                 if let Some(goal) = goal {
-                    path = self
-                        .find_path(
-                            self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5),
-                            goal,
-                            deck,
-                        )
-                        .unwrap_or_default();
+                    // Личное пространство: если у цели уже скопились другие
+                    // боты, бот не лезет в толпу — он держит дистанцию.
+                    let goal_center = (
+                        goal.0 as f32 * crate::map::TILE_SIZE + crate::map::TILE_SIZE * 0.5,
+                        goal.1 as f32 * crate::map::TILE_SIZE + crate::map::TILE_SIZE * 0.5,
+                    );
+                    crowded = self.crowd_near(goal_center.0, goal_center.1, 220.0, pid) >= 3;
+                    if !crowded {
+                        path = self
+                            .find_path(
+                                self.map.tile_at(bx + TANK_SIZE * 0.5, by + TANK_SIZE * 0.5),
+                                goal,
+                                deck,
+                            )
+                            .unwrap_or_default();
+                    }
                 }
             }
             // Цели нет — бот бродит по карте, чтобы мир не выглядел мёртвым.
-            if path.is_empty() && target.is_none() {
+            if path.is_empty() && (target.is_none() || crowded) {
                 path = self.wander_path(bx, by, deck);
             }
             if let Some(player) = self.players.get_mut(&pid) {
@@ -1630,7 +1707,15 @@ impl Game {
                         .and_then(|p| p.bot.as_ref())
                         .map(|b| b.target_seen_at)
                         .unwrap_or(now);
-                    if now >= seen_at + skill.reaction_ticks() {
+                    // Реакция бota: сложность плюс личная задержка — боты
+                    // реагируют не одновременно.
+                    let react_delay = self
+                        .players
+                        .get(&pid)
+                        .and_then(|p| p.bot.as_ref())
+                        .map(|b| b.react_delay)
+                        .unwrap_or(0);
+                    if now >= seen_at + skill.reaction_ticks() + react_delay {
                         input.fire = true;
                     }
                 }
@@ -1679,6 +1764,25 @@ impl Game {
                 player.aim = a;
             }
         }
+    }
+
+    /// Сколько ботов скопилось вокруг точки.
+    ///
+    /// Правило личного пространства: если рядом с целью уже много ботов,
+    /// новый не лезет — иначе на игрока наваливаются все разом.
+    fn crowd_near(&self, x: f32, y: f32, radius: f32, except: u32) -> usize {
+        self.players
+            .values()
+            .filter(|p| p.is_bot && p.id != except && p.removal_at.is_none())
+            .filter(|p| {
+                p.tank.as_ref().is_some_and(|t| {
+                    let (cx, cy) = t.center();
+                    let dx = cx - x;
+                    let dy = cy - y;
+                    dx * dx + dy * dy <= radius * radius
+                })
+            })
+            .count()
     }
 
     /// Случайный маршрут для блуждания, когда поблизости нет цели.
@@ -1836,11 +1940,6 @@ impl Game {
     // -----------------------------------------------------------------------
 
     fn maintain_population(&mut self) {
-        let humans = self
-            .players
-            .values()
-            .filter(|p| !p.is_bot && p.removal_at.is_none())
-            .count();
         let bots: Vec<u32> = self
             .players
             .values()
@@ -1848,11 +1947,9 @@ impl Game {
             .map(|p| p.id)
             .collect();
 
-        let desired = self
-            .cfg
-            .min_population
-            .saturating_sub(humans)
-            .min(self.cfg.max_bots);
+        // Целевая численность ботов: держим карту живой, но не наваливаем
+        // толпой — каждый бот идёт к игроку со своим темпом.
+        let desired = self.cfg.bot_target.min(self.cfg.max_bots);
 
         if bots.len() < desired {
             self.spawn_bot();
@@ -1925,7 +2022,10 @@ impl Game {
                 _ => BotSkill::Hard,
             },
         };
-        self.players.insert(
+        // Личный характер бота: свой темп и своя задержка реакции. Благодаря
+        // этому двадцать ботов сходятся к игроку неспешно и не разом.
+        let speed_bias = 0.55 + self.rng.unit() * 0.35;
+        let react_delay: u64 = 4 + self.rng.below(22) as u64;        self.players.insert(
             id,
             Player {
                 id,
@@ -1957,6 +2057,8 @@ impl Game {
                     skill,
                     target_seen_at: 0,
                     aim_error: 0,
+                    speed_bias,
+                    react_delay,
                 }),
                 removal_at: None,
             },
@@ -2383,7 +2485,7 @@ impl Game {
             .tank
             .as_ref()
             .map(|t| (t.aim, true, t.deck))
-            .unwrap_or((0, false, LEVEL_GROUND));
+            .unwrap_or((0, false, LAYER_GROUND));
 
         // --- Танки ---
         for pid in self.player_grid.query(cx0, cy0, cx1, cy1) {
@@ -2441,10 +2543,35 @@ impl Game {
         }
 
         // --- Снаряды ---
+        // Свои выстрелы приходят всегда: их не должен терять ни фильтр
+        // чанков, ни конус обзора — игрок видит свой залп целиком.
+        let own: Vec<u32> = self
+            .bullets
+            .iter()
+            .filter(|(_, b)| b.owner == viewer_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for bid in own {
+            let Some(bullet) = self.bullets.get(&bid) else {
+                continue;
+            };
+            snap.bullets.push(BulletView {
+                id: bullet.id,
+                x: bullet.x,
+                y: bullet.y,
+                dir: bullet.dir,
+                deck: bullet.deck,
+                level: bullet.level,
+            });
+        }
         for bid in self.bullet_grid.query(cx0, cy0, cx1, cy1) {
             let Some(bullet) = self.bullets.get(&bid) else {
                 continue;
             };
+            if bullet.owner == viewer_id {
+                // Свой снаряд уже добавлен выше.
+                continue;
+            }
             if bullet.deck != viewer_deck {
                 continue;
             }
@@ -2716,6 +2843,7 @@ mod tests {
             tile_size: TILE_SIZE,
             min_population: 0,
             max_bots: 0,
+            bot_target: 0,
             seed: 1234,
             profile: false,
             bot_skill: None,
@@ -2818,7 +2946,7 @@ mod tests {
                         y: ty,
                         kind: PickupKind::Star,
                         expires_at: u64::MAX,
-                        deck: LEVEL_GROUND,
+                        deck: LAYER_GROUND,
                     },
                 );
             }
@@ -2924,7 +3052,7 @@ mod tests {
             .and_then(|p| p.tank.as_ref())
             .map(|t| (t.x, t.y))
             .expect("tank");
-        assert!(game.map.rect_is_free(start.0, start.1, TANK_SIZE, LEVEL_GROUND));
+        assert!(game.map.rect_is_free(start.0, start.1, TANK_SIZE, LAYER_GROUND));
 
         // Долгий проход вправо не должен вывести танк за пределы карты.
         for _ in 0..600 {
@@ -2944,26 +3072,26 @@ mod tests {
     fn bullets_damage_bricks_and_bricks_have_damage_stages() {
         let mut game = test_game();
         // Ставим кирпич в известное место.
-        game.map.set_kind(10, 10, LEVEL_GROUND, TileKind::Brick);
+        game.map.set_kind(10, 10, LAYER_GROUND, TileKind::Brick);
         let owner = 1u32;
-        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
-        assert_eq!(game.map.damage(10, 10, LEVEL_GROUND), 1);
-        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
-        assert_eq!(game.map.damage(10, 10, LEVEL_GROUND), 2);
+        game.hit_tile(10, 10, 1, 1, owner, LAYER_GROUND);
+        assert_eq!(game.map.damage(10, 10, LAYER_GROUND), 1);
+        game.hit_tile(10, 10, 1, 1, owner, LAYER_GROUND);
+        assert_eq!(game.map.damage(10, 10, LAYER_GROUND), 2);
         // Четыре попадания — кирпич разрушен.
-        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
-        game.hit_tile(10, 10, 1, 1, owner, LEVEL_GROUND);
-        assert_eq!(game.map.kind(10, 10, LEVEL_GROUND), TileKind::Empty);
+        game.hit_tile(10, 10, 1, 1, owner, LAYER_GROUND);
+        game.hit_tile(10, 10, 1, 1, owner, LAYER_GROUND);
+        assert_eq!(game.map.kind(10, 10, LAYER_GROUND), TileKind::Empty);
     }
 
     #[test]
     fn steel_survives_normal_bullets_and_dies_from_level_three() {
         let mut game = test_game();
-        game.map.set_kind(12, 12, LEVEL_GROUND, TileKind::Steel);
-        game.hit_tile(12, 12, 1, 1, 1, LEVEL_GROUND);
-        assert_eq!(game.map.kind(12, 12, LEVEL_GROUND), TileKind::Steel);
-        game.hit_tile(12, 12, 3, 3, 1, LEVEL_GROUND);
-        assert_eq!(game.map.kind(12, 12, LEVEL_GROUND), TileKind::Empty);
+        game.map.set_kind(12, 12, LAYER_GROUND, TileKind::Steel);
+        game.hit_tile(12, 12, 1, 1, 1, LAYER_GROUND);
+        assert_eq!(game.map.kind(12, 12, LAYER_GROUND), TileKind::Steel);
+        game.hit_tile(12, 12, 3, 3, 1, LAYER_GROUND);
+        assert_eq!(game.map.kind(12, 12, LAYER_GROUND), TileKind::Empty);
     }
 
     #[test]
@@ -2982,7 +3110,7 @@ mod tests {
     #[test]
     fn population_is_filled_with_bots() {
         let mut cfg = test_game().cfg;
-        cfg.min_population = 5;
+        cfg.bot_target = 5;
         cfg.max_bots = 5;
         let mut game = Game::new(cfg);
         for _ in 0..10 {
@@ -2993,9 +3121,22 @@ mod tests {
     }
 
     #[test]
-    fn bots_are_removed_when_humans_join() {
+    fn twenty_bots_cover_the_map() {
         let mut cfg = test_game().cfg;
-        cfg.min_population = 4;
+        cfg.bot_target = 20;
+        cfg.max_bots = 24;
+        let mut game = Game::new(cfg);
+        for _ in 0..40 {
+            game.tick();
+        }
+        let bots = game.players.values().filter(|p| p.is_bot).count();
+        assert_eq!(bots, 20, "на карте должно быть 20 ботов");
+    }
+
+    #[test]
+    fn bots_stay_when_humans_join() {
+        let mut cfg = test_game().cfg;
+        cfg.bot_target = 4;
         cfg.max_bots = 4;
         let mut game = Game::new(cfg);
         for _ in 0..5 {
@@ -3008,8 +3149,9 @@ mod tests {
         for _ in 0..80 {
             game.tick();
         }
-        // Боты уходят плавно, но в итоге population = 4.
-        assert_eq!(game.players.len(), 4);
+        // Боты держат численность: карта остаётся живой, и человек — не единственный.
+        assert_eq!(game.players.values().filter(|p| p.is_bot).count(), 4);
+        assert!(game.players.values().any(|p| !p.is_bot));
     }
 
     #[test]
@@ -3028,12 +3170,12 @@ mod tests {
             .and_then(|p| p.tank.as_ref())
             .map(|t| t.center())
             .expect("center");
-        game.spawn_pickup_at(center.0, center.1, PickupKind::Repair, LEVEL_GROUND);
+        game.spawn_pickup_at(center.0, center.1, PickupKind::Repair, LAYER_GROUND);
         game.update_pickups();
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("tank");
         assert_eq!(tank.hp, tank.max_hp);
 
-        game.spawn_pickup_at(center.0, center.1, PickupKind::Star, LEVEL_GROUND);
+        game.spawn_pickup_at(center.0, center.1, PickupKind::Star, LAYER_GROUND);
         game.update_pickups();
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("tank");
         assert_eq!(tank.level, 2);
@@ -3051,17 +3193,23 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Расчищает прямоугольник тайлов — чтобы тест не зависел от карты.
+    ///
+    /// На верхнем ярусе пустота — пропасть, поэтому «расчищенные» тайлы
+    /// помечаются настилом: по ним можно ездить.
     fn clear_tiles(game: &mut Game, x0: u32, y0: u32, x1: u32, y1: u32, deck: u8) {
         for ty in y0..=y1 {
             for tx in x0..=x1 {
                 game.map.set_kind(tx, ty, deck, TileKind::Empty);
+                if deck == LAYER_UPPER {
+                    game.map.set_deck(tx, ty, false);
+                }
             }
         }
     }
 
     /// Ставит танк игрока в заданную точку: без стен, без защиты при спавне.
     fn place_tank(game: &mut Game, pid: u32, x: f32, y: f32, aim: u8) {
-        place_tank_on(game, pid, x, y, aim, LEVEL_GROUND);
+        place_tank_on(game, pid, x, y, aim, LAYER_GROUND);
     }
 
     /// Ставит танк игрока на нужный ярус.
@@ -3092,11 +3240,11 @@ mod tests {
     /// к верхнему.
     fn place_ramp_strip(game: &mut Game, x0: u32, y0: u32, dir: u8) {
         let (dx, dy) = ramp_dir_delta(dir);
-        for level in [LEVEL_GROUND, LEVEL_UPPER] {
+        for level in [LAYER_GROUND, LAYER_UPPER] {
             for k in 0..RAMP_LEN {
                 let tx = (x0 as i64 + dx as i64 * k as i64) as u32;
                 let ty = (y0 as i64 + dy as i64 * k as i64) as u32;
-                game.map.set_value(tx, ty, level, ramp_value(dir, k));
+                game.map.set_value(tx, ty, level, ramp_value(dir, k, false));
             }
         }
     }
@@ -3106,8 +3254,8 @@ mod tests {
     /// Нижний край полосы — тайл (10, 10), верхний — на два тайла дальше в
     /// направлении подъёма.
     fn prepare_ramp(game: &mut Game, dir: u8) {
-        clear_tiles(game, 8, 8, 16, 12, LEVEL_GROUND);
-        clear_tiles(game, 8, 8, 16, 12, LEVEL_UPPER);
+        clear_tiles(game, 8, 8, 16, 12, LAYER_GROUND);
+        clear_tiles(game, 8, 8, 16, 12, LAYER_UPPER);
         place_ramp_strip(game, 10, 10, dir);
     }
 
@@ -3161,7 +3309,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 2, 2, 20, 20, LEVEL_GROUND);
+        clear_tiles(&mut game, 2, 2, 20, 20, LAYER_GROUND);
         // Корпус смотрит вниз, башня — вправо.
         place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
 
@@ -3197,7 +3345,7 @@ mod tests {
         game.join_player(viewer, "A".into());
         game.join_player(behind, "B".into());
         game.join_player(ahead, "C".into());
-        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
+        clear_tiles(&mut game, 0, 6, 30, 14, LAYER_GROUND);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
@@ -3231,8 +3379,8 @@ mod tests {
         place_tank(&mut game, pid, x, y, 0);
         place_tank(&mut game, victim, x + 150.0, y, 0);
         // Между стрелком и целью — стена: миномёт её перелетает.
-        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
-        game.map.set_kind(13, 10, LEVEL_GROUND, TileKind::Steel);
+        clear_tiles(&mut game, 8, 9, 12, 11, LAYER_GROUND);
+        game.map.set_kind(13, 10, LAYER_GROUND, TileKind::Steel);
 
         let hp_before = game
             .players
@@ -3278,7 +3426,7 @@ mod tests {
         let victim = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
         game.join_player(victim, "B".into());
-        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
+        clear_tiles(&mut game, 8, 9, 12, 11, LAYER_GROUND);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
@@ -3338,7 +3486,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 8, 9, 12, 11, LEVEL_GROUND);
+        clear_tiles(&mut game, 8, 9, 12, 11, LAYER_GROUND);
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
         place_tank(&mut game, pid, x, y, 0);
@@ -3397,7 +3545,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 8, 9, 16, 11, LEVEL_GROUND);
+        clear_tiles(&mut game, 8, 9, 16, 11, LAYER_GROUND);
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
         place_tank(&mut game, pid, x, y, 0);
@@ -3440,7 +3588,7 @@ mod tests {
         let shooter = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(viewer, "A".into());
         game.join_player(shooter, "B".into());
-        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
+        clear_tiles(&mut game, 0, 6, 30, 14, LAYER_GROUND);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
@@ -3490,7 +3638,7 @@ mod tests {
             game.tick();
             let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
             if tank.center().0 >= 12.0 * TILE_SIZE {
-                assert_eq!(tank.deck, LEVEL_UPPER, "проезд по пандусу меняет ярус");
+                assert_eq!(tank.deck, LAYER_UPPER, "проезд по пандусу меняет ярус");
                 return;
             }
         }
@@ -3519,16 +3667,16 @@ mod tests {
             match idx {
                 // На нижнем и среднем тайле ярус ещё не меняется.
                 0 | 1 => assert_eq!(
-                    tank.deck, LEVEL_GROUND,
+                    tank.deck, LAYER_GROUND,
                     "внутри пандуса ярус меняться не должен"
                 ),
                 // На верхнем тайле — переход на верхний этаж.
                 _ => assert_eq!(
-                    tank.deck, LEVEL_UPPER,
+                    tank.deck, LAYER_UPPER,
                     "на верхнем тайле пандуса ярус меняется"
                 ),
             }
-            if tank.deck == LEVEL_UPPER {
+            if tank.deck == LAYER_UPPER {
                 break;
             }
         }
@@ -3553,7 +3701,7 @@ mod tests {
             12.0 * TILE_SIZE,
             10.0 * TILE_SIZE,
             0,
-            LEVEL_UPPER,
+            LAYER_UPPER,
         );
         send_input(&mut game, 1, 1, input_towards(RAMP_DIR_LEFT));
 
@@ -3568,16 +3716,16 @@ mod tests {
             match idx {
                 // На верхнем и среднем тайле ярус ещё не меняется.
                 1 | 2 => assert_eq!(
-                    tank.deck, LEVEL_UPPER,
+                    tank.deck, LAYER_UPPER,
                     "внутри пандуса ярус меняться не должен"
                 ),
                 // На нижнем тайле — переход на землю.
                 _ => assert_eq!(
-                    tank.deck, LEVEL_GROUND,
+                    tank.deck, LAYER_GROUND,
                     "на нижнем тайле пандуса ярус меняется вниз"
                 ),
             }
-            if tank.deck == LEVEL_GROUND {
+            if tank.deck == LAYER_GROUND {
                 break;
             }
         }
@@ -3605,7 +3753,7 @@ mod tests {
         for _ in 0..300 {
             game.tick();
             let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
-            if tank.deck == LEVEL_UPPER {
+            if tank.deck == LAYER_UPPER {
                 switched = true;
                 break;
             }
@@ -3629,7 +3777,7 @@ mod tests {
             game.tick();
         }
         let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
-        assert_eq!(tank.deck, LEVEL_UPPER, "ярус не должен вернуться назад");
+        assert_eq!(tank.deck, LAYER_UPPER, "ярус не должен вернуться назад");
         assert_eq!(tank.ramp_dir, RAMP_DIR_RIGHT, "направление полосы сохранено");
         assert!(tank.ramp_switched, "состояние заезда не должно сбрасываться");
     }
@@ -3654,7 +3802,7 @@ mod tests {
                 let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
                 if ramp_index_under(&game, tank) == Some(RAMP_LEN - 1) {
                     assert_eq!(
-                        tank.deck, LEVEL_UPPER,
+                        tank.deck, LAYER_UPPER,
                         "подъём по пандусу направления {dir} должен сменить ярус"
                     );
                     up = true;
@@ -3677,7 +3825,7 @@ mod tests {
                 top_x * TILE_SIZE,
                 top_y * TILE_SIZE,
                 0,
-                LEVEL_UPPER,
+                LAYER_UPPER,
             );
             send_input(&mut game, 1, 1, input_towards(opposite_dir(dir)));
             let mut down = false;
@@ -3686,7 +3834,7 @@ mod tests {
                 let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
                 if ramp_index_under(&game, tank) == Some(0) {
                     assert_eq!(
-                        tank.deck, LEVEL_GROUND,
+                        tank.deck, LAYER_GROUND,
                         "спуск по пандусу направления {dir} должен сменить ярус"
                     );
                     down = true;
@@ -3698,28 +3846,55 @@ mod tests {
     }
 
     #[test]
-    fn ramp_on_the_bottom_edge_switches_to_the_ground_deck_at_once() {
+    fn ramp_switches_the_deck_only_after_the_strip_was_driven_through() {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
         prepare_ramp(&mut game, RAMP_DIR_RIGHT);
 
-        // Танк на верхнем ярусе стоит на нижнем краю полосы — он уже внизу.
+        // Танк на верхнем ярусе стоит на нижнем краю полосы — но он не проехал
+        // полосу, поэтому ярус не меняется: наезд сбоку переходом не считается.
         place_tank_on(
             &mut game,
             pid,
             10.0 * TILE_SIZE,
             10.0 * TILE_SIZE,
             0,
-            LEVEL_UPPER,
+            LAYER_UPPER,
         );
         game.tick();
+        {
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            assert_eq!(
+                tank.deck, LAYER_UPPER,
+                "наезд сбоку на край полосы ярус не меняет"
+            );
+        }
 
-        let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
-        assert_eq!(
-            tank.deck, LEVEL_GROUND,
-            "нижний край полосы — это уже земля"
+        // А вот проезд по полосе — переход: на нижнем краю ярус меняется.
+        place_tank_on(
+            &mut game,
+            pid,
+            12.0 * TILE_SIZE,
+            10.0 * TILE_SIZE,
+            0,
+            LAYER_UPPER,
         );
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_LEFT));
+        let mut down = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if ramp_index_under(&game, tank) == Some(0) {
+                assert_eq!(
+                    tank.deck, LAYER_GROUND,
+                    "спуск по пандусу должен сменить ярус"
+                );
+                down = true;
+                break;
+            }
+        }
+        assert!(down, "танк должен доехать до низа полосы");
     }
 
     #[test]
@@ -3735,7 +3910,7 @@ mod tests {
         {
             let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
             assert_eq!(
-                tank.deck, LEVEL_GROUND,
+                tank.deck, LAYER_GROUND,
                 "на среднем тайле ярус ещё не меняется"
             );
         }
@@ -3749,14 +3924,14 @@ mod tests {
             match ramp_index_under(&game, tank) {
                 Some(2) => {
                     assert_eq!(
-                        tank.deck, LEVEL_UPPER,
+                        tank.deck, LAYER_UPPER,
                         "на верхнем тайле пандуса ярус меняется"
                     );
                     switched = true;
                     break;
                 }
                 _ => assert_eq!(
-                    tank.deck, LEVEL_GROUND,
+                    tank.deck, LAYER_GROUND,
                     "внутри пандуса ярус меняться не должен"
                 ),
             }
@@ -3786,7 +3961,7 @@ mod tests {
         assert!(left, "танк должен выехать с пандуса");
         {
             let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
-            assert_eq!(tank.deck, LEVEL_UPPER, "подъём по пандусу сменил ярус");
+            assert_eq!(tank.deck, LAYER_UPPER, "подъём по пандусу сменил ярус");
             assert_eq!(
                 tank.ramp_dir, RAMP_DIR_NONE,
                 "после схода с пандуса заезд сброшен"
@@ -3803,7 +3978,7 @@ mod tests {
             let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
             if ramp_index_under(&game, tank) == Some(0) {
                 assert_eq!(
-                    tank.deck, LEVEL_GROUND,
+                    tank.deck, LAYER_GROUND,
                     "спуск по пандусу снова меняет ярус"
                 );
                 down = true;
@@ -3820,14 +3995,14 @@ mod tests {
         let foe = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(viewer, "A".into());
         game.join_player(foe, "B".into());
-        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_GROUND);
-        clear_tiles(&mut game, 0, 6, 30, 14, LEVEL_UPPER);
+        clear_tiles(&mut game, 0, 6, 30, 14, LAYER_GROUND);
+        clear_tiles(&mut game, 0, 6, 30, 14, LAYER_UPPER);
 
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
-        place_tank_on(&mut game, viewer, x, y, 0, LEVEL_GROUND);
+        place_tank_on(&mut game, viewer, x, y, 0, LAYER_GROUND);
         // Противник прямо перед наблюдателем, но этажом выше.
-        place_tank_on(&mut game, foe, x + 200.0, y, 0, LEVEL_UPPER);
+        place_tank_on(&mut game, foe, x + 200.0, y, 0, LAYER_UPPER);
 
         game.tick();
         let snap = game.snapshot_for(viewer).expect("снимок");
@@ -3846,7 +4021,7 @@ mod tests {
         let mut game = test_game();
         let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
         game.join_player(pid, "A".into());
-        clear_tiles(&mut game, 8, 9, 16, 11, LEVEL_GROUND);
+        clear_tiles(&mut game, 8, 9, 16, 11, LAYER_GROUND);
         let x = 10.0 * TILE_SIZE;
         let y = 10.0 * TILE_SIZE;
         place_tank(&mut game, pid, x, y, 0);
@@ -3872,5 +4047,187 @@ mod tests {
             me.airstrike_cd, 0,
             "кулдаун авиаподдержки тоже присылается всегда"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Три уровня высот: ямки, земля, возвышенности
+    // -----------------------------------------------------------------------
+
+    /// Ставит спускной пандус в ямку: край земли, откос, дно.
+    ///
+    /// Полоса идёт сверху вниз: верхний тайл — ещё на уровне земли, нижний —
+    /// уже на дне ямки.
+    fn place_pit_ramp(game: &mut Game, x0: u32, y0: u32) {
+        for k in 0..RAMP_LEN {
+            let value = ramp_value(RAMP_DIR_UP, RAMP_LEN - 1 - k, true);
+            game.map.set_value(x0, y0 + k as u32, LAYER_GROUND, value);
+            game.map.set_value(x0, y0 + k as u32, LAYER_PIT, value);
+        }
+    }
+
+    #[test]
+    fn pit_ramp_takes_the_tank_down_and_back() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 8, 16, 18, LAYER_GROUND);
+        clear_tiles(&mut game, 8, 8, 16, 18, LAYER_PIT);
+        clear_tiles(&mut game, 8, 8, 16, 18, LAYER_UPPER);
+        // Дно ямки под спуском.
+        for ty in 12..=15 {
+            game.map.set_kind(10, ty, LAYER_PIT, TileKind::Pit);
+        }
+        place_pit_ramp(&mut game, 10, 10);
+
+        // Танк на земле, на верхнем тайле полосы, и едет вниз.
+        place_tank_on(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0, LAYER_GROUND);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_DOWN));
+
+        let mut reached_pit = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if tank.deck == LAYER_PIT {
+                reached_pit = true;
+                break;
+            }
+        }
+        assert!(reached_pit, "спускной пандус должен увести танка в ямку");
+
+        // И обратно — на землю.
+        send_input(&mut game, 1, 2, input_towards(RAMP_DIR_UP));
+        let mut reached_ground = false;
+        for _ in 0..300 {
+            game.tick();
+            let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+            if tank.deck == LAYER_GROUND {
+                reached_ground = true;
+                break;
+            }
+        }
+        assert!(reached_ground, "по спускному пандусу можно вернуться на землю");
+    }
+
+    #[test]
+    fn tank_cannot_drive_into_a_pit() {
+        let mut game = test_game();
+        let pid = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(pid, "A".into());
+        clear_tiles(&mut game, 8, 8, 18, 14, LAYER_GROUND);
+        clear_tiles(&mut game, 8, 8, 18, 14, LAYER_PIT);
+        clear_tiles(&mut game, 8, 8, 18, 14, LAYER_UPPER);
+        // Ямка: дыра в земле на тайлах (12, 10)..(13, 11).
+        for ty in 10..=11 {
+            for tx in 12..=13 {
+                game.map.set_kind(tx, ty, LAYER_GROUND, TileKind::Empty);
+                game.map.set_kind(tx, ty, LAYER_PIT, TileKind::Pit);
+            }
+        }
+
+        place_tank(&mut game, pid, 10.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0);
+        send_input(&mut game, 1, 1, input_towards(RAMP_DIR_RIGHT));
+        for _ in 0..120 {
+            game.tick();
+        }
+        let tank = game.players.get(&pid).and_then(|p| p.tank.as_ref()).expect("танк");
+        assert_eq!(tank.deck, LAYER_GROUND, "танк остаётся на земле");
+        assert!(
+            tank.x + TANK_SIZE <= 12.0 * TILE_SIZE + 0.5,
+            "в ямку с земли уехать нельзя, x = {}",
+            tank.x
+        );
+    }
+
+    #[test]
+    fn flat_fire_rules_follow_the_height() {
+        // Свой слой — всегда.
+        assert!(flat_shot_hits(LAYER_GROUND, LAYER_GROUND));
+        assert!(flat_shot_hits(LAYER_UPPER, LAYER_UPPER));
+        assert!(flat_shot_hits(LAYER_PIT, LAYER_PIT));
+        // С возвышенности достаёт землю — преимущество высоты.
+        assert!(flat_shot_hits(LAYER_UPPER, LAYER_GROUND));
+        // Снизу вверх — нет: края платформ и бортики мостов блокируют.
+        assert!(!flat_shot_hits(LAYER_GROUND, LAYER_UPPER));
+        // В ямку настильным огнём не достать.
+        assert!(!flat_shot_hits(LAYER_GROUND, LAYER_PIT));
+        assert!(!flat_shot_hits(LAYER_UPPER, LAYER_PIT));
+        // Из ямки — только внутри своей низины.
+        assert!(!flat_shot_hits(LAYER_PIT, LAYER_GROUND));
+        assert!(!flat_shot_hits(LAYER_PIT, LAYER_UPPER));
+    }
+
+    #[test]
+    fn bullets_follow_the_height_rules() {
+        let mut game = test_game();
+        let shooter = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(shooter, "A".into());
+        let foe = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(foe, "B".into());
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_GROUND);
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_PIT);
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_UPPER);
+
+        let bx = 20.0 * TILE_SIZE + 8.0;
+        let by = 10.0 * TILE_SIZE + 8.0;
+        let shot = |deck: u8| Bullet {
+            id: 1,
+            owner: shooter,
+            x: bx,
+            y: by,
+            dir: 0,
+            deck,
+            level: 1,
+            damage: 1,
+            speed: 100.0,
+        };
+
+        // Противник в ямке: с земли и с возвышенности настильным огнём
+        // не достать.
+        place_tank_on(&mut game, foe, 20.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0, LAYER_PIT);
+        assert_eq!(game.find_tank_hit(&shot(LAYER_GROUND)), None);
+        assert_eq!(game.find_tank_hit(&shot(LAYER_UPPER)), None);
+        // В ямку можно попасть только из своей же низины.
+        assert_eq!(game.find_tank_hit(&shot(LAYER_PIT)), Some(foe));
+
+        // Противник на земле: с возвышенности — попадание.
+        place_tank_on(&mut game, foe, 20.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0, LAYER_GROUND);
+        assert_eq!(game.find_tank_hit(&shot(LAYER_UPPER)), Some(foe));
+        // Из ямки по земле — мимо.
+        assert_eq!(game.find_tank_hit(&shot(LAYER_PIT)), None);
+
+        // Противник на возвышенности: с земли вверх — нет.
+        place_tank_on(&mut game, foe, 20.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0, LAYER_UPPER);
+        assert_eq!(game.find_tank_hit(&shot(LAYER_GROUND)), None);
+        assert_eq!(game.find_tank_hit(&shot(LAYER_UPPER)), Some(foe));
+    }
+
+    #[test]
+    fn mortar_reaches_a_tank_in_a_pit() {
+        let mut game = test_game();
+        let shooter = game.add_player(1, "A".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(shooter, "A".into());
+        let foe = game.add_player(2, "B".into(), tokio::sync::mpsc::channel(4).0);
+        game.join_player(foe, "B".into());
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_GROUND);
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_PIT);
+        clear_tiles(&mut game, 4, 4, 30, 20, LAYER_UPPER);
+        place_tank_on(&mut game, foe, 20.0 * TILE_SIZE, 10.0 * TILE_SIZE, 0, LAYER_PIT);
+
+        // Навесной удар в точку рядом с танком в ямке.
+        game.explode(
+            20.0 * TILE_SIZE + 10.0,
+            10.0 * TILE_SIZE + 10.0,
+            48.0,
+            3,
+            shooter,
+            LAYER_GROUND,
+        );
+        let hp = game
+            .players
+            .get(&foe)
+            .and_then(|p| p.tank.as_ref())
+            .map(|t| t.hp)
+            .unwrap_or(0);
+        assert!(hp < 3, "миномёт достаёт танк в ямке, hp = {hp}");
     }
 }

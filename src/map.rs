@@ -19,13 +19,34 @@ pub const VIEW_CHUNK_RADIUS: i32 = 3;
 
 pub const BRICK_MAX_DAMAGE: u8 = 4;
 
-/// Количество ярусов (этажей) карты.
-pub const LEVELS: u8 = 2;
+/// Количество слоёв карты (уровней по высоте).
+pub const LEVELS: u8 = 3;
 
-/// Нижний ярус — земля.
-pub const LEVEL_GROUND: u8 = 0;
-/// Верхний ярус — площадки и перекрытия.
-pub const LEVEL_UPPER: u8 = 1;
+/// Слой ямок (окопов): дно ниже основной земли.
+pub const LAYER_PIT: u8 = 0;
+/// Слой основной земли.
+pub const LAYER_GROUND: u8 = 1;
+/// Слой возвышенностей и мостиков: настил над землёй.
+pub const LAYER_UPPER: u8 = 2;
+
+/// Высота ямки: ниже земли.
+pub const ELEV_PIT: i8 = -1;
+/// Высота основной земли.
+pub const ELEV_GROUND: i8 = 0;
+/// Высота возвышенностей и мостиков.
+pub const ELEV_UPPER: i8 = 1;
+
+/// Высота слоя: слой 0 — это минус один, слой 1 — ноль, слой 2 — плюс один.
+#[inline]
+pub fn layer_elev(layer: u8) -> i8 {
+    layer as i8 - 1
+}
+
+/// Слой по высоте: −1 → 0, 0 → 1, +1 → 2.
+#[inline]
+pub fn elev_layer(elev: i8) -> u8 {
+    (elev + 1).clamp(0, 2) as u8
+}
 
 /// Длина пандуса в тайлах: полоса из трёх тайлов.
 pub const RAMP_LEN: u8 = 3;
@@ -60,8 +81,10 @@ pub enum TileKind {
     Forest = 4,
     /// Лёд — скользкая поверхность с инерцией.
     Ice = 5,
-    /// Трамплин — переход между ярусами.
+    /// Трамплин — переход между слоями.
     Ramp = 6,
+    /// Дно ямки — проходимая поверхность ниже земли.
+    Pit = 7,
 }
 
 impl TileKind {
@@ -74,6 +97,7 @@ impl TileKind {
             4 => TileKind::Forest,
             5 => TileKind::Ice,
             6 => TileKind::Ramp,
+            7 => TileKind::Pit,
             _ => TileKind::Empty,
         }
     }
@@ -103,9 +127,14 @@ impl TileKind {
         matches!(self, TileKind::Ice)
     }
 
-    /// Является ли тайл переходом между ярусами.
+    /// Является ли тайл переходом между слоями.
     pub fn is_ramp(self) -> bool {
         matches!(self, TileKind::Ramp)
+    }
+
+    /// Является ли тайл дном ямки.
+    pub fn is_pit_floor(self) -> bool {
+        matches!(self, TileKind::Pit)
     }
 }
 
@@ -126,9 +155,51 @@ pub fn ramp_index(value: u8) -> u8 {
     (value >> 5) & 0x03
 }
 
+/// Бит 7: пандус ведёт вниз, в ямку (земля ↔ ямка).
+///
+/// Без этого бита пандус всегда ведёт вверх, с земли на возвышенность.
+pub const RAMP_FLAG_PIT: u8 = 0x80;
+
+/// Бит 3 у пустого тайла верхнего яруса: это **настил** — по нему ездят.
+///
+/// Смысл бита зависит от типа тайла: у пандуса биты 3..4 заняты
+/// направлением полосы, у кирпича — стадией повреждения.
+pub const DECK_FLAG: u8 = 0x08;
+
+/// Бит 4 у настила верхнего яруса: это **мостик** (деревянный), а не холм.
+pub const BRIDGE_FLAG: u8 = 0x10;
+
 /// Собирает значение тайла-пандуса: тип, направление и номер в полосе.
-pub fn ramp_value(dir: u8, idx: u8) -> u8 {
-    TileKind::Ramp.bits() | ((dir & 0x03) << 3) | ((idx & 0x03) << 5)
+///
+/// `to_pit` — ведёт ли полоса вниз, в ямку.
+pub fn ramp_value(dir: u8, idx: u8, to_pit: bool) -> u8 {
+    TileKind::Ramp.bits()
+        | ((dir & 0x03) << 3)
+        | ((idx & 0x03) << 5)
+        | if to_pit { RAMP_FLAG_PIT } else { 0 }
+}
+
+/// Ведёт ли пандус вниз, в ямку.
+pub fn ramp_is_pit(value: u8) -> bool {
+    value & RAMP_FLAG_PIT != 0
+}
+
+/// Низкая сторона полосы: там, откуда полоса поднимается.
+pub fn ramp_low_layer(value: u8) -> u8 {
+    if ramp_is_pit(value) {
+        LAYER_PIT
+    } else {
+        LAYER_GROUND
+    }
+}
+
+/// Высокая сторона полосы: там, куда полоса ведёт.
+pub fn ramp_high_layer(value: u8) -> u8 {
+    if ramp_is_pit(value) {
+        LAYER_GROUND
+    } else {
+        LAYER_UPPER
+    }
 }
 
 /// Смещение соседнего тайла в направлении пандуса.
@@ -138,6 +209,16 @@ pub fn ramp_dir_delta(dir: u8) -> (i32, i32) {
         RAMP_DIR_DOWN => (0, 1),
         RAMP_DIR_LEFT => (-1, 0),
         _ => (0, -1),
+    }
+}
+
+/// Направление пандуса по смещению: `(1, 0)` — вправо и так далее.
+pub fn dir_from_delta(dx: i32, dy: i32) -> u8 {
+    match (dx, dy) {
+        (1, 0) => RAMP_DIR_RIGHT,
+        (0, 1) => RAMP_DIR_DOWN,
+        (-1, 0) => RAMP_DIR_LEFT,
+        _ => RAMP_DIR_UP,
     }
 }
 // ---------------------------------------------------------------------------
@@ -204,15 +285,41 @@ impl Rng {
 // Карта
 // ---------------------------------------------------------------------------
 
-/// Тайловая карта мира с несколькими ярусами.
+/// Прямоугольник ямки в тайлах.
+#[derive(Debug, Clone, Copy)]
+struct PitRect {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+}
+
+impl PitRect {
+    /// Входит ли тайл в ямку.
+    fn contains(&self, tx: u32, ty: u32) -> bool {
+        tx >= self.x && tx < self.x + self.w && ty >= self.y && ty < self.y + self.h
+    }
+}
+
+/// Налезают ли две ямки друг на друга (с запасом в один тайл).
+fn pits_overlap(a: &PitRect, b: &PitRect) -> bool {
+    a.x < b.x + b.w + 2
+        && b.x < a.x + a.w + 2
+        && a.y < b.y + b.h + 2
+        && b.y < a.y + a.h + 2
+}
+
+/// Тайловая карта мира с несколькими слоями по высоте.
 #[derive(Debug, Clone)]
 pub struct GameMap {
     width: u32,
     height: u32,
-    /// Упакованные значения тайлов: по одному массиву на ярус.
+    /// Упакованные значения тайлов: по одному массиву на слой.
     layers: Vec<Vec<u8>>,
     /// Идентификатор лесного массива для каждого тайла (`u32::MAX` — не лес).
     forest_regions: Vec<Vec<u32>>,
+    /// Прямоугольники ямок: нужны, чтобы мостики легли именно над ними.
+    pits: Vec<PitRect>,
 }
 
 impl GameMap {
@@ -224,8 +331,12 @@ impl GameMap {
             height,
             layers: vec![vec![0; total]; LEVELS as usize],
             forest_regions: vec![vec![u32::MAX; total]; LEVELS as usize],
+            pits: Vec::new(),
         };
         map.build(seed);
+        map.build_pits(seed ^ 0x1A2B_3C4D_5E6F_7788);
+        // Связность проверяем после ямок: дыры в земле тоже перекрывают путь.
+        map.ensure_connectivity(width / 2, height / 2);
         map.build_upper_level(seed ^ 0x5DEE_CE66_D1CE_4B0D);
         map.rebuild_forest_regions();
         map
@@ -303,9 +414,48 @@ impl GameMap {
         self.set_value(tx, ty, level, kind.bits());
     }
 
-    /// Блокирует ли тайл движение танка.
-    pub fn blocks_tank(&self, tx: u32, ty: u32, level: u8) -> bool {
-        self.kind(tx, ty, level).blocks_tank()
+    /// Блокирует ли тайл движение танка — с учётом слоя.
+    ///
+    /// На слое ямок проходимы только дно (`Pit`) и пандусы: всё остальное —
+    /// сплошная земля над головой. На земле тайл непроходим, если под ним
+    /// ямка: дыру в землю случайно не проехать, только по спускному пандусу.
+    /// На верхнем ярусе пустота — пропасть: ездить можно только по настилам
+    /// мостов и холмов.
+    pub fn blocks_tank(&self, tx: u32, ty: u32, layer: u8) -> bool {
+        let kind = self.kind(tx, ty, layer);
+        match layer {
+            LAYER_PIT => !matches!(kind, TileKind::Pit | TileKind::Ramp),
+            LAYER_GROUND => {
+                if kind.blocks_tank() {
+                    return true;
+                }
+                let below = self.kind(tx, ty, LAYER_PIT);
+                // Дыра в земле: под тайлом дно ямки или её стенка.
+                below.is_pit_floor() || below == TileKind::Brick
+            }
+            _ => {
+                if kind.blocks_tank() {
+                    return true;
+                }
+                // Пустота верхнего яруса — пропасть: проезжают только настилы.
+                kind == TileKind::Empty && !self.is_deck(tx, ty)
+            }
+        }
+    }
+
+    /// Является ли тайл верхнего яруса настилом, по которому можно ездить.
+    pub fn is_deck(&self, tx: u32, ty: u32) -> bool {
+        self.value(tx, ty, LAYER_UPPER) & DECK_FLAG != 0
+    }
+
+    /// Помечает тайл верхнего яруса как настил.
+    pub fn set_deck(&mut self, tx: u32, ty: u32, bridge: bool) {
+        let value = self.value(tx, ty, LAYER_UPPER);
+        let mut next = value | DECK_FLAG;
+        if bridge {
+            next |= BRIDGE_FLAG;
+        }
+        self.set_value(tx, ty, LAYER_UPPER, next);
     }
 
     /// Является ли тайл переходом между ярусами.
@@ -397,9 +547,9 @@ impl GameMap {
                 let edge = x == 0 || y == 0 || x == w - 1 || y == h - 1;
                 let near_edge = x == 1 || y == 1 || x == w - 2 || y == h - 2;
                 if edge {
-                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Steel);
+                    self.set_kind(x, y, LAYER_GROUND, TileKind::Steel);
                 } else if near_edge {
-                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Brick);
+                    self.set_kind(x, y, LAYER_GROUND, TileKind::Brick);
                 }
             }
         }
@@ -439,14 +589,13 @@ impl GameMap {
         for y in cy - 4..cy + 5 {
             for x in cx - 4..cx + 5 {
                 if x > 1 && y > 1 && x < w - 2 && y < h - 2 {
-                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Empty);
+                    self.set_kind(x, y, LAYER_GROUND, TileKind::Empty);
                 }
             }
         }
 
-        // 4. Убираем «острова» пустоты, недоступные из центра, чтобы карта
-        //    оставалась связной и игроки не застревали в закрытых карманах.
-        self.ensure_connectivity(cx, cy);
+        // 4. Связность земли проверяется после построения ямок:
+        //    дыры в земле тоже перекрывают путь.
     }
 
     /// Ставит блок тайлов с зеркалированием по четырём квадрантам.
@@ -464,84 +613,251 @@ impl GameMap {
                 let right = w - 1 - px;
                 let bottom = h - 1 - py;
                 if px < right && py < bottom {
-                    self.set_kind(px, py, LEVEL_GROUND, kind);
-                    self.set_kind(right, py, LEVEL_GROUND, kind);
-                    self.set_kind(px, bottom, LEVEL_GROUND, kind);
-                    self.set_kind(right, bottom, LEVEL_GROUND, kind);
+                    self.set_kind(px, py, LAYER_GROUND, kind);
+                    self.set_kind(right, py, LAYER_GROUND, kind);
+                    self.set_kind(px, bottom, LAYER_GROUND, kind);
+                    self.set_kind(right, bottom, LAYER_GROUND, kind);
                 }
             }
         }
     }
 
     /// Гарантирует, что все пустые области связаны с центром карты.
+    ///
+    /// Дыры ямок проезжаемы только по спускному пандусу, поэтому обход
+    /// считает их закрытыми; сами ямки при этом не замуровываются.
+    ///
+    /// Ищутся области связности свободных тайлов земли. Основной считается
+    /// та, что содержит центр (если центр свободен и не зажат в крошечный
+    /// карман), иначе — самая большая. Остальные области — «карманы»: их
+    /// тайлы замуровываются кирпичом.
+    ///
+    /// Так карта остаётся цельной даже тогда, когда центр оказался внутри
+    /// ямки: раньше заливка от центра обрывалась сразу, и весь мир
+    /// превращался в кирпич.
     fn ensure_connectivity(&mut self, cx: u32, cy: u32) {
         let total = (self.width * self.height) as usize;
-        let mut visited = vec![false; total];
-        let mut queue: Vec<u32> = Vec::with_capacity(total);
+        let mut comp = vec![u32::MAX; total];
+        let mut comps: Vec<Vec<u32>> = Vec::new();
+        let mut stack: Vec<u32> = Vec::new();
 
-        let start = (cy * self.width + cx) as usize;
-        visited[start] = true;
-        queue.push(start as u32);
+        for start in 0..total {
+            if comp[start] != u32::MAX {
+                continue;
+            }
+            let sx = (start % self.width as usize) as u32;
+            let sy = (start / self.width as usize) as u32;
+            if self.blocks_tank(sx, sy, LAYER_GROUND) {
+                continue;
+            }
+            let id = comps.len() as u32;
+            let mut cells: Vec<u32> = Vec::with_capacity(64);
+            comp[start] = id;
+            stack.push(start as u32);
+            while let Some(idx) = stack.pop() {
+                cells.push(idx);
+                let x = (idx as u32) % self.width;
+                let y = (idx as u32) / self.width;
+                let neighbours = [
+                    (x.wrapping_sub(1), y),
+                    (x + 1, y),
+                    (x, y.wrapping_sub(1)),
+                    (x, y + 1),
+                ];
+                for (nx, ny) in neighbours {
+                    if nx >= self.width || ny >= self.height {
+                        continue;
+                    }
+                    let nidx = ny as usize * self.width as usize + nx as usize;
+                    if comp[nidx] != u32::MAX {
+                        continue;
+                    }
+                    if self.blocks_tank(nx, ny, LAYER_GROUND) {
+                        continue;
+                    }
+                    comp[nidx] = id;
+                    stack.push(nidx as u32);
+                }
+            }
+            comps.push(cells);
+        }
 
-        while let Some(idx) = queue.pop() {
-            let x = (idx as u32) % self.width;
-            let y = (idx as u32) / self.width;
-            let neighbours = [
-                (x.wrapping_sub(1), y),
-                (x + 1, y),
-                (x, y.wrapping_sub(1)),
-                (x, y + 1),
-            ];
-            for (nx, ny) in neighbours {
-                if nx >= self.width || ny >= self.height {
-                    continue;
-                }
-                let nidx = (ny * self.width + nx) as usize;
-                if visited[nidx] {
-                    continue;
-                }
-                if self.kind(nx, ny, LEVEL_GROUND).blocks_tank() {
-                    continue;
-                }
-                visited[nidx] = true;
-                queue.push(nidx as u32);
+        // Основная область: самая большая, а если центр входит в область
+        // сопоставимого размера — та, в которой находится центр.
+        let mut best = 0usize;
+        let mut best_len = 0usize;
+        for (i, cells) in comps.iter().enumerate() {
+            if cells.len() > best_len {
+                best_len = cells.len();
+                best = i;
+            }
+        }
+        let center_idx = (cy as usize * self.width as usize + cx as usize) as u32;
+        let center_comp = comp[center_idx as usize];
+        if center_comp != u32::MAX {
+            let center_len = comps[center_comp as usize].len();
+            if center_len * 2 >= best_len {
+                best = center_comp as usize;
             }
         }
 
-        // Недостижимые пустые тайлы превращаем в кирпич — закрываем карманы.
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = (y * self.width + x) as usize;
-                if !visited[idx] && !self.kind(x, y, LEVEL_GROUND).blocks_tank() {
-                    self.set_kind(x, y, LEVEL_GROUND, TileKind::Brick);
+        // Остальные области — глухие карманы: замуровываем их кирпичом.
+        for (i, cells) in comps.iter().enumerate() {
+            if i == best {
+                continue;
+            }
+            for &idx in cells {
+                let x = (idx as u32) % self.width;
+                let y = (idx as u32) / self.width;
+                // Ямки не замуровываем: они и есть «дыры» в земле.
+                if self.is_pit(x, y) {
+                    continue;
                 }
+                self.set_kind(x, y, LAYER_GROUND, TileKind::Brick);
             }
         }
     }
 
-    /// Строит верхний ярус: площадки-перекрытия и пандусы между ярусами.
+    /// Строит ямки (окопы) ниже земли: дыра в земле, дно и спускной пандус.
     ///
-    /// Сначала ставятся площадки, потом к их краям привязываются пандусы —
-    /// полосы из трёх тайлов, по которым танк поднимается на верхний этаж.
+    /// Ямка устроена так:
+    ///  - на слое **земли** её тайлы пустые — это дыра, в которую с поверхности
+    ///    нельзя уехать, только по спускному пандусу;
+    ///  - на слое **ямок** лежит дно (`Pit`) — по нему можно ездить;
+    ///  - спускной пандус — полоса из трёх тайлов: край земли, откос, дно.
+    fn build_pits(&mut self, seed: u64) {
+        let mut rng = Rng::new(seed);
+        let w = self.width;
+        let h = self.height;
+        let count = 5 + rng.below(4);
+        let mut attempts = 0u32;
+        // Центральная зона — место для манёвра и появления игроков: ямка здесь
+        // перекрыла бы путь из центра и разорвала карту.
+        let protect = 8i64;
+        let (bx0, bx1) = (w as i64 / 2 - protect, w as i64 / 2 + protect);
+        let (by0, by1) = (h as i64 / 2 - protect, h as i64 / 2 + protect);
+
+        while self.pits.len() < count as usize && attempts < 800 {
+            attempts += 1;
+            // Размер ямки задан с запасом на стенки окопа: внутри кольца из
+            // кирпича должно остаться место, где танк свободно разворачивается.
+            let pw = rng.range(6, 9);
+            let ph = rng.range(5, 7);
+            let px = rng.range(3, w.saturating_sub(pw + 3));
+            let py = rng.range(3, h.saturating_sub(ph + 3));
+            let pit = PitRect {
+                x: px,
+                y: py,
+                w: pw,
+                h: ph,
+            };
+
+            // Ямки не наезжают друг на друга.
+            if self.pits.iter().any(|p| pits_overlap(p, &pit)) {
+                continue;
+            }
+            // Ямка не должна закрывать центр карты.
+            let (pxi, pyi, pwi, phi) = (px as i64, py as i64, pw as i64, ph as i64);
+            if pxi < bx1 && pxi + pwi > bx0 && pyi < by1 && pyi + phi > by0 {
+                continue;
+            }
+            // Полоса спуска: край земли (сверху), откос, дно (в ямке).
+            // Полоса идёт на тайл глубже стенки окопа, чтобы пересечь её
+            // насквозь: вход в ямку — это пролом в кладке.
+            let strip = [(px + 1, py - 1), (px + 1, py), (px + 1, py + 1)];
+            // Подход к пандусу должен быть свободен.
+            if !self.ramp_area_free(px + 1, py - 1) {
+                continue;
+            }
+            // Под ямкой не должно быть глухих карманов: земля под ней обычная.
+            let mut blocked = false;
+            for ty in py..py + ph {
+                for tx in px..px + pw {
+                    if self.kind(tx, ty, LAYER_GROUND).blocks_tank() {
+                        blocked = true;
+                    }
+                }
+            }
+            if blocked {
+                continue;
+            }
+
+            // Дыра в земле: тайлы ямки на слое земли пустые.
+            let pit_layer = elev_layer(ELEV_PIT);
+            for ty in py..py + ph {
+                for tx in px..px + pw {
+                    self.set_kind(tx, ty, LAYER_GROUND, TileKind::Empty);
+                }
+            }
+            // Стенки окопа: кольцо по периметру ямки на слое ямок — кирпич.
+            // Внутри кольца — дно (`Pit`), по нему можно ездить.
+            for ty in py..py + ph {
+                for tx in px..px + pw {
+                    let edge = tx == px || tx == px + pw - 1 || ty == py || ty == py + ph - 1;
+                    if edge {
+                        self.set_kind(tx, ty, pit_layer, TileKind::Brick);
+                    }
+                }
+            }
+            // Дно ямки на слое ямок.
+            for ty in py..py + ph {
+                for tx in px..px + pw {
+                    let edge = tx == px || tx == px + pw - 1 || ty == py || ty == py + ph - 1;
+                    if !edge {
+                        self.set_kind(tx, ty, pit_layer, TileKind::Pit);
+                    }
+                }
+            }
+            // Спускной пандус: те же тайлы на обоих слоях пары. Он проходит
+            // сквозь стенку окопа — это и есть вход в ямку.
+            for (k, &(tx, ty)) in strip.iter().enumerate() {
+                // Номер в полосе: 2 — край земли, 0 — дно ямки.
+                let idx = (RAMP_LEN - 1 - k as u8) as u8;
+                let value = ramp_value(RAMP_DIR_UP, idx, true);
+                self.set_value(tx, ty, LAYER_GROUND, value);
+                self.set_value(tx, ty, pit_layer, value);
+            }
+
+            self.pits.push(pit);
+        }
+    }
+
+    /// Является ли тайл частью ямки.
+    pub fn is_pit(&self, tx: u32, ty: u32) -> bool {
+        self.pits.iter().any(|p| p.contains(tx, ty))
+    }
+
+    /// Количество ямок на карте.
+    pub fn pits_count(&self) -> usize {
+        self.pits.len()
+    }
+
+    /// Строит верхний ярус: холмы, мостики и пандусы между слоями.
+    ///
+    /// Верхний ярус — **не сплошное поле**, а тактическая сеть:
+    ///  - **холмы** — возвышенные платформы, по ним ездят, на них стоят
+    ///    кирпичные заграждения;
+    ///  - **мостики** — узкие настилы, перекинутые над землёй и над ямками.
+    ///
+    /// И то, и другое соединено с землёй пандусами: без пандуса холм
+    /// недостижим, поэтому такой холм просто не ставится.
     fn build_upper_level(&mut self, seed: u64) {
         let mut rng = Rng::new(seed);
         let w = self.width;
         let h = self.height;
 
-        // 1. Площадки на верхнем ярусе. Ставим их над свободными местами
-        //    нижнего яруса, чтобы они не «замуровывали» нижний этаж.
-        let blocks = 14 + rng.below(8);
-        let mut platforms: Vec<Vec<(u32, u32)>> = Vec::with_capacity(blocks as usize);
-        for _ in 0..blocks {
+        // 1. Холмы: возвышенные платформы верхнего яруса.
+        let blocks = 10 + rng.below(8);
+        let mut placed = 0u32;
+        let mut attempts = 0u32;
+        while placed < blocks && attempts < 600 {
+            attempts += 1;
             let bw = rng.range(3, 9);
             let bh = rng.range(3, 7);
             let bx = rng.range(3, w.saturating_sub(bw + 3));
             let by = rng.range(3, h.saturating_sub(bh + 3));
-            let kind = if rng.chance(70) {
-                TileKind::Brick
-            } else {
-                TileKind::Steel
-            };
+
+            // Тайлы платформы: над проходимой землёй, без ямок.
             let mut tiles: Vec<(u32, u32)> = Vec::new();
             for dy in 0..bh {
                 for dx in 0..bw {
@@ -550,116 +866,229 @@ impl GameMap {
                     if px < 2 || py < 2 || px >= w - 2 || py >= h - 2 {
                         continue;
                     }
-                    // Под площадкой должно быть проходимо — иначе нижний
+                    // Под холмом должно быть проходимо — иначе нижний
                     // ярус получит непроходимый «слепой» карман.
-                    if self.kind(px, py, LEVEL_GROUND).blocks_tank() {
+                    if self.kind(px, py, LAYER_GROUND).blocks_tank() || self.is_pit(px, py) {
                         continue;
                     }
-                    self.set_kind(px, py, LEVEL_UPPER, kind);
                     tiles.push((px, py));
                 }
             }
-            if !tiles.is_empty() {
-                platforms.push(tiles);
-            }
-        }
-
-        // 2. Кандидаты на пандус: крайний тайл площадки и направление, в
-        //    котором полоса уходит наружу. Подъём по пандусу идёт в обратную
-        //    сторону — от нижнего края полосы к площадке.
-        let mut candidates: Vec<(u32, u32, u8)> = Vec::new();
-        for platform in &platforms {
-            for &(px, py) in platform {
-                for out in [
-                    RAMP_DIR_RIGHT,
-                    RAMP_DIR_DOWN,
-                    RAMP_DIR_LEFT,
-                    RAMP_DIR_UP,
-                ] {
-                    let (dx, dy) = ramp_dir_delta(out);
-                    let (nx, ny) = (px as i64 + dx as i64, py as i64 + dy as i64);
-                    if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
-                        continue;
-                    }
-                    // Внутрь площадки полосу не кладём.
-                    if platform.contains(&(nx as u32, ny as u32)) {
-                        continue;
-                    }
-                    candidates.push((px, py, out));
-                }
-            }
-        }
-
-        // 3. Пандусы: полосы из трёх тайлов, ведущие к площадкам. Один и тот же
-        //    тайл стоит на обоих ярусах, поэтому заезд работает и вверх, и вниз.
-        let strips = 8 + rng.below(6);
-        let mut occupied = vec![false; (w * h) as usize];
-        let mut placed = 0u32;
-        let mut attempts = 0u32;
-        while placed < strips && attempts < 20000 {
-            attempts += 1;
-            if candidates.is_empty() {
-                break;
-            }
-            let &(px, py, out) = &candidates[rng.below(candidates.len() as u32) as usize];
-            // Край площадки нельзя выкалывать: он может принадлежать другому
-            // пандусу.
-            if occupied[(py * w + px) as usize] || self.kind(px, py, LEVEL_UPPER).is_ramp() {
+            if tiles.len() < 6 {
                 continue;
             }
-            let (dx, dy) = ramp_dir_delta(out);
-            // Подъём по пандусу идёт в сторону, противоположную его уходу.
-            let dir = (out + 2) & 0x03;
-            // Тайлы полосы: от края площадки (верх, номер 2) наружу (низ, 0).
-            let mut strip = [(0u32, 0u32); RAMP_LEN as usize];
-            let mut fits = true;
-            for k in 0..RAMP_LEN as usize {
-                let step = k as i64 + 1;
-                let (nx, ny) = (px as i64 + dx as i64 * step, py as i64 + dy as i64 * step);
-                if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
-                    fits = false;
-                    break;
-                }
-                let (tx, ty) = (nx as u32, ny as u32);
-                // Полосы не должны налезать друг на друга.
-                if occupied[(ty * w + tx) as usize] {
-                    fits = false;
-                    break;
-                }
-                strip[k] = (tx, ty);
+            // Платформа — настил верхнего яруса.
+            for &(px, py) in &tiles {
+                self.set_kind(px, py, LAYER_UPPER, TileKind::Empty);
+                self.set_deck(px, py, false);
             }
-            if !fits {
+            // Пара кирпичных заграждений на самой платформе.
+            let obstacles = rng.below(3);
+            for _ in 0..obstacles {
+                if tiles.is_empty() {
+                    break;
+                }
+                let idx = rng.below(tiles.len() as u32) as usize;
+                let (px, py) = tiles[idx];
+                self.set_kind(px, py, LAYER_UPPER, TileKind::Brick);
+            }
+            // Пандус с земли на холм. Если он не помещается — холм убираем.
+            if !self.place_hill_ramp(&tiles) {
+                for &(px, py) in &tiles {
+                    self.set_value(px, py, LAYER_UPPER, TileKind::Empty.bits());
+                }
                 continue;
-            }
-            // Дверь в площадку: крайний тайл делаем проходимым, иначе с
-            // пандуса нельзя было бы въехать на этаж.
-            let saved = self.value(px, py, LEVEL_UPPER);
-            self.set_kind(px, py, LEVEL_UPPER, TileKind::Empty);
-            for (tx, ty) in strip {
-                if !self.ramp_area_free(tx, ty) {
-                    fits = false;
-                    break;
-                }
-            }
-            if !fits {
-                self.set_value(px, py, LEVEL_UPPER, saved);
-                continue;
-            }
-            // Ставим полосу одинаково на обоих ярусах.
-            for (k, &(tx, ty)) in strip.iter().enumerate() {
-                let value = ramp_value(dir, RAMP_LEN - 1 - k as u8);
-                self.set_value(tx, ty, LEVEL_GROUND, value);
-                self.set_value(tx, ty, LEVEL_UPPER, value);
-                occupied[(ty * w + tx) as usize] = true;
             }
             placed += 1;
         }
+
+        // 2. Мостики. Сначала — через ямки, потом — несколько над землёй.
+        let pits = self.pits.clone();
+        for pit in &pits {
+            if pit.w >= pit.h {
+                let y = pit.y + pit.h / 2;
+                let x0 = pit.x.saturating_sub(1);
+                let len = pit.w + 2;
+                self.place_bridge(x0, y, 1, 0, len);
+            } else {
+                let x = pit.x + pit.w / 2;
+                let y0 = pit.y.saturating_sub(1);
+                let len = pit.h + 2;
+                self.place_bridge(x, y0, 0, 1, len);
+            }
+        }
+        // Мостиков над землёй — тем больше, чем больше ямок на карте.
+        let extra_bridges = 4 + self.pits_count() as u32 / 2;
+        for _ in 0..extra_bridges {
+            let len = rng.range(3, 7);
+            if rng.chance(50) {
+                let y = rng.range(3, h.saturating_sub(len + 3));
+                let x0 = rng.range(3, w.saturating_sub(len + 3));
+                self.place_bridge(x0, y, 1, 0, len);
+            } else {
+                let x = rng.range(3, w.saturating_sub(len + 3));
+                let y0 = rng.range(3, h.saturating_sub(len + 3));
+                self.place_bridge(x, y0, 0, 1, len);
+            }
+        }
     }
 
-    /// Проходимы ли тайл и его соседи на обоих ярусах.
+    /// Пристраивает к платформе холма пандус с земли.
+    ///
+    /// Пробуются все крайние тайлы платформы и все четыре направления:
+    /// полоса из трёх тайлов должна поместиться на свободном месте.
+    fn place_hill_ramp(&mut self, tiles: &[(u32, u32)]) -> bool {
+        let w = self.width;
+        let h = self.height;
+        for &(px, py) in tiles {
+            // К холму пристраиваем пандус только к чистому настилу: кирпичное
+            // заграждение на выходе из полосы перекрыло бы проезд.
+            if !self.is_deck(px, py) {
+                continue;
+            }
+            for out in [
+                RAMP_DIR_RIGHT,
+                RAMP_DIR_DOWN,
+                RAMP_DIR_LEFT,
+                RAMP_DIR_UP,
+            ] {
+                let (dx, dy) = ramp_dir_delta(out);
+                let mut strip = [(0u32, 0u32); RAMP_LEN as usize];
+                let mut fits = true;
+                for k in 0..RAMP_LEN as usize {
+                    let step = k as i64 + 1;
+                    let (nx, ny) = (px as i64 + dx as i64 * step, py as i64 + dy as i64 * step);
+                    if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
+                        fits = false;
+                        break;
+                    }
+                    let (tx, ty) = (nx as u32, ny as u32);
+                    // Полоса идёт наружу от холма, а не по самой платформе.
+                    if tiles.contains(&(tx, ty)) {
+                        fits = false;
+                        break;
+                    }
+                    // Полоса должна быть свободна на обоих слоях пары.
+                    if self.kind(tx, ty, LAYER_UPPER) != TileKind::Empty
+                        || self.kind(tx, ty, LAYER_GROUND).is_ramp()
+                        || self.is_pit(tx, ty)
+                        || !self.ramp_area_free(tx, ty)
+                    {
+                        fits = false;
+                        break;
+                    }
+                    strip[k] = (tx, ty);
+                }
+                if !fits {
+                    continue;
+                }
+                // Подъём по пандусу идёт в сторону, противоположную его уходу.
+                let dir = (out + 2) & 0x03;
+                for (k, &(tx, ty)) in strip.iter().enumerate() {
+                    let value = ramp_value(dir, RAMP_LEN - 1 - k as u8, false);
+                    self.set_value(tx, ty, LAYER_GROUND, value);
+                    self.set_value(tx, ty, LAYER_UPPER, value);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Ставит мостик верхнего яруса: проходимый коридор и пандус к нему.
+    ///
+    /// Коридор идёт от точки `(x0, y0)` в направлении `(dx, dy)` длиной
+    /// `len` тайлов. Пандус пристраивается к началу коридора с противоположной
+    /// стороны и ведёт с земли на верхний ярус.
+    ///
+    /// Под мостиком может быть ямка: мост идёт над ней, а земля под ним —
+    /// дыра, в которую с земли не уедешь.
+    fn place_bridge(&mut self, x0: u32, y0: u32, dx: i32, dy: i32, len: u32) -> bool {
+        let w = self.width;
+        let h = self.height;
+
+        // Тайлы коридора.
+        let mut tiles: Vec<(u32, u32)> = Vec::with_capacity(len as usize);
+        for k in 0..len {
+            let nx = x0 as i64 + dx as i64 * k as i64;
+            let ny = y0 as i64 + dy as i64 * k as i64;
+            if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
+                return false;
+            }
+            tiles.push((nx as u32, ny as u32));
+        }
+
+        // Полоса пандуса перед началом коридора.
+        let mut strip = [(0u32, 0u32); RAMP_LEN as usize];
+        for k in 0..RAMP_LEN as usize {
+            let step = k as i64 + 1;
+            let nx = x0 as i64 - dx as i64 * step;
+            let ny = y0 as i64 - dy as i64 * step;
+            if nx < 2 || ny < 2 || nx >= w as i64 - 2 || ny >= h as i64 - 2 {
+                return false;
+            }
+            strip[k] = (nx as u32, ny as u32);
+        }
+
+        // Коридор и пандус не должны занимать занятые тайлы верхнего яруса.
+        for &(tx, ty) in tiles.iter().chain(strip.iter()) {
+            if self.kind(tx, ty, LAYER_UPPER) != TileKind::Empty {
+                return false;
+            }
+            // Спуск в ямку лежит на земле — его не затираем.
+            if self.kind(tx, ty, LAYER_GROUND).is_ramp() {
+                return false;
+            }
+        }
+        // Под пандусом земля обязана быть проходима: по нему едет танк.
+        for &(tx, ty) in strip.iter() {
+            if self.blocks_tank(tx, ty, LAYER_GROUND) {
+                return false;
+            }
+            // Пандус не кладём над ямкой: там дыра в земле.
+            if self.is_pit(tx, ty) {
+                return false;
+            }
+        }
+        // Под коридором стен быть не должно (яма — можно: мост идёт над ней).
+        for &(tx, ty) in tiles.iter() {
+            if self.kind(tx, ty, LAYER_GROUND).blocks_tank() {
+                return false;
+            }
+        }
+
+        // Подход к пандусу с земли должен быть свободен: иначе на полосу
+        // не въехать.
+        let ax = x0 as i64 - dx as i64 * (RAMP_LEN as i64 + 1);
+        let ay = y0 as i64 - dy as i64 * (RAMP_LEN as i64 + 1);
+        if ax < 2 || ay < 2 || ax >= w as i64 - 2 || ay >= h as i64 - 2 {
+            return false;
+        }
+        if self.blocks_tank(ax as u32, ay as u32, LAYER_GROUND) {
+            return false;
+        }
+
+        // Коридор — проходимый настил верхнего яруса.
+        for &(tx, ty) in tiles.iter() {
+            self.set_kind(tx, ty, LAYER_UPPER, TileKind::Empty);
+            self.set_deck(tx, ty, true);
+        }
+        // Пандус: полоса из трёх тайлов, подъём от земли к мостику.
+        let dir = dir_from_delta(dx, dy);
+        for (k, &(tx, ty)) in strip.iter().enumerate() {
+            let value = ramp_value(dir, RAMP_LEN - 1 - k as u8, false);
+            self.set_value(tx, ty, LAYER_GROUND, value);
+            self.set_value(tx, ty, LAYER_UPPER, value);
+        }
+        true
+    }
+
+    /// Проходимы ли тайл и его соседи на обоих слоях.
     ///
     /// Такое условие нужно пандусу: к нему должно быть где подъехать, и он
-    /// не должен упираться в стену.
+    /// не должен упираться в стену. Проверка слой-зависимая: над ямкой
+    /// проезжает только её собственный спуск, а на верхнем ярусе мешают
+    /// только стены — пустота там это пропасть, по которой едут по полосе.
     fn ramp_area_free(&self, tx: u32, ty: u32) -> bool {
         for (dx, dy) in [(0i64, 0i64), (-1, 0), (1, 0), (0, -1), (0, 1)] {
             let (nx, ny) = (tx as i64 + dx, ty as i64 + dy);
@@ -667,8 +1096,8 @@ impl GameMap {
                 return false;
             }
             let (nx, ny) = (nx as u32, ny as u32);
-            if self.kind(nx, ny, LEVEL_GROUND).blocks_tank()
-                || self.kind(nx, ny, LEVEL_UPPER).blocks_tank()
+            if self.blocks_tank(nx, ny, LAYER_GROUND)
+                || self.kind(nx, ny, LAYER_UPPER).blocks_tank()
             {
                 return false;
             }
@@ -739,7 +1168,11 @@ impl GameMap {
             }
             let x = tx as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
             let y = ty as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
-            if self.rect_is_free(x, y, tank_size, LEVEL_GROUND) {
+            // Точка появления — только сплошная земля: над ямкой танк появился бы
+            // на её дне, а на спускном пандусе — посреди спуска.
+            if self.rect_is_free(x, y, tank_size, LAYER_GROUND)
+                && self.is_solid_ground(x, y, tank_size)
+            {
                 points.push((x, y));
             }
         }
@@ -753,7 +1186,9 @@ impl GameMap {
                 let ty = rng.range(3, self.height.saturating_sub(4));
                 let x = tx as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
                 let y = ty as f32 * TILE_SIZE + (TILE_SIZE - tank_size) * 0.5;
-                if self.rect_is_free(x, y, tank_size, LEVEL_GROUND) {
+                if self.rect_is_free(x, y, tank_size, LAYER_GROUND)
+                    && self.is_solid_ground(x, y, tank_size)
+                {
                     points.push((x, y));
                 }
             }
@@ -777,6 +1212,36 @@ impl GameMap {
                     return false;
                 }
                 if self.blocks_tank(tx, ty, level) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Стоит ли прямоугольник на сплошной земле — без ямки под ним.
+    ///
+    /// На слое ямок `Empty` означает «ямы тут нет», то есть сплошную землю над
+    /// головой. Любое другое значение под землёй — это дыра (дно ямки), стенка
+    /// окопа или спускной пандус.
+    ///
+    /// Появляться над дырой нельзя: танк сразу окажется на дне ямки, а на
+    /// спускном пандусе — ещё и на середине спуска.
+    pub fn is_solid_ground(&self, x: f32, y: f32, size: f32) -> bool {
+        let x0 = (x / TILE_SIZE).floor() as i64;
+        let y0 = (y / TILE_SIZE).floor() as i64;
+        let x1 = ((x + size - 0.001) / TILE_SIZE).floor() as i64;
+        let y1 = ((y + size - 0.001) / TILE_SIZE).floor() as i64;
+        for ty in y0..=y1 {
+            for tx in x0..=x1 {
+                if tx < 0 || ty < 0 {
+                    return false;
+                }
+                let (tx, ty) = (tx as u32, ty as u32);
+                if tx >= self.width || ty >= self.height {
+                    return false;
+                }
+                if self.kind(tx, ty, LAYER_PIT) != TileKind::Empty {
                     return false;
                 }
             }
@@ -883,7 +1348,7 @@ mod tests {
     fn map_generates_with_expected_size() {
         let map = GameMap::generate(MAP_W, MAP_H, 42);
         assert_eq!(map.len(), (MAP_W * MAP_H) as usize);
-        assert_eq!(map.kind(0, 0, LEVEL_GROUND), TileKind::Steel);
+        assert_eq!(map.kind(0, 0, LAYER_GROUND), TileKind::Steel);
         assert_eq!(map.levels(), LEVELS);
     }
 
@@ -910,7 +1375,7 @@ mod tests {
     fn map_is_connected_from_center() {
         let map = GameMap::generate(MAP_W, MAP_H, 99);
         let (cx, cy) = (MAP_W / 2, MAP_H / 2);
-        assert!(map.rect_is_free(cx as f32 * TILE_SIZE, cy as f32 * TILE_SIZE, 30.0, LEVEL_GROUND));
+        assert!(map.rect_is_free(cx as f32 * TILE_SIZE, cy as f32 * TILE_SIZE, 30.0, LAYER_GROUND));
         // Каждая пустая клетка достижима: проверяем, что «карманов» не осталось.
         let mut visited = vec![false; map.len()];
         let mut stack = vec![(cx, cy)];
@@ -926,7 +1391,7 @@ mod tests {
                     continue;
                 }
                 let idx = (ny * MAP_W + nx) as usize;
-                if visited[idx] || map.blocks_tank(nx, ny, LEVEL_GROUND) {
+                if visited[idx] || map.blocks_tank(nx, ny, LAYER_GROUND) {
                     continue;
                 }
                 visited[idx] = true;
@@ -935,7 +1400,7 @@ mod tests {
         }
         for y in 0..MAP_H {
             for x in 0..MAP_W {
-                if !map.blocks_tank(x, y, LEVEL_GROUND) {
+                if !map.blocks_tank(x, y, LAYER_GROUND) {
                     assert!(visited[(y * MAP_W + x) as usize], "недостижимая клетка {x},{y}");
                 }
             }
@@ -948,7 +1413,50 @@ mod tests {
         let points = map.spawn_points(25, 30.0);
         assert!(!points.is_empty());
         for (x, y) in points {
-            assert!(map.rect_is_free(x, y, 30.0, LEVEL_GROUND));
+            assert!(map.rect_is_free(x, y, 30.0, LAYER_GROUND));
+        }
+    }
+
+    /// Точки появления не должны лежать над ямкой.
+    ///
+    /// Ямка — это дыра в земле: появившийся над ней танк сразу оказался бы на
+    /// дне (или посреди спуска по пандусу), а не на ровной земле.
+    #[test]
+    fn spawn_points_are_on_solid_ground() {
+        for seed in [5u64, 11, 0x7A4C_1E55_D1CE_2026] {
+            let map = GameMap::generate(MAP_W, MAP_H, seed);
+            let points = map.spawn_points(25, 30.0);
+            assert!(!points.is_empty());
+            for (x, y) in points {
+                assert!(
+                    map.is_solid_ground(x, y, 30.0),
+                    "точка появления ({x}, {y}) оказалась над ямкой"
+                );
+                assert!(map.rect_is_free(x, y, 30.0, LAYER_GROUND));
+            }
+        }
+    }
+
+    /// Карта не должна превращаться в кирпичную стену.
+    ///
+    /// Раньше ямка могла закрыть центр карты: заливка связности от центра
+    /// обрывалась сразу, и весь мир замуровывался кирпичом — играть было
+    /// негде. Теперь центр защищён от ямок, а связность ищется по всей карте.
+    #[test]
+    fn map_is_not_mostly_brick() {
+        for seed in [5u64, 11, 42, 0x7A4C_1E55_D1CE_2026] {
+            let map = GameMap::generate(MAP_W, MAP_H, seed);
+            let total = (MAP_W * MAP_H) as usize;
+            let mut free = 0usize;
+            for y in 0..MAP_H {
+                for x in 0..MAP_W {
+                    if !map.blocks_tank(x, y, LAYER_GROUND) {
+                        free += 1;
+                    }
+                }
+            }
+            let share = free * 100 / total;
+            assert!(share >= 40, "сид {seed}: свободно только {share}% карты");
         }
     }
 
@@ -958,8 +1466,8 @@ mod tests {
         let mut out = Vec::new();
         for y in 0..map.height() {
             for x in 0..map.width() {
-                let value = map.value(x, y, LEVEL_GROUND);
-                if map.kind(x, y, LEVEL_GROUND) == TileKind::Ramp {
+                let value = map.value(x, y, LAYER_GROUND);
+                if map.kind(x, y, LAYER_GROUND) == TileKind::Ramp {
                     out.push((x, y, ramp_dir(value), ramp_index(value)));
                 }
             }
@@ -973,27 +1481,35 @@ mod tests {
         let mut ramps = 0;
         for y in 0..MAP_H {
             for x in 0..MAP_W {
-                if map.kind(x, y, LEVEL_GROUND) == TileKind::Ramp {
-                    ramps += 1;
-                    // Пандус есть на обоих ярусах: заехав на него, меняем этаж.
-                    assert_eq!(map.kind(x, y, LEVEL_UPPER), TileKind::Ramp);
-                    // Значение совпадает: тип, направление и номер в полосе.
-                    assert_eq!(
-                        map.value(x, y, LEVEL_GROUND),
-                        map.value(x, y, LEVEL_UPPER),
-                        "пандус на тайле {x},{y} различается на ярусах"
-                    );
+                if map.kind(x, y, LAYER_GROUND) != TileKind::Ramp {
+                    continue;
                 }
+                ramps += 1;
+                let value = map.value(x, y, LAYER_GROUND);
+                // У каждого пандуса есть пара слоёв: низкая и высокая.
+                // Подъёмный ведёт с земли наверх, спускной — с земли в ямку.
+                let low = ramp_low_layer(value);
+                let high = ramp_high_layer(value);
+                assert_ne!(low, high, "у пандуса должны быть разные слои");
+                // Пандус есть на обоих слоях пары: заехав на него, меняем слой.
+                assert_eq!(map.kind(x, y, low), TileKind::Ramp);
+                assert_eq!(map.kind(x, y, high), TileKind::Ramp);
+                // Значение совпадает: тип, направление и номер в полосе.
+                assert_eq!(
+                    map.value(x, y, low),
+                    map.value(x, y, high),
+                    "пандус на тайле {x},{y} различается на слоях пары"
+                );
             }
         }
-        assert!(ramps > 0, "на карте должны быть переходы между ярусами");
+        assert!(ramps > 0, "на карте должны быть переходы между слоями");
     }
 
     #[test]
     fn ramp_tile_value_packs_direction_and_index() {
         for dir in 0..4u8 {
             for idx in 0..RAMP_LEN {
-                let value = ramp_value(dir, idx);
+                let value = ramp_value(dir, idx, false);
                 // Базовый тип тайла не ломается: читаются только младшие биты.
                 assert_eq!(TileKind::from_bits(value), TileKind::Ramp);
                 assert_eq!(ramp_dir(value), dir);
@@ -1002,8 +1518,8 @@ mod tests {
         }
         // Повреждения у пандуса нет: старшие биты заняты направлением.
         let mut map = GameMap::generate(64, 64, 3);
-        map.set_value(5, 5, LEVEL_GROUND, ramp_value(RAMP_DIR_UP, 2));
-        assert_eq!(map.damage(5, 5, LEVEL_GROUND), 0);
+        map.set_value(5, 5, LAYER_GROUND, ramp_value(RAMP_DIR_UP, 2, false));
+        assert_eq!(map.damage(5, 5, LAYER_GROUND), 0);
     }
 
     /// Есть ли тайл пандуса в позиции, смещённой от (x, y) на (dx, dy).
@@ -1076,7 +1592,10 @@ mod tests {
                     "у полосы должен быть верхний тайл"
                 );
             }
-            assert!((8..=13).contains(&strips), "пандусов должно быть 8..=13");
+            assert!(
+                (12..=44).contains(&strips),
+                "полос должно быть 12..=44, а их {strips}"
+            );
             // Полоса состоит ровно из трёх тайлов — значит, тайлы не делятся
             // между разными полосами.
             assert_eq!(ramps.len(), strips * RAMP_LEN as usize);
@@ -1115,25 +1634,39 @@ mod tests {
     fn ramp_strips_have_free_approach_on_both_levels() {
         for seed in [11u64, 42, 7] {
             let map = GameMap::generate(MAP_W, MAP_H, seed);
-            for (x, y, _, _) in ramp_tiles(&map) {
-                // Сам тайл пандуса и по тайлу вокруг него должны быть
-                // проходимы на обоих ярусах: иначе к пандусу не подъехать.
-                for (dx, dy) in [(0i64, 0i64), (-1, 0), (1, 0), (0, -1), (0, 1)] {
-                    let (nx, ny) = (x as i64 + dx, y as i64 + dy);
-                    assert!(
-                        nx >= 0 && ny >= 0 && nx < MAP_W as i64 && ny < MAP_H as i64,
-                        "пандус у края карты: {x},{y}"
-                    );
-                    let (nx, ny) = (nx as u32, ny as u32);
-                    assert!(
-                        !map.blocks_tank(nx, ny, LEVEL_GROUND),
-                        "к пандусу {x},{y} нельзя подъехать снизу"
-                    );
-                    assert!(
-                        !map.blocks_tank(nx, ny, LEVEL_UPPER),
-                        "к пандусу {x},{y} нельзя подъехать сверху"
-                    );
-                }
+            for (x, y, dir, _) in ramp_tiles(&map) {
+                let value = map.value(x, y, LAYER_GROUND);
+                let low = ramp_low_layer(value);
+                let high = ramp_high_layer(value);
+                let (dx, dy) = ramp_dir_delta(dir);
+                // Подъезд к полосе — с низкой стороны: танк едет по низкому
+                // слою и въезжает на полосу с её края.
+                let ax = x as i64 - dx as i64;
+                let ay = y as i64 - dy as i64;
+                assert!(
+                    ax >= 0 && ay >= 0 && ax < MAP_W as i64 && ay < MAP_H as i64,
+                    "пандус у края карты: {x},{y}"
+                );
+                assert!(
+                    !map.blocks_tank(ax as u32, ay as u32, low),
+                    "к пандусу {x},{y} нельзя подъехать с низкой стороны: \
+                     тайл {ax},{ay} на слое {low} — {:?}, верх {high}, {:?}",
+                    map.kind(ax as u32, ay as u32, low),
+                    map.kind(ax as u32, ay as u32, high)
+                );
+                // Выход с полосы — на высокую сторону: там должен быть путь.
+                let bx = x as i64 + dx as i64;
+                let by = y as i64 + dy as i64;
+                assert!(
+                    bx >= 0 && by >= 0 && bx < MAP_W as i64 && by < MAP_H as i64,
+                    "пандус у края карты: {x},{y}"
+                );
+                assert!(
+                    !map.blocks_tank(bx as u32, by as u32, high),
+                    "с пандуса {x},{y} нельзя уехать на высокую сторону: \
+                     тайл {bx},{by} на слое {high} — {:?}, низкая сторона {low}",
+                    map.kind(bx as u32, by as u32, high)
+                );
             }
         }
     }
@@ -1151,8 +1684,65 @@ mod tests {
     #[test]
     fn tile_damage_bits_are_packed() {
         let mut map = GameMap::generate(64, 64, 1);
-        map.set_value(5, 5, LEVEL_GROUND, TileKind::Brick.bits() | (2 << 3));
-        assert_eq!(map.kind(5, 5, LEVEL_GROUND), TileKind::Brick);
-        assert_eq!(map.damage(5, 5, LEVEL_GROUND), 2);
+        map.set_value(5, 5, LAYER_GROUND, TileKind::Brick.bits() | (2 << 3));
+        assert_eq!(map.kind(5, 5, LAYER_GROUND), TileKind::Brick);
+        assert_eq!(map.damage(5, 5, LAYER_GROUND), 2);
+    }
+
+    #[test]
+    fn pits_are_holes_with_a_descent_ramp() {
+        let map = GameMap::generate(MAP_W, MAP_H, 11);
+        assert!(map.pits_count() >= 3, "на карте должны быть ямки");
+        for pit in &map.pits {
+            let mut ramp_found = false;
+            for ty in pit.y..pit.y + pit.h {
+                for tx in pit.x..pit.x + pit.w {
+                    let kind = map.kind(tx, ty, LAYER_GROUND);
+                    if kind == TileKind::Ramp {
+                        // Спуск в ямку: полоса ведёт с земли вниз.
+                        assert!(ramp_is_pit(map.value(tx, ty, LAYER_GROUND)));
+                        ramp_found = true;
+                        continue;
+                    }
+                    assert_eq!(kind, TileKind::Empty, "в ямке на земле — дыра");
+                    assert!(
+                        map.blocks_tank(tx, ty, LAYER_GROUND),
+                        "в ямку с земли уехать нельзя"
+                    );
+                    // Под землёй — стенки окопа по периметру и дно внутри.
+                    let below = map.kind(tx, ty, LAYER_PIT);
+                    let edge = tx == pit.x || tx == pit.x + pit.w - 1 || ty == pit.y || ty == pit.y + pit.h - 1;
+                    if edge && below != TileKind::Ramp {
+                        // Стенка окопа: по ней не ездят.
+                        assert_eq!(below, TileKind::Brick, "по периметру ямки — стенка");
+                        assert!(map.blocks_tank(tx, ty, LAYER_PIT));
+                    } else {
+                        // Дно ямки: по нему можно ездить.
+                        assert!(
+                            !map.blocks_tank(tx, ty, LAYER_PIT),
+                            "по дну ямки ездить можно"
+                        );
+                    }                }
+            }
+            assert!(ramp_found, "у ямки должен быть спускной пандус");
+        }
+    }
+
+    #[test]
+    fn ground_stays_drivable_under_the_upper_level() {
+        let map = GameMap::generate(MAP_W, MAP_H, 11);
+        // Мостик и холм лежат на верхнем слое — земля под ними остаётся
+        // проходимой: под мостиком можно проехать.
+        let mut bridges = 0;
+        for ty in 0..MAP_H {
+            for tx in 0..MAP_W {
+                if map.kind(tx, ty, LAYER_UPPER) == TileKind::Empty
+                    && map.kind(tx, ty, LAYER_GROUND) == TileKind::Empty
+                {
+                    bridges += 1;
+                }
+            }
+        }
+        assert!(bridges > 0, "на верхнем ярусе должны быть мостики");
     }
 }
