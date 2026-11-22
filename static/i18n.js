@@ -16,7 +16,7 @@
 export const LANGUAGES = ['ru', 'en'];
 
 /** Язык по умолчанию, если в localStorage ничего нет или он неизвестен. */
-export const DEFAULT_LANGUAGE = 'ru';
+export const DEFAULT_LANGUAGE = 'en';
 
 /** Ключ в localStorage, где хранится выбранный язык. */
 const STORAGE_KEY = 'tanchiki.lang';
@@ -50,6 +50,9 @@ const RU = Object.freeze({
   'hud.deck': 'ЯРУС',
   'hud.deck.lower': 'НИЖНИЙ',
   'hud.deck.upper': 'ВЕРХНИЙ',
+  // --- Три уровня высот ---
+  'hud.deck.pit': 'ЯМКА',
+  'hud.deck.ground': 'ЗЕМЛЯ',
 
   // --- HUD: способности ---
   'hud.abilities': 'СПОСОБНОСТИ · ПКМ',
@@ -64,12 +67,17 @@ const RU = Object.freeze({
   // --- HUD: звук и настройки ---
   'hud.soundOn': '🔊 ЗВУК',
   'hud.soundOff': '🔇 ЗВУК ВЫКЛ',
-  'settings.title': 'НАСТРОЙКИ ЗВУКА',
+  'hud.soundToggle': 'Звук',
+  'hud.mute': 'БЕЗ ЗВУКА',
+  'hud.unmute': 'ВКЛЮЧИТЬ ЗВУК',
+  'hud.mapSize': 'Размер карты',
+  'settings.title': 'НАСТРОЙКИ',
   'settings.master': 'Общая громкость',
   'settings.shots': 'Выстрелы',
   'settings.explosions': 'Взрывы',
   'settings.engine': 'Мотор',
   'settings.hits': 'Попадания и интерфейс',
+  'settings.language': 'Язык',
   'settings.hint': 'Настройки сохраняются в браузере',
 
   // --- HUD: подсказка по управлению ---
@@ -77,7 +85,7 @@ const RU = Object.freeze({
     '<b>WASD</b> / <b>стрелки</b> — корпус (в т.ч. по диагонали) · ' +
     '<b>мышь</b> — башня · <b>Пробел</b> / <b>ЛКМ</b> — огонь · ' +
     '<b>ПКМ</b> — способность · <b>1</b>–<b>2</b> — выбор · ' +
-    '<b>F</b> — во весь экран · <b>M</b> — звук',
+    '<b>F</b> — во весь экран · <b>K</b> — размер карты · <b>M</b> — звук',
 
   // --- Оверлей входа ---
   'welcome.title': 'ТАНЧИКИ',
@@ -89,12 +97,13 @@ const RU = Object.freeze({
     'мыши — можно ехать вбок и целиться в другую сторону. ЛКМ или Пробел — выстрел, ПКМ — ' +
     'выбранная способность (миномёт перелетает стены, авиаподдержка бьёт с воздуха), клавиши 1–2 ' +
     'переключают способность. Противники видны только там, куда смотрит башня: пройденная территория ' +
-    'остаётся на карте, но в «старом» виде. Карта двухэтажная: заезжаешь на жёлтый трамплин — это ' +
-    'пандус на верхний этаж — и оказываешься наверху, а текущий этаж показан в панели слева ' +
-    '(«ЯРУС»). Звезда повышает уровень танка: со второго уровня у него две пушки и выше ' +
-    'скорострельность, щит даёт неуязвимость, ремкомплект чинит броню. Выстрелы врагов слышны даже ' +
-    'когда их не видно — по звуку понятно, с какой стороны атакуют. Клавиша M — включить/выключить ' +
-    'звук.',
+    'остаётся на карте, но в «старом» виде. Карта трёхуровневая: земля, ямки-окопы ниже и холмы с ' +
+    'мостиками выше. Заезжаешь по жёлтому пандусу — меняешь высоту; из ямки настильный огонь не ' +
+    'достаёт, попасть можно только миномётом или авиаударом, зато с холма видно землю внизу. ' +
+    'Текущая высота показана в панели слева («ЯРУС»). Звезда повышает уровень танка: со второго уровня ' +
+    'у него две пушки и выше скорострельность, щит даёт неуязвимость, ремкомплект чинит броню. ' +
+    'Выстрелы врагов слышны даже когда их не видно — по звуку понятно, с какой стороны атакуют. ' +
+    'Клавиша F — развернуть карту на весь экран, K — размер карты, M — звук.',
 
   // --- Оверлей смерти ---
   'death.title': 'ТАНК УНИСЧТОЖЕН',
@@ -133,6 +142,9 @@ const EN = Object.freeze({
   'hud.deck': 'DECK',
   'hud.deck.lower': 'LOWER',
   'hud.deck.upper': 'UPPER',
+  // --- Three elevation levels ---
+  'hud.deck.pit': 'PIT',
+  'hud.deck.ground': 'GROUND',
 
   // --- HUD: abilities ---
   'hud.abilities': 'ABILITIES · RMB',
@@ -147,12 +159,17 @@ const EN = Object.freeze({
   // --- HUD: sound and settings ---
   'hud.soundOn': '🔊 SOUND',
   'hud.soundOff': '🔇 SOUND OFF',
-  'settings.title': 'AUDIO SETTINGS',
+  'hud.soundToggle': 'Sound',
+  'hud.mute': 'MUTE',
+  'hud.unmute': 'UNMUTE',
+  'hud.mapSize': 'Map size',
+  'settings.title': 'SETTINGS',
   'settings.master': 'Master volume',
   'settings.shots': 'Shots',
   'settings.explosions': 'Explosions',
   'settings.engine': 'Engine',
   'settings.hits': 'Hits and interface',
+  'settings.language': 'Language',
   'settings.hint': 'Settings are saved in your browser',
 
   // --- HUD: controls hint ---
@@ -160,7 +177,7 @@ const EN = Object.freeze({
     '<b>WASD</b> / <b>arrows</b> — body (incl. diagonals) · ' +
     '<b>mouse</b> — turret · <b>Space</b> / <b>LMB</b> — fire · ' +
     '<b>RMB</b> — ability · <b>1</b>–<b>2</b> — select · ' +
-    '<b>F</b> — fullscreen map · <b>M</b> — sound',
+    '<b>F</b> — fullscreen map · <b>K</b> — map size · <b>M</b> — sound',
 
   // --- Welcome overlay ---
   'welcome.title': 'TANCHEKI',
@@ -172,12 +189,14 @@ const EN = Object.freeze({
     'your mouse cursor — you can strafe sideways and aim in another direction. LMB or Space fires, ' +
     'RMB uses the selected ability (the mortar flies over walls, the air strike hits from above), ' +
     'keys 1–2 switch the ability. Enemies are visible only where your turret is looking: the ground ' +
-    'you have passed stays on the map, but in its “old” state. The map has two floors: drive onto ' +
-    'the yellow ramp — it is a ramp up to the upper floor — and you end up upstairs, while your ' +
-    'current floor is shown in the panel on the left (“DECK”). A star raises the tank level: from ' +
-    'the second level it has two guns and a higher rate of fire, a shield grants invulnerability, ' +
-    'and a repair kit fixes the armor. Enemy shots are audible even when the enemy is not visible — ' +
-    'the sound tells you which side the attack comes from. Press M to toggle the sound.',
+    'you have passed stays on the map, but in its “old” state. The map has three levels: the ground, ' +
+    'trenches below it and hills with bridges above it. Drive onto a yellow ramp to change your ' +
+    'elevation; from a trench flat fire cannot reach you — only the mortar or the air strike can, ' +
+    'but from a hill you can shoot down at the ground. Your current elevation is shown in the panel ' +
+    'on the left (“DECK”). A star raises the tank level: from the second level it has two guns and ' +
+    'a higher rate of fire, a shield grants invulnerability, and a repair kit fixes the armor. ' +
+    'Enemy shots are audible even when the enemy is not visible — the sound tells you which side ' +
+    'the attack comes from. Press F for the fullscreen map, K for the map size, M for the sound.',
 
   // --- Death overlay ---
   'death.title': 'TANK DESTROYED',
@@ -370,6 +389,31 @@ export function applyI18n(root) {
   for (const el of scope.querySelectorAll('[data-lang-toggle]')) {
     el.textContent = currentLanguage === 'ru' ? 'EN' : 'RU';
   }
+
+  // Переключатель EN / RU: активный язык подсвечивается.
+  for (const el of scope.querySelectorAll('[data-lang-set]')) {
+    const lang = el.getAttribute('data-lang-set');
+    const active = lang === currentLanguage;
+    el.classList.toggle('is-active', active);
+    el.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
+/**
+ * Вешает обработчик клика на кнопки выбора языка `[data-lang-set="en|ru"]`.
+ * @param {ParentNode} root
+ */
+function bindLanguageSetButtons(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') return;
+  for (const el of root.querySelectorAll('[data-lang-set]')) {
+    if (boundToggles.has(el)) continue;
+    boundToggles.add(el);
+    el.addEventListener('click', (event) => {
+      event.preventDefault();
+      const lang = el.getAttribute('data-lang-set');
+      if (lang) setLanguage(lang);
+    });
+  }
 }
 
 /**
@@ -399,6 +443,7 @@ export function initI18n() {
   if (typeof document !== 'undefined') {
     applyI18n(document);
     bindLanguageToggles(document);
+    bindLanguageSetButtons(document);
   }
   return currentLanguage;
 }

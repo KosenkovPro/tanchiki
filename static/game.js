@@ -28,10 +28,10 @@ import {
   encodePing,
 } from './protocol.js';
 
-import { initI18n, t } from './i18n.js';
+import { initI18n, t, setLanguage, getLanguage } from './i18n.js';
 
 // ---------------------------------------------------------------------------
-// Константы (зеркалят src/game.rs)
+// Константы (зеркалят src/map.rs)
 // ---------------------------------------------------------------------------
 
 const TANK_SIZE = 30;
@@ -48,24 +48,71 @@ const VISION_HALF_ANGLE = Math.PI / 3;
 /** Дальность применения способности. */
 const ABILITY_RANGE = 1400;
 
-/** Нижний ярус — земля. */
-const LEVEL_GROUND = 0;
-/** Верхний ярус — площадки и перекрытия. */
-const LEVEL_UPPER = 1;
-/** Сколько ярусов на карте. */
-const LEVEL_COUNT = 2;
+/** Нижний слой — дно ямки (высота −1). */
+const LEVEL_PIT = 0;
+/** Средний слой — земля (высота 0). */
+const LEVEL_GROUND = 1;
+/** Верхний слой — возвышенности и мостики (высота +1). */
+const LEVEL_UPPER = 2;
+/** Сколько слоёв на карте. */
+const LEVEL_COUNT = 3;
+
+/**
+ * Высота слоя: 0 → −1, 1 → 0, 2 → +1.
+ * @param {number} layer индекс слоя
+ * @returns {number} высота в «этажах»
+ */
+function layerElev(layer) {
+  return layer - 1;
+}
+
+/**
+ * Вид тайла «дно ямки».
+ *
+ * В `static/protocol.js` такого вида пока нет, поэтому константа объявлена
+ * здесь. Если протокол её добавит — будет взят именно его вариант.
+ */
+const TILE_PIT = TILE.PIT ?? 7;
+
+/** Бит «пандус ведёт вниз (земля ↔ ямка)» в байте тайла. */
+const RAMP_FLAG_PIT = 0x80;
+
+/**
+ * Может ли снаряд слоя `bulletLayer` поразить танк слоя `targetLayer`.
+ *
+ * Зеркало серверного `flat_shot_hits`: настильный огонь летит по своему
+ * слою, а снаряд с верхнего яруса (+1) дополнительно достаёт до земли (0).
+ *
+ * @param {number} bulletLayer слой снаряда
+ * @param {number} targetLayer слой цели
+ * @returns {boolean}
+ */
+function flatShotHits(bulletLayer, targetLayer) {
+  return bulletLayer === targetLayer || (bulletLayer === LEVEL_UPPER && targetLayer === LEVEL_GROUND);
+}
+
+/**
+ * Пустой тайл.
+ *
+ * На земле пустота — это трава (или дыра в яму), на слое ямок — сплошная
+ * земля над головой, на верхнем ярусе — настил.
+ */
+const TILE_EMPTY = TILE.EMPTY;
 
 /**
  * Длина полосы пандуса в тайлах.
  *
- * Полоса идёт от нижнего этажа к верхнему: тайл с индексом 0 — это
- * «вход» на земле, тайл с индексом 2 — вершина у верхней площадки.
+ * Полоса идёт от нижней стороны к верхней: тайл с индексом 0 — это
+ * «низ» полосы (дно ямки или земля), тайл с индексом 2 — «верх»
+ * (кромка земли или вершина холма).
  */
 const RAMP_LEN = 3;
 /** Индекс тайла в начале полосы (нижний край). */
 const RAMP_BOTTOM = 0;
 /** Индекс тайла в конце полосы (верхний край). */
 const RAMP_TOP = RAMP_LEN - 1;
+/** Индекс среднего тайла полосы — по нему видно, что танк проехал полосу. */
+const RAMP_MIDDLE = RAMP_LEN - 2;
 /**
  * Высота подъёма пандуса в мировых пикселях.
  *
@@ -73,6 +120,48 @@ const RAMP_TOP = RAMP_LEN - 1;
  * на полосе плавно поднимается, а под ним идёт тень по земле.
  */
 const RAMP_HEIGHT = 26;
+
+/**
+ * Высота боковой стенки уступа (мост, холм) в пикселях.
+ *
+ * Стенка показывает, что верхний ярус — это не плоская картинка, а
+ * настоящий перепад высоты.
+ */
+const LEDGE_HEIGHT = 10;
+
+/**
+ * Ширина «нависающей кромки» ямки в пикселях.
+ *
+ * Кромка рисуется поверх ямы и создаёт ощущение углубления.
+ */
+const PIT_RIM = 7;
+
+/**
+ * Палитра рельефа.
+ *
+ * Карта светлая: сочная зелёная трава, тёплая кладка, насыщенная вода.
+ * Цвета подобраны так, чтобы все виды тайлов различались с одного взгляда.
+ */
+const TERRAIN = Object.freeze({
+  grass: ['#6fb04a', '#68a744', '#77b852', '#5f9e3f'],
+  brick: '#b4572c',
+  brickDark: '#7d3a1c',
+  steel: '#b9c2cc',
+  steelDark: '#8b949f',
+  water: '#1f6fd0',
+  waterDeep: '#174f9c',
+  forest: '#3f9147',
+  forestLight: '#57ab5f',
+  ice: '#bfe6f5',
+  pit: '#6d4a2e',
+  pitDark: '#4c3320',
+  pitWall: '#6f3520',
+  deck: '#b58b52',
+  deckDark: '#8a663a',
+  deckTop: '#cda468',
+  shadow: 'rgba(20,26,16,0.28)',
+  fog: [26, 44, 24],
+});
 
 /**
  * Насколько быстро проявляется и гаснет тайл тумана.
@@ -137,7 +226,15 @@ const statKills = document.getElementById('stat-kills');
 const statPing = document.getElementById('stat-ping');
 const statFps = document.getElementById('stat-fps');
 const statDeck = document.getElementById('stat-deck');
+/** Старая кнопка звука в подсказках: её может уже не быть в DOM. */
 const soundButton = document.getElementById('sound-toggle');
+/** Компактная панель звука в правом нижнем углу. */
+const soundHub = document.getElementById('sound-hub');
+const soundHubBtn = document.getElementById('sound-hub-btn');
+const soundPopover = document.getElementById('sound-popover');
+const muteButton = document.getElementById('btn-mute');
+/** Выбор размера мини-карты. */
+const mapSizeSelect = document.getElementById('minimap-size');
 const abilityBar = document.getElementById('ability-bar');
 const abilityHint = document.getElementById('ability-hint');
 
@@ -153,6 +250,17 @@ const VOLUME_INPUTS = {
   engine: document.getElementById('vol-engine'),
   hits: document.getElementById('vol-hits'),
 };
+
+/**
+ * Размеры мини-карты в пикселях — по кругу переключаются клавишей K.
+ */
+const MINIMAP_SIZES = [150, 200, 260, 320];
+
+/** Размер мини-карты по умолчанию. */
+const MINIMAP_SIZE_DEFAULT = 200;
+
+/** Ключ в localStorage, где хранится размер мини-карты. */
+const MINIMAP_SIZE_KEY = 'tanchiki.mapSize';
 
 
 // ---------------------------------------------------------------------------
@@ -264,6 +372,8 @@ let terrainCtxs = [];
 let sprites = null;
 /** Развёрнута ли мини-карта на весь экран. */
 let minimapExpanded = false;
+/** Текущий размер мини-карты в пикселях (150 / 200 / 260 / 320). */
+let minimapSize = MINIMAP_SIZE_DEFAULT;
 
 // ---------------------------------------------------------------------------
 // Звук
@@ -551,10 +661,11 @@ function noiseBuffer() {
 /**
  * Процедурный звук танкового выстрела.
  *
- * Три слоя складываются в характерный «бум» пушки:
- *  1) низкочастотный свип синуса 150 → 45 Гц — сама тяга выстрела;
- *  2) шумовой всплеск через lowpass — выстрел как таковой;
- *  3) короткий металлический отзвук — ствол и отдача.
+ * Четыре слоя складываются в характерный «бум» пушки:
+ *  1) глубокий сабовый удар — 90 → 38 Гц за 0.12 с: тяга и вес выстрела;
+ *  2) тело выстрела — синус 150 → 45 Гц;
+ *  3) короткий пороховой щелчок — шум через узкий фильтр;
+ *  4) металлический резонанс ствола — короткий отзвук.
  *
  * Звук собирается из генераторов прямо в браузере: никаких внешних
  * файлов, лицензионных вопросов и полного контроля над тембром.
@@ -569,50 +680,80 @@ function playTankShot(dest, volume = 1, pitch = 1) {
   if (ctx.state === 'suspended') ctx.resume();
   const now = ctx.currentTime;
 
-  // 1) Низкочастотная «ударная волна».
+  // 1) Сабовый удар: резкий спад частоты — самый «низкий» слой звука.
+  const sub = ctx.createOscillator();
+  sub.type = 'sine';
+  sub.frequency.setValueAtTime(90 * pitch, now);
+  sub.frequency.exponentialRampToValueAtTime(38 * pitch, now + 0.12);
+  const subGain = ctx.createGain();
+  subGain.gain.setValueAtTime(0.0001, now);
+  subGain.gain.exponentialRampToValueAtTime(0.85 * volume, now + 0.008);
+  subGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.32);
+
+  // 2) Тело выстрела.
   const osc = ctx.createOscillator();
   osc.type = 'sine';
   osc.frequency.setValueAtTime(150 * pitch, now);
   osc.frequency.exponentialRampToValueAtTime(45 * pitch, now + 0.3);
   const og = ctx.createGain();
   og.gain.setValueAtTime(0.0001, now);
-  og.gain.exponentialRampToValueAtTime(0.95 * volume, now + 0.014);
+  og.gain.exponentialRampToValueAtTime(0.55 * volume, now + 0.014);
   og.gain.exponentialRampToValueAtTime(0.0001, now + 0.45);
 
-  // 2) Шумовой всплеск — «порох».
-  const noise = ctx.createBufferSource();
-  noise.buffer = noiseBuffer();
-  const lp = ctx.createBiquadFilter();
-  lp.type = 'lowpass';
-  lp.frequency.setValueAtTime(2800, now);
-  lp.frequency.exponentialRampToValueAtTime(300, now + 0.28);
-  lp.Q.value = 0.9;
-  const ng = ctx.createGain();
-  ng.gain.setValueAtTime(0.0001, now);
-  ng.gain.exponentialRampToValueAtTime(0.5 * volume, now + 0.008);
-  ng.gain.exponentialRampToValueAtTime(0.0001, now + 0.3);
+  // 3) Пороховой щелчок: короткий шум через узкий фильтр.
+  const click = ctx.createBufferSource();
+  click.buffer = noiseBuffer();
+  const bp = ctx.createBiquadFilter();
+  bp.type = 'bandpass';
+  bp.frequency.setValueAtTime(2600 * pitch, now);
+  bp.Q.value = 1.1;
+  const clickGain = ctx.createGain();
+  clickGain.gain.setValueAtTime(0.0001, now);
+  clickGain.gain.exponentialRampToValueAtTime(0.35 * volume, now + 0.004);
+  clickGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.07);
 
-  // 3) Металлический отзвук ствола.
+  // 4) Металлический резонанс ствола: шум в узкой полосе + треугольник.
+  const metal = ctx.createBufferSource();
+  metal.buffer = noiseBuffer();
+  const mb = ctx.createBiquadFilter();
+  mb.type = 'bandpass';
+  mb.frequency.setValueAtTime(1500 * pitch, now);
+  mb.frequency.exponentialRampToValueAtTime(700 * pitch, now + 0.12);
+  mb.Q.value = 6;
+  const mg = ctx.createGain();
+  mg.gain.setValueAtTime(0.0001, now);
+  mg.gain.exponentialRampToValueAtTime(0.25 * volume, now + 0.005);
+  mg.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+
   const ring = ctx.createOscillator();
   ring.type = 'triangle';
   ring.frequency.setValueAtTime(430 * pitch, now);
   const rg = ctx.createGain();
   rg.gain.setValueAtTime(0.0001, now);
-  rg.gain.exponentialRampToValueAtTime(0.2 * volume, now + 0.006);
+  rg.gain.exponentialRampToValueAtTime(0.15 * volume, now + 0.006);
   rg.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
 
+  sub.connect(subGain);
   osc.connect(og);
-  noise.connect(lp);
-  lp.connect(ng);
+  click.connect(bp);
+  bp.connect(clickGain);
+  metal.connect(mb);
+  mb.connect(mg);
   ring.connect(rg);
+  subGain.connect(dest);
   og.connect(dest);
-  ng.connect(dest);
+  clickGain.connect(dest);
+  mg.connect(dest);
   rg.connect(dest);
 
+  sub.start(now);
+  sub.stop(now + 0.36);
   osc.start(now);
   osc.stop(now + 0.5);
-  noise.start(now);
-  noise.stop(now + 0.35);
+  click.start(now);
+  click.stop(now + 0.09);
+  metal.start(now);
+  metal.stop(now + 0.18);
   ring.start(now);
   ring.stop(now + 0.2);
 }
@@ -694,10 +835,86 @@ function toggleSound() {
   updateSoundButton();
 }
 
+/**
+ * Открыта ли всплывающая панель звука.
+ * @returns {boolean}
+ */
+function isSoundPopoverOpen() {
+  if (!soundPopover) return false;
+  return soundPopover.classList.contains('open') || soundPopover.classList.contains('is-open');
+}
+
+/**
+ * Открывает или закрывает панель звука.
+ *
+ * Класс `open`/`is-open` — для стилей, `hidden` — для старого соглашения
+ * проекта: так панель открывается при любом оформлении.
+ *
+ * @param {boolean} open
+ */
+function setSoundPopoverOpen(open) {
+  if (!soundPopover) return;
+  soundPopover.classList.toggle('open', open);
+  soundPopover.classList.toggle('is-open', open);
+  soundPopover.classList.toggle('hidden', !open);
+  if (soundHubBtn) soundHubBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+/**
+ * Обновляет иконки звука и подпись кнопки mute.
+ */
 function updateSoundButton() {
-  if (!soundButton) return;
-  soundButton.textContent = audio.enabled ? tr('hud.soundOn', '🔊 ЗВУК') : tr('hud.soundOff', '🔇 ЗВУК ВЫКЛ');
-  soundButton.classList.toggle('off', !audio.enabled);
+  const icon = audio.enabled ? '🔊' : '🔇';
+  const label = tr('hud.soundToggle', 'Sound');
+  if (soundHubBtn) {
+    soundHubBtn.textContent = icon;
+    soundHubBtn.classList.toggle('off', !audio.enabled);
+    soundHubBtn.classList.toggle('muted', !audio.enabled);
+    soundHubBtn.setAttribute('aria-label', label);
+    soundHubBtn.setAttribute('title', label);
+  }
+  // Старая кнопка в подсказках может остаться в DOM — работаем с ней,
+  // если она есть.
+  if (soundButton) {
+    soundButton.textContent = audio.enabled ? tr('hud.soundOn', '🔊 ЗВУК') : tr('hud.soundOff', '🔇 ЗВУК ВЫКЛ');
+    soundButton.classList.toggle('off', !audio.enabled);
+  }
+  if (muteButton) {
+    muteButton.textContent = audio.enabled
+      ? tr('hud.mute', 'MUTE')
+      : tr('hud.unmute', 'UNMUTE');
+    muteButton.classList.toggle('muted', !audio.enabled);
+  }
+}
+
+/**
+ * Подсвечивает кнопки выбора языка.
+ */
+function updateLanguageButtons() {
+  const current = getLanguage();
+  for (const btn of document.querySelectorAll('[data-lang-set]')) {
+    btn.classList.toggle('is-active', btn.getAttribute('data-lang-set') === current);
+  }
+}
+
+/**
+ * Включает язык по кнопке `[data-lang-set="en|ru"]`.
+ *
+ * Слушатель делегирован на документ: кнопки есть и на стартовом экране,
+ * и в панели звука, а появятся они могут когда угодно.
+ */
+function bindLanguageButtons() {
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!target || typeof target.closest !== 'function') return;
+    const btn = target.closest('[data-lang-set]');
+    if (!btn) return;
+    e.preventDefault();
+    const lang = btn.getAttribute('data-lang-set');
+    if (lang !== 'en' && lang !== 'ru') return;
+    setLanguage(lang);
+    updateLanguageButtons();
+  });
 }
 
 
@@ -818,6 +1035,9 @@ function applyMap(map) {
     levels: layers.length,
     layers,
   };
+  // Маска настила верхнего яруса: мостики и холмы, а не пустота.
+  // Считаем её до рельефа мини-карты — от неё зависит цвет настила.
+  refreshUpperDeckMask();
   buildTerrainCanvases();
   // Новая карта — память исследованного сбрасывается.
   fog.explored = [];
@@ -905,11 +1125,13 @@ function applySnapshot(msg) {
   // Обновляем карту дельтами.
   if (msg.tiles.length && state.map) {
     for (const t of msg.tiles) {
-      const deck = t.deck ?? 0;
+      const deck = t.deck ?? LEVEL_GROUND;
       const layer = state.map.layers[deck];
       if (!layer) continue;
       if (t.x < state.map.width && t.y < state.map.height) {
         layer[t.y * state.map.width + t.x] = t.value;
+        // Настил верхнего яруса мог измениться — пересчитываем маску.
+        refreshUpperDeckMask();
         paintTerrainTile(t.x, t.y, deck);
       }
     }
@@ -917,8 +1139,8 @@ function applySnapshot(msg) {
 
   // События мира.
   for (const ev of msg.events) {
-    const evDeck = ev.deck ?? 0;
-    if (evDeck !== state.deck) continue; // события другого этажа не показываем
+    const evDeck = ev.deck ?? LEVEL_GROUND;
+    if (evDeck !== state.deck) continue; // события другого слоя не показываем
     if (ev.kind === 'explosion') {
       spawnExplosion(ev.x, ev.y, ev.size);
       // Громкость взрыва зависит от расстояния до камеры.
@@ -1045,17 +1267,28 @@ window.addEventListener('keydown', (e) => {
     toggleSound();
     return;
   }
+  // K — размер мини-карты: переключение по кругу.
+  if (e.code === 'KeyK') {
+    e.preventDefault();
+    cycleMapSize();
+    return;
+  }
   // F — развернуть или свернуть карту на весь экран.
   if (e.code === 'KeyF') {
     e.preventDefault();
     setMinimapExpanded(!minimapExpanded);
     return;
   }
-  // Esc — свернуть развёрнутую карту.
+  // Esc — свернуть развёрнутую карту или закрыть панель звука.
   if (e.code === 'Escape') {
     if (minimapExpanded) {
       e.preventDefault();
       setMinimapExpanded(false);
+      return;
+    }
+    if (isSoundPopoverOpen()) {
+      e.preventDefault();
+      setSoundPopoverOpen(false);
     }
     return;
   }
@@ -1086,6 +1319,44 @@ if (soundButton) {
   soundButton.addEventListener('click', () => {
     initAudio();
     toggleSound();
+  });
+}
+
+// Иконка динамика в правом нижнем углу: только открывает панель.
+// Mute переключается отдельной кнопкой и клавишей M.
+if (soundHubBtn) {
+  soundHubBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    initAudio();
+    setSoundPopoverOpen(!isSoundPopoverOpen());
+  });
+}
+
+if (muteButton) {
+  muteButton.addEventListener('click', (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    initAudio();
+    toggleSound();
+  });
+}
+
+// Клик вне панели звука закрывает её.
+document.addEventListener('click', (e) => {
+  if (!isSoundPopoverOpen()) return;
+  const target = e.target;
+  if (!target) return;
+  if (soundHub && typeof soundHub.contains === 'function' && soundHub.contains(target)) return;
+  if (soundPopover && typeof soundPopover.contains === 'function' && soundPopover.contains(target)) return;
+  setSoundPopoverOpen(false);
+});
+
+// Выбор размера мини-карты.
+if (mapSizeSelect) {
+  mapSizeSelect.addEventListener('change', () => {
+    const num = Number(mapSizeSelect.value);
+    if (MINIMAP_SIZES.includes(num)) setMapSize(num);
   });
 }
 
@@ -1151,11 +1422,29 @@ canvas.addEventListener(
 // Предсказание движения
 // ---------------------------------------------------------------------------
 
-function mapRectFree(x, y, size, deck = pred.deck) {
+/**
+ * Свободно ли место для танка в прямоугольнике на заданном слое.
+ *
+ * Зеркало серверного `GameMap::rect_is_free`:
+ *  - на слое ямок проходимы только дно (`Pit`) и пандус (`Ramp`); пустота
+ *    здесь означает «сверху сплошная земля», а не «пусто»;
+ *  - на земле тайл непроходим, если сам он блокирует (кирпич/бетон/вода)
+ *    либо если под ним ямка (на слое ямок `Pit` или `Brick`) — это дыра,
+ *    в которую можно попасть только по спускному пандусу;
+ *  - на верхнем ярусе блокируют кирпич, бетон и вода.
+ *
+ * @param {number} x     левый край в мировых пикселях
+ * @param {number} y     верхний край в мировых пикселях
+ * @param {number} size  размер танка (сторона квадрата)
+ * @param {number} layer слой (0 — ямка, 1 — земля, 2 — верх)
+ * @returns {boolean}
+ */
+function mapRectFree(x, y, size, layer = pred.deck) {
   const m = state.map;
   if (!m) return true;
-  const layer = m.layers[deck];
-  if (!layer) return true;
+  const tiles = m.layers[layer];
+  if (!tiles) return true;
+  const pitLayer = m.layers[LEVEL_PIT];
   const ts = m.tileSize;
   const x0 = Math.floor(x / ts);
   const y0 = Math.floor(y / ts);
@@ -1164,8 +1453,23 @@ function mapRectFree(x, y, size, deck = pred.deck) {
   for (let ty = y0; ty <= y1; ty++) {
     for (let tx = x0; tx <= x1; tx++) {
       if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
-      const kind = layer[ty * m.width + tx] & 7;
+      const kind = tiles[ty * m.width + tx] & 7;
+      if (layer === LEVEL_PIT) {
+        // Дно ямки и пандус — единственные проходимые тайлы.
+        if (kind !== TILE_PIT && kind !== TILE.RAMP) return false;
+        continue;
+      }
       if (kind === TILE.BRICK || kind === TILE.STEEL || kind === TILE.WATER) return false;
+      if (layer === LEVEL_UPPER) {
+        // На верхнем ярусе пустота — пропасть: ездить можно только по
+        // настилам мостов и холмов.
+        if (kind === TILE_EMPTY && (tiles[ty * m.width + tx] & DECK_FLAG) === 0) return false;
+      }
+      if (layer === LEVEL_GROUND && pitLayer) {
+        // Дыра в земле: под нами либо дно ямки, либо её стенка.
+        const below = pitLayer[ty * m.width + tx] & 7;
+        if (below !== TILE_EMPTY && below !== TILE.RAMP) return false;
+      }
     }
   }
   return true;
@@ -1194,67 +1498,95 @@ function resetRampState() {
  * Данные о полосе пандуса под точкой.
  *
  * В байте тайла пандуса закодированы: вид тайла (младшие 3 бита),
- * направление полосы (биты 3–4) и индекс тайла в полосе (биты 5–6).
+ * направление полосы (биты 3–4), индекс тайла в полосе (биты 5–6) и бит 7 —
+ * «пандус ведёт вниз, в ямку».
  *
  * Направление полосы: 0 — вправо, 1 — вниз, 2 — влево, 3 — вверх.
- * Индекс: 0 — нижний край (уровень земли), 2 — вершина (верхний этаж).
+ * Индекс: 0 — низкая сторона полосы, 2 — высокая.
  *
- * @returns {{dir:number, idx:number, tx:number, ty:number}|null}
+ * @param {number} x     мировая координата (левый край танка)
+ * @param {number} y     мировая координата (верхний край танка)
+ * @param {number} layer слой
+ * @returns {{dir:number, idx:number, toPit:boolean, tx:number, ty:number}|null}
  */
-function rampInfoAt(x, y, deck = pred.deck) {
+function rampInfoAt(x, y, layer = pred.deck) {
   const m = state.map;
   if (!m) return null;
-  const layer = m.layers[deck];
-  if (!layer) return null;
+  const tiles = m.layers[layer];
+  if (!tiles) return null;
   const cx = x + TANK_SIZE / 2;
   const cy = y + TANK_SIZE / 2;
   const tx = Math.floor(cx / m.tileSize);
   const ty = Math.floor(cy / m.tileSize);
   if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return null;
-  const v = layer[ty * m.width + tx];
+  const v = tiles[ty * m.width + tx];
   if ((v & 7) !== TILE.RAMP) return null;
-  return { dir: (v >> 3) & 3, idx: (v >> 5) & 3, tx, ty };
+  return {
+    dir: (v >> 3) & 3,
+    idx: (v >> 5) & 3,
+    toPit: (v & RAMP_FLAG_PIT) !== 0,
+    tx,
+    ty,
+  };
 }
 
 /**
  * Высота подъёма пандуса под точкой (в мировых пикселях).
  *
- * Вне пандуса высота этажа постоянна: земля — ноль, верхняя площадка —
- * полная высота подъёма. На самом пандусе высота растёт линейно от
- * нижнего края полосы к верхнему, поэтому подъём выглядит непрерывным.
+ * Вне пандуса высота слоя постоянна: земля — ноль, верхний ярус — полная
+ * высота подъёма, дно ямки — та же высота вниз.
+ *
+ * На самом пандусе высота меняется линейно вдоль полосы: `progress` — это
+ * положение точки на полосе (0 — низкая сторона, RAMP_LEN — высокая).
+ * Подъёмный пандус ведёт вверх (земля → верх), спускной — вниз
+ * (дно ямки → земля), поэтому у спускного знак отрицательный.
+ *
+ * @param {number} x     мировая координата
+ * @param {number} y     мировая координата
+ * @param {number} layer слой
+ * @returns {number} высота в пикселях
  */
-function rampHeightAt(x, y, deck = pred.deck) {
-  const info = rampInfoAt(x, y, deck);
-  if (!info) return deck === LEVEL_UPPER ? RAMP_HEIGHT : 0;
+function rampHeightAt(x, y, layer = pred.deck) {
+  const info = rampInfoAt(x, y, layer);
+  if (!info) {
+    if (layer === LEVEL_UPPER) return RAMP_HEIGHT;
+    if (layer === LEVEL_PIT) return -RAMP_HEIGHT;
+    return 0;
+  }
   const m = state.map;
   const ts = m.tileSize;
   const cx = x + TANK_SIZE / 2;
   const cy = y + TANK_SIZE / 2;
-  // Доля тайла вдоль направления подъёма: 0 — внизу полосы, 1 — вверху.
+  // Доля тайла вдоль направления полосы: 0 — низкая сторона, 1 — высокая.
   let frac;
   if (info.dir === 0) frac = (cx - info.tx * ts) / ts;
   else if (info.dir === 1) frac = (cy - info.ty * ts) / ts;
   else if (info.dir === 2) frac = 1 - (cx - info.tx * ts) / ts;
   else frac = 1 - (cy - info.ty * ts) / ts;
   frac = Math.max(0, Math.min(1, frac));
-  // Прогресс по полосе: 0 — нижний край, RAMP_LEN — верхний.
+  // Прогресс по полосе: 0 — низкий край, RAMP_LEN — высокий.
   const progress = info.idx + frac;
+  if (info.toPit) {
+    // Спускной пандус: низ — дно ямки (−RAMP_HEIGHT), верх — земля (0).
+    return -((RAMP_LEN - progress) / RAMP_LEN) * RAMP_HEIGHT;
+  }
   return (progress / RAMP_LEN) * RAMP_HEIGHT;
 }
 
 /**
- * Непрерывный переход между ярусами по пандусу.
+ * Непрерывный переход между слоями по пандусу.
  *
- * Пандус — полоса из трёх тайлов: тайл 0 — нижний край (уровень земли),
- * тайл 1 — середина, тайл 2 — верхний край (верхняя площадка). Полоса —
- * это наклонная поверхность: на нижнем ярусе ею поднимаются наверх, на
- * верхнем — спускаются вниз.
+ * Пандус — полоса из трёх тайлов: тайл 0 — низкая сторона, тайл 2 — высокая.
+ * Подъёмный пандус связывает землю и верх, спускной — ямку и землю.
  *
- * Цель перехода задаёт этаж, а не направление езда: снизу цель — верхний
- * край полосы, сверху — нижний. Поэтому заезд сбоку или с «не того» края
- * тоже отрабатывает правильно, и ярус не меняется случайно.
+ * Правило перехода (зеркало серверного `Game::update_deck`):
+ *  - на низкой стороне полосы цель перехода — край высокой стороны (idx 2);
+ *  - на высокой стороне цель — край низкой стороны (idx 0);
+ *  - слой меняется, только если на новом слое танк помещается.
  *
- * Логика — зеркало серверной `Game::update_deck`.
+ * Сторона определяется не сравнением слоёв, а самим пандусом
+ * (`ramp_low_layer`/`ramp_high_layer`), поэтому подъёмный и спускной
+ * пандусы обрабатываются одинаково.
  */
 function updatePredictedDeck() {
   const info = rampInfoAt(pred.x, pred.y, pred.deck);
@@ -1269,11 +1601,22 @@ function updatePredictedDeck() {
     pred.rampIndex = info.idx;
     pred.rampSwitched = false;
   }
-  // Снизу едем к вершине полосы, сверху — к её основанию.
-  pred.rampTarget = pred.deck === LEVEL_GROUND ? RAMP_TOP : RAMP_BOTTOM;
-  if (info.idx === pred.rampTarget && !pred.rampSwitched) {
-    const next = pred.deck === LEVEL_GROUND ? LEVEL_UPPER : LEVEL_GROUND;
-    // Переключаемся только если на новом ярусе тоже можно стоять.
+  // Низкая и высокая стороны полосы — по типу пандуса.
+  const lowLayer = info.toPit ? LEVEL_PIT : LEVEL_GROUND;
+  const highLayer = info.toPit ? LEVEL_GROUND : LEVEL_UPPER;
+  const onLowSide = pred.deck === lowLayer;
+  pred.rampTarget = onLowSide ? RAMP_TOP : RAMP_BOTTOM;
+  // Смена тайла в полосе — это новый заезд: счётчик переключений сбрасываем
+  // (зеркало серверного `update_deck`).
+  if (info.idx !== pred.rampIndex) {
+    pred.rampSwitched = false;
+  }
+  // Переход — только если танк реально проехал полосу: перед крайним тайлом
+  // должен быть средний. Наехать сбоку на край пандуса — не переход.
+  const prevIndex = pred.rampIndex;
+  if (info.idx === pred.rampTarget && prevIndex === RAMP_MIDDLE && !pred.rampSwitched) {
+    const next = onLowSide ? highLayer : lowLayer;
+    // Переключаемся только если на новом слое тоже можно стоять.
     if (mapRectFree(pred.x, pred.y, TANK_SIZE, next)) {
       pred.deck = next;
       state.deck = next;
@@ -1409,6 +1752,15 @@ function ensureFog() {
   fog.canvas.height = m.height;
   fog.ctx = fog.canvas.getContext('2d');
   fog.image = fog.ctx.createImageData(m.width, m.height);
+  // Туман — не чёрный, а тёмно-зелёный: карта выглядит светлее, но
+  // неисследованное всё равно не читается.
+  const pixels = fog.image.data;
+  for (let i = 0; i < pixels.length; i += 4) {
+    pixels[i] = TERRAIN.fog[0];
+    pixels[i + 1] = TERRAIN.fog[1];
+    pixels[i + 2] = TERRAIN.fog[2];
+    pixels[i + 3] = 0;
+  }
   // «Старый» вид тайлов — снимок того, как карта выглядела изначально.
   for (let d = 0; d < LEVEL_COUNT; d++) {
     const layer = m.layers[d];
@@ -1534,21 +1886,28 @@ function updateVisibility(cx, cy, aim, deck) {
 }
 
 /**
- * Плавно гасит освещённость тайлов.
+ * Плавно гасит освещённость тайлов всех слоёв.
  *
  * Значение не прыгает сразу на 0 или 1, а подтягивается к цели — поэтому
  * граница конуса не «щёлкает», а растворяется. Именно это убирает моргание.
+ *
+ * Гасим сразу все слои: соседние слои тоже видны сквозь дыры и мосты,
+ * и их освещённость должна вести себя так же.
+ *
+ * @param {number} dt время кадра в секундах
  */
-function updateFogFade(dt, deck) {
+function updateFogFade(dt) {
   const m = state.map;
   if (!m || !ensureFog()) return;
-  const light = fog.light[deck];
-  const target = fog.target[deck];
-  const explored = fog.explored[deck];
   const k = 1 - Math.pow(1 - FOG_FADE, dt * 60);
-  for (let i = 0; i < light.length; i++) {
-    const goal = target[i] > 0 ? 1 : explored[i] ? FOG_MEMORY : 0;
-    light[i] += (goal - light[i]) * k;
+  for (let d = 0; d < LEVEL_COUNT; d++) {
+    const light = fog.light[d];
+    const target = fog.target[d];
+    const explored = fog.explored[d];
+    for (let i = 0; i < light.length; i++) {
+      const goal = target[i] > 0 ? 1 : explored[i] ? FOG_MEMORY : 0;
+      light[i] += (goal - light[i]) * k;
+    }
   }
 }
 
@@ -1631,8 +1990,9 @@ respawnButton.addEventListener('click', doRespawn);
 function buildSprites() {
   const TS = 32;
   const c = document.createElement('canvas');
-  // 11 спрайтов в ряд: 4 стадии кирпича, бетон, лес, лёд, 3 кадра воды, трамплин.
-  c.width = TS * 11;
+  // Спрайты в ряд: 4 стадии кирпича, бетон, лес, лёд, 3 кадра воды,
+  // пандус вверх, пандус в ямку, дно ямки, настил моста, 4 варианта травы.
+  c.width = TS * 18;
   c.height = TS;
   buildSpritesInto(c.getContext('2d'), TS);
   sprites = {
@@ -1641,6 +2001,10 @@ function buildSprites() {
     ice: 6,
     water: [7, 8, 9],
     ramp: 10,
+    pit: 11,
+    pitRamp: 12,
+    deck: 13,
+    grass: [14, 15, 16, 17],
     ts: TS,
     canvas: c,
   };
@@ -1651,7 +2015,98 @@ function spriteCell(index) {
   return { sx: index * ts, sy: 0 };
 }
 
-/** Отдельный холст с «рельефом» карты для мини-карты — по одному на ярус. */
+/**
+ * Детерминированный хеш координат тайла.
+ *
+ * Нужен, чтобы трава выглядела слегка неровной, но одинаково при каждом
+ * запуске: вариант оттенка выбирается по хешу, а не случайно.
+ *
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {number}
+ */
+function tileHash(tx, ty) {
+  let h = (tx * 73856093) ^ (ty * 19349663);
+  h = (h ^ (h >>> 13)) >>> 0;
+  return h;
+}
+
+/**
+ * Есть ли под этим тайлом земли ямка (дыра в земле).
+ *
+ * На слое земли тайл ямки пустой, а на слое ямок — дно (`Pit`) или стенка
+ * (`Brick`). Такой тайл земли не закрашивается травой: в нём видно яму.
+ *
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {boolean}
+ */
+function isHoleAt(tx, ty) {
+  const m = state.map;
+  if (!m) return false;
+  const ground = m.layers[LEVEL_GROUND];
+  const pit = m.layers[LEVEL_PIT];
+  if (!ground || !pit) return false;
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
+  const idx = ty * m.width + tx;
+  if ((ground[idx] & 7) !== TILE_EMPTY) return false;
+  const below = pit[idx] & 7;
+  return below === TILE_PIT || below === TILE.BRICK;
+}
+
+/**
+ * Маска настила верхнего яруса.
+ *
+ * На верхнем слое пустые тайлы — это настил: мостики над ямками, подходы
+ * к холмам и площадки. Клиент рисует настил там, где он действительно
+ * есть: над ямкой, рядом с холмом и в коридоре, который ведёт от пандуса.
+ */
+let upperDeckMask = null;
+
+/** Бит 3 у пустого тайла верхнего яруса: это настил — по нему ездят. */
+const DECK_FLAG = 0x08;
+
+/** Бит 4 у настила верхнего яруса: это мостик, а не холм. */
+const BRIDGE_FLAG = 0x10;
+
+/** Смещение тайла по направлению полосы пандуса. */
+const RAMP_DX = [1, 0, -1, 0];
+const RAMP_DY = [0, 1, 0, -1];
+
+/**
+ * Пересчитывает маску настила верхнего яруса.
+ *
+ * Сервер помечает настил прямо в байте тайла (бит 3), поэтому маска — это
+ * точная копия того, что можно проехать наверху: мостики и холмы.
+ */
+function refreshUpperDeckMask() {
+  const m = state.map;
+  if (!m) return;
+  const upper = m.layers[LEVEL_UPPER];
+  if (!upper) {
+    upperDeckMask = null;
+    return;
+  }
+  const mask = new Uint8Array(m.width * m.height);
+  for (let i = 0; i < upper.length; i++) {
+    const v = upper[i];
+    // Настил — пустой тайл с флагом: по нему ездят.
+    if ((v & 7) === TILE_EMPTY && (v & DECK_FLAG) !== 0) {
+      mask[i] = 1;
+    }
+  }
+  upperDeckMask = mask;
+}
+
+/** Есть ли настил верхнего яруса в этом тайле. */
+function isUpperDeck(tx, ty) {
+  const m = state.map;
+  if (!m || !upperDeckMask) return false;
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
+  return upperDeckMask[ty * m.width + tx] === 1;
+}
+
+/** Отдельный холст с «рельефом» карты для мини-карты — по одному на слой. */
 function buildTerrainCanvases() {
   const m = state.map;
   if (!m) return;
@@ -1662,8 +2117,15 @@ function buildTerrainCanvases() {
     c.width = m.width;
     c.height = m.height;
     const g = c.getContext('2d');
-    g.fillStyle = '#0a0e13';
-    g.fillRect(0, 0, m.width, m.height);
+    // Фон слоя: земля — трава, ямка — грунт. Верхний ярус остаётся
+    // прозрачным: там пустота (пропасть), сквозь неё видно землю внизу.
+    if (d === LEVEL_PIT) {
+      g.fillStyle = TERRAIN.pitDark;
+      g.fillRect(0, 0, m.width, m.height);
+    } else if (d === LEVEL_GROUND) {
+      g.fillStyle = TERRAIN.grass[1];
+      g.fillRect(0, 0, m.width, m.height);
+    }
     terrainCanvases.push(c);
     terrainCtxs.push(g);
   }
@@ -1676,12 +2138,18 @@ function buildTerrainCanvases() {
   }
 }
 
-function paintTerrainTile(tx, ty, deck = 0) {
+function paintTerrainTile(tx, ty, deck = LEVEL_GROUND) {
   const g = terrainCtxs[deck];
   if (!g || !state.map) return;
   paintTerrainTileTo(g, tx, ty, deck);
 }
 
+/**
+ * Рисует один тайл в «рельеф» мини-карты.
+ *
+ * Цвет выбирается по виду тайла; на земле пустой тайл — это трава,
+ * а если под ним ямка — дыра, и она подсвечивается отдельным цветом.
+ */
 function paintTerrainTileTo(g, tx, ty, deck) {
   const m = state.map;
   const layer = m.layers[deck];
@@ -1691,25 +2159,42 @@ function paintTerrainTileTo(g, tx, ty, deck) {
   let color = null;
   switch (kind) {
     case TILE.BRICK:
-      color = '#7a3714';
+      color = deck === LEVEL_PIT ? TERRAIN.pitWall : TERRAIN.brick;
       break;
     case TILE.STEEL:
-      color = '#767f8c';
+      color = TERRAIN.steel;
       break;
     case TILE.WATER:
-      color = '#17518f';
+      color = TERRAIN.water;
       break;
     case TILE.FOREST:
-      color = '#1d5c2a';
+      color = TERRAIN.forest;
       break;
     case TILE.ICE:
-      color = '#a8d8ef';
+      color = TERRAIN.ice;
       break;
     case TILE.RAMP:
-      color = '#c9a227';
+      color = deck === LEVEL_PIT ? '#d9a05b' : '#f2c94c';
+      break;
+    case TILE_PIT:
+      color = TERRAIN.pit;
       break;
     default:
-      color = '#0a0e13';
+      if (deck === LEVEL_GROUND) {
+        // Пустой тайл земли: трава, а если под ним ямка — дыра.
+        color = isHoleAt(tx, ty) ? '#2a1c10' : TERRAIN.grass[tileHash(tx, ty) % TERRAIN.grass.length];
+      } else if (deck === LEVEL_UPPER) {
+        // Верхний ярус — настил: мостики (дерево) и холмы (камень).
+        // Пустота — пропасть: её не красим, сквозь неё видно землю внизу.
+        if (isUpperDeck(tx, ty)) {
+          color = (layer[ty * m.width + tx] & BRIDGE_FLAG) !== 0 ? TERRAIN.deck : TERRAIN.deckTop;
+        } else {
+          return;
+        }
+      } else {
+        // Слой ямок: пустота означает сплошную землю над головой.
+        color = '#2f2a20';
+      }
   }
   g.fillStyle = color;
   g.fillRect(tx, ty, 1, 1);
@@ -1831,57 +2316,349 @@ function worldToScreenY(wy) {
 }
 
 /**
- * Рисует тайлы яруса.
+ * Угол поворота спрайта пандуса под направление полосы.
  *
- * @param {number} now      время для анимации воды;
- * @param {number} deck     какой ярус рисуем;
- * @param {number} alpha    прозрачность слоя (для «чужого» этажа);
- * @param {boolean} withFog использовать ли туман войны и «старую» память.
+ * Спрайт нарисован шевронами вверх, поэтому для направления полосы
+ * его нужно повернуть на угол dir.
  */
-function drawTiles(now, deck, alpha, withFog) {
+const RAMP_ROTATION = [Math.PI / 2, Math.PI, -Math.PI / 2, 0];
+
+/**
+ * Границы видимой области карты в тайлах.
+ * @returns {{x0:number, x1:number, y0:number, y1:number}}
+ */
+function visibleTileBounds() {
   const m = state.map;
-  if (!m || !sprites) return;
-  const layer = m.layers[deck];
-  if (!layer) return;
   const ts = m.tileSize;
   const halfW = canvas.clientWidth / 2 / camera.zoom;
   const halfH = canvas.clientHeight / 2 / camera.zoom;
+  return {
+    x0: Math.max(0, Math.floor((camera.x - halfW) / ts)),
+    x1: Math.min(m.width - 1, Math.ceil((camera.x + halfW) / ts)),
+    y0: Math.max(0, Math.floor((camera.y - halfH) / ts)),
+    y1: Math.min(m.height - 1, Math.ceil((camera.y + halfH) / ts)),
+  };
+}
 
-  const x0 = Math.max(0, Math.floor((camera.x - halfW) / ts));
-  const x1 = Math.min(m.width - 1, Math.ceil((camera.x + halfW) / ts));
-  const y0 = Math.max(0, Math.floor((camera.y - halfH) / ts));
-  const y1 = Math.min(m.height - 1, Math.ceil((camera.y + halfH) / ts));
-
+/**
+ * Рисует спрайт тайла в мировых координатах.
+ * @param {number} index индекс спрайта
+ * @param {number} tx
+ * @param {number} ty
+ * @param {number} ts  размер тайла
+ */
+function blitTile(index, tx, ty, ts) {
+  const { sx, sy } = spriteCell(index);
   const s = ts * camera.zoom;
-  const waterFrame = Math.floor(now / 380) % 3;
-  const light = withFog ? fog.light[deck] : null;
-  const seen = withFog ? fog.seen[deck] : null;
+  ctx.drawImage(sprites.canvas, sx, sy, 32, 32, worldToScreenX(tx * ts), worldToScreenY(ty * ts), s, s);
+}
 
-  ctx.globalAlpha = alpha;
-  for (let ty = y0; ty <= y1; ty++) {
-    for (let tx = x0; tx <= x1; tx++) {
+/**
+ * Рисует спрайт пандуса, повёрнутый по направлению полосы.
+ *
+ * Шевроны на пандусе показывают, в какую сторону ведёт полоса.
+ *
+ * @param {number} index индекс спрайта
+ * @param {number} tx
+ * @param {number} ty
+ * @param {number} ts  размер тайла
+ * @param {number} dir  направление полосы (0..3)
+ */
+function blitRamp(index, tx, ty, ts, dir) {
+  const { sx, sy } = spriteCell(index);
+  const s = ts * camera.zoom;
+  const cx = worldToScreenX(tx * ts) + s / 2;
+  const cy = worldToScreenY(ty * ts) + s / 2;
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(RAMP_ROTATION[dir] ?? 0);
+  ctx.drawImage(sprites.canvas, sx, sy, 32, 32, -s / 2, -s / 2, s, s);
+  ctx.restore();
+}
+
+/**
+ * Прозрачность слоя ямок.
+ *
+ * Дно ямки видно сквозь дыру в земле, поэтому считаем освещение и земли
+ * над ямой, и того слоя, на котором стоит игрок (с моста тоже видно в яму).
+ *
+ * @param {number} idx
+ * @returns {number}
+ */
+function pitAlpha(idx) {
+  const pit = fog.light[LEVEL_PIT];
+  const ground = fog.light[LEVEL_GROUND];
+  const active = fog.light[pred.deck];
+  return Math.max(
+    pit ? pit[idx] : 0,
+    ground ? ground[idx] : 0,
+    active ? active[idx] : 0,
+  );
+}
+
+/**
+ * Рисует слой ямок: дно, стенки и спускные пандусы.
+ *
+ * Слой ямок находится ниже земли, поэтому рисуется первым — сквозь дыру
+ * в земле видно грунт и внутренние стенки.
+ */
+function drawPitLayer() {
+  const m = state.map;
+  if (!m || !sprites) return;
+  const pit = m.layers[LEVEL_PIT];
+  if (!pit) return;
+  const ts = m.tileSize;
+  const b = visibleTileBounds();
+  for (let ty = b.y0; ty <= b.y1; ty++) {
+    for (let tx = b.x0; tx <= b.x1; tx++) {
+      const idx = ty * m.width + tx;
+      const v = pit[idx];
+      const kind = v & 7;
+      if (kind === TILE_EMPTY) continue;
+      const alpha = pitAlpha(idx);
+      if (alpha <= 0.03) continue;
+      ctx.globalAlpha = Math.min(1, alpha);
+      if (kind === TILE_PIT) {
+        blitTile(sprites.pit, tx, ty, ts);
+      } else if (kind === TILE.BRICK) {
+        // Стенки окопа — тёмный кирпич.
+        blitTile(0, tx, ty, ts);
+        ctx.fillStyle = 'rgba(24,12,6,0.45)';
+        ctx.fillRect(worldToScreenX(tx * ts), worldToScreenY(ty * ts), ts * camera.zoom, ts * camera.zoom);
+      } else if (kind === TILE.RAMP) {
+        blitRamp(sprites.pitRamp, tx, ty, ts, (v >> 3) & 3);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/**
+ * Рисует «нависающие кромки» ямок.
+ *
+ * По краю дыры земля нависает над ямой, поэтому кромка рисуется поверх
+ * дна с тенью внутрь — яма читается как углубление, а не как дыра в фото.
+ */
+function drawPitRim() {
+  const m = state.map;
+  if (!m) return;
+  const ts = m.tileSize;
+  const zoom = camera.zoom;
+  const b = visibleTileBounds();
+  const band = PIT_RIM * zoom;
+  for (let ty = b.y0; ty <= b.y1; ty++) {
+    for (let tx = b.x0; tx <= b.x1; tx++) {
+      if (!isHoleAt(tx, ty)) continue;
+      const idx = ty * m.width + tx;
+      const alpha = pitAlpha(idx);
+      if (alpha <= 0.03) continue;
+      const sx = worldToScreenX(tx * ts);
+      const sy = worldToScreenY(ty * ts);
+      const s = ts * zoom;
+      ctx.globalAlpha = Math.min(1, alpha);
+      // Верхняя кромка (сосед сверху — сплошная земля).
+      if (!isHoleAt(tx, ty - 1)) {
+        const grad = ctx.createLinearGradient(0, sy, 0, sy + band);
+        grad.addColorStop(0, 'rgba(26,16,8,0.85)');
+        grad.addColorStop(1, 'rgba(26,16,8,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx, sy, s, band);
+        ctx.fillStyle = 'rgba(18,10,4,0.9)';
+        ctx.fillRect(sx, sy, s, Math.max(1, 2 * zoom));
+      }
+      // Нижняя кромка.
+      if (!isHoleAt(tx, ty + 1)) {
+        const grad = ctx.createLinearGradient(0, sy + s - band, 0, sy + s);
+        grad.addColorStop(0, 'rgba(26,16,8,0)');
+        grad.addColorStop(1, 'rgba(26,16,8,0.8)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx, sy + s - band, s, band);
+      }
+      // Левая и правая кромки.
+      if (!isHoleAt(tx - 1, ty)) {
+        const grad = ctx.createLinearGradient(sx, 0, sx + band, 0);
+        grad.addColorStop(0, 'rgba(26,16,8,0.8)');
+        grad.addColorStop(1, 'rgba(26,16,8,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx, sy, band, s);
+      }
+      if (!isHoleAt(tx + 1, ty)) {
+        const grad = ctx.createLinearGradient(sx + s - band, 0, sx + s, 0);
+        grad.addColorStop(0, 'rgba(26,16,8,0)');
+        grad.addColorStop(1, 'rgba(26,16,8,0.8)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(sx + s - band, sy, band, s);
+      }
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/**
+ * Рисует слой земли: траву, препятствия и пандусы.
+ *
+ * В местах ям ничего не рисуется — там сквозь дыру видно слой ямок.
+ */
+function drawGroundLayer(now) {
+  const m = state.map;
+  if (!m || !sprites) return;
+  const ground = m.layers[LEVEL_GROUND];
+  if (!ground) return;
+  const ts = m.tileSize;
+  const b = visibleTileBounds();
+  const waterFrame = Math.floor(now / 380) % 3;
+  const light = fog.light[LEVEL_GROUND];
+  const seen = fog.seen[LEVEL_GROUND];
+  for (let ty = b.y0; ty <= b.y1; ty++) {
+    for (let tx = b.x0; tx <= b.x1; tx++) {
       const idx = ty * m.width + tx;
       // Видимые тайлы рисуем как есть, а исследованные — по «старому» виду,
       // как в Age of Empires 2: устаревшая карта, без живых обновлений.
-      // Переключаемся на «старый» вид уже под затемнением, чтобы смена
-      // не была заметна глазом.
       const lit = light ? light[idx] > 0.75 : true;
-      const v = lit ? layer[idx] : seen ? seen[idx] : layer[idx];
+      const v = lit ? ground[idx] : seen ? seen[idx] : ground[idx];
       const kind = v & 7;
-      if (kind === TILE.EMPTY) continue;
+      const alpha = light ? light[idx] : 1;
+      if (alpha <= 0.03) continue;
+      ctx.globalAlpha = Math.min(1, alpha);
+      if (kind === TILE.EMPTY) {
+        // Пустой тайл земли — трава, но в яме сквозь дыру видно грунт.
+        if (isHoleAt(tx, ty)) continue;
+        blitTile(sprites.grass[tileHash(tx, ty) % sprites.grass.length], tx, ty, ts);
+        continue;
+      }
       const damage = v >> 3;
-
       let index;
       if (kind === TILE.BRICK) index = Math.min(3, damage);
       else if (kind === TILE.STEEL) index = sprites.steel;
       else if (kind === TILE.FOREST) index = sprites.forest;
       else if (kind === TILE.ICE) index = sprites.ice;
       else if (kind === TILE.WATER) index = sprites.water[waterFrame];
-      else if (kind === TILE.RAMP) index = sprites.ramp;
-      else continue;
+      else if (kind === TILE.RAMP) {
+        blitRamp(sprites.ramp, tx, ty, ts, (v >> 3) & 3);
+        continue;
+      } else continue;
+      blitTile(index, tx, ty, ts);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
 
-      const { sx, sy } = spriteCell(index);
-      ctx.drawImage(sprites.canvas, sx, sy, 32, 32, worldToScreenX(tx * ts), worldToScreenY(ty * ts), s, s);
+/**
+ * Прозрачность верхнего яруса.
+ *
+ * Сверху верхний ярус виден как обычно. Снизу (с земли) — полупрозрачным,
+ * так читается, что мосты и холмы нависают над землёй. Но только там, где
+ * видна сама земля: за пределами конуса обзора верхнего яруса нет.
+ *
+ * @param {number} idx
+ * @returns {number}
+ */
+function upperAlpha(idx) {
+  const upper = fog.light[LEVEL_UPPER];
+  const upperValue = upper ? upper[idx] : 1;
+  if (pred.deck === LEVEL_UPPER) return Math.min(1, Math.max(0.25, upperValue));
+  const active = fog.light[pred.deck];
+  const gate = active ? active[idx] : 1;
+  return Math.min(1, Math.max(0.35, upperValue) * gate);
+}
+
+/**
+ * Есть ли на верхнем ярусе сплошная поверхность в этом тайле.
+ *
+ * Стоя на верхнем ярусе, игрок видит весь настил целиком; снизу — только
+ * мосты и холмы, которые нависают над землёй.
+ *
+ * @param {number} tx
+ * @param {number} ty
+ * @returns {boolean}
+ */
+function isUpperSolid(tx, ty) {
+  const m = state.map;
+  const upper = m.layers[LEVEL_UPPER];
+  if (!upper) return false;
+  if (tx < 0 || ty < 0 || tx >= m.width || ty >= m.height) return false;
+  const kind = upper[ty * m.width + tx] & 7;
+  if (kind === TILE.BRICK || kind === TILE.STEEL) return true;
+  if (kind === TILE.RAMP) return true;
+  if (kind !== TILE_EMPTY) return false;
+  // Пустота верхнего яруса — пропасть, проезжает только настил.
+  return isUpperDeck(tx, ty);
+}
+
+/**
+ * Тень, которую мосты и холмы отбрасывают на землю.
+ *
+ * Рисуется между землёй и верхним ярусом: тень лежит на земле, а сам
+ * мост — выше.
+ */
+function drawUpperShadows() {
+  const m = state.map;
+  if (!m) return;
+  // В ямке верхнего яруса не видно — мы под землёй.
+  if (pred.deck === LEVEL_PIT) return;
+  const upper = m.layers[LEVEL_UPPER];
+  if (!upper) return;
+  const ts = m.tileSize;
+  const zoom = camera.zoom;
+  const b = visibleTileBounds();
+  for (let ty = b.y0; ty <= b.y1; ty++) {
+    for (let tx = b.x0; tx <= b.x1; tx++) {
+      if (!isUpperSolid(tx, ty)) continue;
+      // Тень падает вниз-вправо от конструкции.
+      const idx = ty * m.width + tx;
+      ctx.globalAlpha = upperAlpha(idx) * 0.45;
+      ctx.fillStyle = '#101a0c';
+      ctx.fillRect(
+        worldToScreenX(tx * ts) + 3 * zoom,
+        worldToScreenY((ty + 1) * ts) - 6 * zoom,
+        ts * zoom,
+        ts * zoom * 0.55,
+      );
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+/**
+ * Рисует верхний ярус: настил мостов, холмы и их боковые стенки.
+ *
+ * Уступ виден по нижней кромке — так перепад высоты читается сразу.
+ */
+function drawUpperLayer() {
+  const m = state.map;
+  if (!m || !sprites) return;
+  // В ямке верхнего яруса не видно — мы под землёй.
+  if (pred.deck === LEVEL_PIT) return;
+  const upper = m.layers[LEVEL_UPPER];
+  if (!upper) return;
+  const ts = m.tileSize;
+  const zoom = camera.zoom;
+  const b = visibleTileBounds();
+  const wall = LEDGE_HEIGHT * zoom;
+  for (let ty = b.y0; ty <= b.y1; ty++) {
+    for (let tx = b.x0; tx <= b.x1; tx++) {
+      const idx = ty * m.width + tx;
+      const v = upper[idx];
+      const kind = v & 7;
+      // Стоя на верхнем ярусе, видно весь настил; снизу — только мосты и холмы.
+      const deck = kind === TILE_EMPTY ? isUpperSolid(tx, ty) : false;
+      if (kind === TILE_EMPTY && !deck) continue;
+      const alpha = upperAlpha(idx);
+      if (alpha <= 0.03) continue;
+      ctx.globalAlpha = Math.min(1, alpha);
+      if (kind === TILE.BRICK) blitTile(Math.min(3, v >> 3), tx, ty, ts);
+      else if (kind === TILE.STEEL) blitTile(sprites.steel, tx, ty, ts);
+      else if (kind === TILE.RAMP) blitRamp(sprites.ramp, tx, ty, ts, (v >> 3) & 3);
+      else if (deck) blitTile(sprites.deck, tx, ty, ts);
+      // Боковая стенка уступа: там, где под конструкцией пусто.
+      if (!isUpperSolid(tx, ty + 1)) {
+        const sx = worldToScreenX(tx * ts);
+        const sy = worldToScreenY((ty + 1) * ts);
+        ctx.fillStyle = TERRAIN.deckDark;
+        ctx.fillRect(sx, sy, ts * zoom, wall);
+        ctx.fillStyle = 'rgba(30,20,8,0.35)';
+        ctx.fillRect(sx, sy + wall - 2 * zoom, ts * zoom, 2 * zoom);
+      }
     }
   }
   ctx.globalAlpha = 1;
@@ -1945,24 +2722,63 @@ function drawStar(cx, cy, r, fill, stroke) {
   ctx.stroke();
 }
 
+/**
+ * Радиус, в котором снаряд считается «своим».
+ *
+ * В протоколе у снаряда нет владельца, поэтому свои выстрелы узнаются по
+ * близости к своему танку: они рождаются у башни и летят дальше.
+ */
+const OWN_BULLET_RADIUS = 420;
+
+/**
+ * Свой ли снаряд.
+ *
+ * Если сервер когда-нибудь пришлёт владельца — берём его, иначе смотрим
+ * на расстояние до танка игрока.
+ *
+ * @param {object} b снаряд
+ * @returns {boolean}
+ */
+function isOwnBullet(b) {
+  if (b.owner !== undefined && b.owner !== null) return b.owner === state.myId;
+  const dx = b.x - (pred.x + TANK_SIZE / 2);
+  const dy = b.y - (pred.y + TANK_SIZE / 2);
+  return Math.hypot(dx, dy) <= OWN_BULLET_RADIUS;
+}
+
+/**
+ * Рисует снаряды.
+ *
+ * Свои выстрелы рисуются всегда: их не отсекает ни туман войны, ни
+ * соседний слой — иначе игрок теряет из виду свой же снаряд.
+ */
 function drawBullets(bullets) {
   for (const b of bullets.values()) {
-    // Снаряды соседнего этажа не видны.
-    if ((b.deck ?? LEVEL_GROUND) !== pred.deck) continue;
+    const own = isOwnBullet(b);
+    // Снаряды соседнего этажа не видны, кроме собственных.
+    if (!own && (b.deck ?? LEVEL_GROUND) !== pred.deck) continue;
     const x = worldToScreenX(b.x);
     const y = worldToScreenY(b.y);
     const dir = aimDelta(b.dir);
     const dx = dir.x;
     const dy = dir.y;
-    const size = 6 * camera.zoom;
+    const size = (own ? 7 : 6) * camera.zoom;
 
     // След снаряда.
-    ctx.strokeStyle = 'rgba(255,214,102,0.35)';
+    ctx.strokeStyle = own ? 'rgba(255,235,150,0.6)' : 'rgba(255,214,102,0.35)';
     ctx.lineWidth = size * 0.55;
     ctx.beginPath();
     ctx.moveTo(x - dx * size * 2.2, y - dy * size * 2.2);
     ctx.lineTo(x, y);
     ctx.stroke();
+
+    if (own) {
+      // Свечение — свой снаряд не должен теряться на фоне.
+      ctx.fillStyle = 'rgba(255,214,102,0.35)';
+      ctx.beginPath();
+      ctx.arc(x, y, size * 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
 
     ctx.fillStyle = b.level >= 3 ? '#fff3c4' : '#ffd166';
     ctx.fillRect(x - size / 2, y - size / 2, size, size);
@@ -1983,57 +2799,144 @@ function isInForest(x, y, deck = pred.deck) {
   return (layer[ty * m.width + tx] & 7) === TILE.FOREST;
 }
 
+/**
+ * Скруглённый прямоугольник.
+ *
+ * Отдельная функция вместо `ctx.roundRect`, чтобы рисование одинаково
+ * работало во всех браузерах.
+ *
+ * @param {number} x
+ * @param {number} y
+ * @param {number} w
+ * @param {number} h
+ * @param {number} r радиус скругления
+ */
+function roundRect(x, y, w, h, r) {
+  const rr = Math.max(0, Math.min(r, Math.abs(w) / 2, Math.abs(h) / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+  ctx.lineTo(x + rr, y + h);
+  ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+  ctx.lineTo(x, y + rr);
+  ctx.quadraticCurveTo(x, y, x + rr, y);
+  ctx.closePath();
+}
+
+/**
+ * Цвет детали танка с учётом высоты слоя.
+ *
+ * На верхнем ярусе танок светлее (ближе к солнцу), в ямке — темнее на 20%.
+ *
+ * @param {number} hue
+ * @param {number} sat
+ * @param {number} light
+ * @param {number} elev высота слоя (−1, 0, +1)
+ * @returns {string}
+ */
+function tankColor(hue, sat, light, elev) {
+  const k = elev > 0 ? 1.08 : elev < 0 ? 0.8 : 1;
+  return `hsl(${hue}, ${sat}%, ${Math.max(16, Math.min(74, light * k))}%)`;
+}
+
+/**
+ * Рисует танк.
+ *
+ * Модель построена честно: корпус с двумя симметричными гусеницами по
+ * бокам (одинаковой ширины, с одинаковой проступью) и башня, которая
+ * поворачивается по направлению прицела.
+ *
+ * Высота слоя читается на самом танке: на верхнем ярусе (+1) он крупнее
+ * и светлее, в ямке (−1) — мельче и темнее.
+ *
+ * @param {object} p    состояние танка
+ * @param {object} opts {hue, self, trackPhase, lift}
+ */
 function drawTank(p, opts = {}) {
-  const size = TANK_SIZE * camera.zoom;
+  const deck = p.deck ?? pred.deck;
+  const elev = layerElev(deck);
+  const zoom = camera.zoom;
+  // На верхнем ярусе танк крупнее, в ямке — мельче.
+  const scale = elev > 0 ? 1.07 : elev < 0 ? 0.94 : 1;
+  const size = TANK_SIZE * zoom * scale;
   const x = worldToScreenX(p.x);
   const groundY = worldToScreenY(p.y);
   // Подъём на пандусе: корпус рисуется выше, а тень остаётся на земле —
   // так видно, что танк едет вверх, а не «перепрыгнул» этаж.
-  const lift = (opts.lift ?? 0) * camera.zoom;
+  const lift = (opts.lift ?? 0) * zoom;
   const y = groundY - lift;
   const hue = opts.hue ?? 40;
   const level = p.level ?? 1;
   const aim = p.aim ?? 4;
 
-  // Тень на земле.
-  if (lift > 0.5) {
-    ctx.save();
-    ctx.globalAlpha = 0.38 * (1 - Math.min(1, lift / (RAMP_HEIGHT * camera.zoom)) * 0.45);
-    ctx.fillStyle = '#000000';
-    ctx.beginPath();
-    ctx.ellipse(x + size / 2, groundY + size * 0.74, size * 0.42, size * 0.17, 0, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
-  }
+  // Тень на земле: с верхнего яруса она длинная и смещённая.
+  const shadowOffX = elev > 0 ? 6 * zoom : 0;
+  const shadowOffY = elev > 0 ? 5 * zoom : 0;
+  ctx.save();
+  ctx.globalAlpha =
+    (elev > 0 ? 0.3 : elev < 0 ? 0.16 : 0.24) *
+    (lift > 0.5 ? 1 - Math.min(1, lift / (RAMP_HEIGHT * zoom)) * 0.45 : 1);
+  ctx.fillStyle = '#000000';
+  ctx.beginPath();
+  ctx.ellipse(
+    x + size / 2 + shadowOffX,
+    groundY + size * 0.74 + shadowOffY,
+    size * (elev > 0 ? 0.5 : 0.42),
+    size * (elev > 0 ? 0.16 : 0.17),
+    0,
+    0,
+    Math.PI * 2,
+  );
+  ctx.fill();
+  ctx.restore();
 
   ctx.save();
   // В чаще танк частично маскируется — становится полупрозрачным.
-  ctx.globalAlpha = isInForest(p.x, p.y, p.deck ?? pred.deck) ? (opts.self ? 0.62 : 0.45) : 1;
+  ctx.globalAlpha = isInForest(p.x, p.y, deck) ? (opts.self ? 0.62 : 0.45) : 1;
   ctx.translate(x + size / 2, y + size / 2);
 
   const half = size / 2;
-  const trackW = size * 0.22;
+  const trackW = size * 0.2;
+  const trackTop = -half + size * 0.05;
+  const trackH = size * 0.9;
 
   // --- Корпус: крутится по направлению движения ---
   ctx.save();
   ctx.rotate(ROT[p.dir] ?? 0);
 
-  // Гусеницы.
-  ctx.fillStyle = '#16191d';
-  ctx.fillRect(-half, -half, trackW, size);
-  ctx.fillRect(half - trackW, -half, trackW, size);
-  ctx.fillStyle = '#39414d';
+  // Гусеницы: две одинаковые, симметричные относительно корпуса.
+  ctx.fillStyle = '#1b1f25';
+  roundRect(-half, trackTop, trackW, trackH, trackW * 0.35);
+  ctx.fill();
+  roundRect(half - trackW, trackTop, trackW, trackH, trackW * 0.35);
+  ctx.fill();
+
+  // Проступь: одинаковый рисунок на обеих гусеницах, без смещения.
+  ctx.fillStyle = '#49525e';
   const tread = ((opts.trackPhase ?? 0) * 4) % 6;
-  for (let i = -half + tread; i < half; i += 6 * camera.zoom) {
-    ctx.fillRect(-half, i, trackW, 2 * camera.zoom);
-    ctx.fillRect(half - trackW, i + 3 * camera.zoom, trackW, 2 * camera.zoom);
+  for (let i = trackTop + tread; i < trackTop + trackH - 1; i += 6 * zoom) {
+    ctx.fillRect(-half, i, trackW, 2 * zoom);
+    ctx.fillRect(half - trackW, i, trackW, 2 * zoom);
   }
 
   // Кузов.
-  ctx.fillStyle = `hsl(${hue}, 58%, 40%)`;
-  ctx.fillRect(-half + trackW, -half + size * 0.14, size - trackW * 2, size * 0.82);
-  ctx.fillStyle = `hsl(${hue}, 62%, 52%)`;
-  ctx.fillRect(-half + trackW, -half + size * 0.14, size - trackW * 2, size * 0.16);
+  const bodyX = -half + trackW;
+  const bodyW = size - trackW * 2;
+  const bodyY = -half + size * 0.1;
+  const bodyH = size * 0.8;
+  ctx.fillStyle = tankColor(hue, 58, 40, elev);
+  roundRect(bodyX, bodyY, bodyW, bodyH, size * 0.07);
+  ctx.fill();
+  // Верхняя кромка корпуса — ближе к свету.
+  ctx.fillStyle = tankColor(hue, 62, 54, elev);
+  roundRect(bodyX + size * 0.03, bodyY + size * 0.03, bodyW - size * 0.06, bodyH * 0.2, size * 0.04);
+  ctx.fill();
+  // Кормовые листы.
+  ctx.fillStyle = tankColor(hue, 40, 30, elev);
+  ctx.fillRect(bodyX, bodyY + bodyH * 0.42, bodyW, size * 0.05);
   ctx.restore();
 
   // --- Башня: крутится по курсору мыши, независимо от корпуса ---
@@ -2042,7 +2945,7 @@ function drawTank(p, opts = {}) {
   ctx.rotate(Math.atan2(aimVec.y, aimVec.x));
 
   // Стволы: на втором уровне появляется вторая пушка.
-  ctx.fillStyle = `hsl(${hue}, 45%, 26%)`;
+  ctx.fillStyle = tankColor(hue, 45, 26, elev);
   if (level >= 2) {
     ctx.fillRect(0, -size * 0.19, size * 0.55, size * 0.12);
     ctx.fillRect(0, size * 0.07, size * 0.55, size * 0.12);
@@ -2051,10 +2954,12 @@ function drawTank(p, opts = {}) {
   }
 
   // Башня.
-  ctx.fillStyle = `hsl(${hue}, 66%, 56%)`;
-  ctx.fillRect(-size * 0.18, -size * 0.18, size * 0.36, size * 0.36);
-  ctx.fillStyle = `hsl(${hue}, 70%, 66%)`;
-  ctx.fillRect(-size * 0.1, -size * 0.1, size * 0.2, size * 0.2);
+  ctx.fillStyle = tankColor(hue, 66, 56, elev);
+  roundRect(-size * 0.18, -size * 0.18, size * 0.36, size * 0.36, size * 0.07);
+  ctx.fill();
+  ctx.fillStyle = tankColor(hue, 70, 68, elev);
+  roundRect(-size * 0.1, -size * 0.1, size * 0.2, size * 0.2, size * 0.04);
+  ctx.fill();
   ctx.restore();
 
   ctx.restore();
@@ -2063,9 +2968,9 @@ function drawTank(p, opts = {}) {
   // Уровень прокачки — звёздочки на башне.
   if (p.level > 1) {
     for (let i = 0; i < p.level - 1; i++) {
-      const px = x + size / 2 - (p.level - 2) * 4 * camera.zoom + i * 8 * camera.zoom;
+      const px = x + size / 2 - (p.level - 2) * 4 * zoom + i * 8 * zoom;
       const py = y - size * 0.12;
-      drawStar(px, py, 3.4 * camera.zoom, '#ffd166', '#8a5b00');
+      drawStar(px, py, 3.4 * zoom, '#ffd166', '#8a5b00');
     }
   }
 
@@ -2074,7 +2979,7 @@ function drawTank(p, opts = {}) {
     ctx.beginPath();
     ctx.arc(x + size / 2, y + size / 2, size * 0.72, 0, Math.PI * 2);
     ctx.strokeStyle = 'rgba(88,166,255,0.85)';
-    ctx.lineWidth = 2.5 * camera.zoom;
+    ctx.lineWidth = 2.5 * zoom;
     ctx.stroke();
     ctx.fillStyle = 'rgba(88,166,255,0.14)';
     ctx.fill();
@@ -2082,23 +2987,42 @@ function drawTank(p, opts = {}) {
 
   // Полоска здоровья.
   if (!opts.self && p.hp < p.maxHp) {
+    // Цель на недостижимой высоте: полоску приглушаем — это подсказка,
+    // что навести настильный огонь не выйдет и нужно менять позицию.
+    const reachable = flatShotHits(pred.deck, deck);
     const bw = size;
     const bx = x;
-    const by = y - 8 * camera.zoom;
+    const by = y - 8 * zoom;
+    ctx.save();
+    ctx.globalAlpha = reachable ? 1 : 0.35;
     ctx.fillStyle = 'rgba(0,0,0,0.6)';
-    ctx.fillRect(bx, by, bw, 3.5 * camera.zoom);
+    ctx.fillRect(bx, by, bw, 3.5 * zoom);
     ctx.fillStyle = p.hp > p.maxHp / 2 ? '#3fb950' : '#f85149';
-    ctx.fillRect(bx, by, (bw * p.hp) / p.maxHp, 3.5 * camera.zoom);
+    ctx.fillRect(bx, by, (bw * p.hp) / p.maxHp, 3.5 * zoom);
+    ctx.restore();
   }
 
   // Ник.
   if (!opts.self && p.name) {
-    ctx.font = `${Math.max(9, 11 * camera.zoom)}px Consolas, monospace`;
+    ctx.font = `${Math.max(9, 11 * zoom)}px Consolas, monospace`;
     ctx.textAlign = 'center';
     ctx.fillStyle = 'rgba(0,0,0,0.75)';
-    ctx.fillText(p.name, x + size / 2 + 1, y - 11 * camera.zoom + 1);
+    ctx.fillText(p.name, x + size / 2 + 1, y - 11 * zoom + 1);
     ctx.fillStyle = p.isBot ? '#f0a202' : '#e6edf3';
-    ctx.fillText(p.name, x + size / 2, y - 11 * camera.zoom);
+    ctx.fillText(p.name, x + size / 2, y - 11 * zoom);
+  }
+
+  // Значок высоты: ▲ — верхний ярус, ▼ — ямка.
+  if (!opts.self && elev !== 0) {
+    const mark = elev > 0 ? '▲' : '▼';
+    const mx = x + size / 2 + size * 0.42;
+    const my = y - 9 * zoom;
+    ctx.font = `${Math.max(9, 11 * zoom)}px Consolas, monospace`;
+    ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(0,0,0,0.8)';
+    ctx.fillText(mark, mx + 1, my + 1);
+    ctx.fillStyle = elev > 0 ? '#7ee787' : '#79c0ff';
+    ctx.fillText(mark, mx, my);
   }
 }
 
@@ -2129,73 +3053,106 @@ function interpolationPair(renderTime) {
   return { a: s[s.length - 2], b: s[s.length - 1], f: 1 };
 }
 
+/**
+ * Рисует слой тумана войны поверх рельефа.
+ *
+ * Неисследованное закрыто, исследованное приглушено. Растягиваем с
+ * билинейной фильтрацией — край тумана получается мягким.
+ */
+function drawFogOverlay() {
+  if (!fog.canvas || !state.map) return;
+  const ts = state.map.tileSize;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(
+    fog.canvas,
+    0,
+    0,
+    fog.canvas.width,
+    fog.canvas.height,
+    worldToScreenX(0),
+    worldToScreenY(0),
+    fog.canvas.width * ts * camera.zoom,
+    fog.canvas.height * ts * camera.zoom,
+  );
+  ctx.imageSmoothingEnabled = false;
+}
+
+/**
+ * Рисует танки слоя с интерполяцией.
+ *
+ * @param {{a:object, b:object, f:number}} pair пара снапшотов
+ * @param {number} deck слой
+ */
+function drawDeckTanks(pair, deck) {
+  const { a, b, f } = pair;
+  for (const [id, pb] of b.players) {
+    if (id === state.myId) continue;
+    // Чужие танки с другого слоя не видны — слой перекрывает.
+    if ((pb.deck ?? LEVEL_GROUND) !== deck) continue;
+    const pa = a.players.get(id);
+    const p = {
+      ...pb,
+      x: pa ? pa.x + (pb.x - pa.x) * f : pb.x,
+      y: pa ? pa.y + (pb.y - pa.y) * f : pb.y,
+    };
+    drawTank(p, {
+      hue: hueFor(id),
+      trackPhase: (performance.now() / 60) % 6,
+      lift: rampHeightAt(p.x, p.y, p.deck ?? deck),
+    });
+  }
+}
+
+/**
+ * Главный кадр сцены.
+ *
+ * Порядок отрисовки задаёт высоту: сначала дно ям, потом земля, потом
+ * верхний ярус. Благодаря этому мосты нависают над землёй, а ямы читаются
+ * как углубления.
+ */
 function renderWorld(now) {
   const w = canvas.clientWidth;
   const h = canvas.clientHeight;
 
-  ctx.fillStyle = '#0a0e13';
+  // Фон мира: тёмно-зелёная земля, а не чёрный.
+  ctx.fillStyle = '#2c4526';
   ctx.fillRect(0, 0, w, h);
 
   const deck = pred.deck;
-
-  // Виден только свой этаж: соседний ярус не рисуется вовсе, чтобы не
-  // путать планировку и не спорить с туманом.
-  drawTiles(now, deck, 1, true);
-
-  // Слой тумана: неисследованное закрыто, исследованное приглушено.
-  // Растягиваем с билинейной фильтрацией — край тумана получается мягким.
-  if (fog.canvas && state.map) {
-    const ts = state.map.tileSize;
-    ctx.imageSmoothingEnabled = true;
-    ctx.drawImage(
-      fog.canvas,
-      0,
-      0,
-      fog.canvas.width,
-      fog.canvas.height,
-      worldToScreenX(0),
-      worldToScreenY(0),
-      fog.canvas.width * ts * camera.zoom,
-      fog.canvas.height * ts * camera.zoom,
-    );
-    ctx.imageSmoothingEnabled = false;
-  }
-
   const renderTime = performance.now() - INTERP_DELAY;
   const pair = interpolationPair(renderTime);
 
+  // --- 1. Дно ям и танки в них (−1) ---
+  drawPitLayer();
+  if (pair && deck === LEVEL_PIT) drawDeckTanks(pair, deck);
+
+  // --- 2. Нависающие кромки ям с внутренней тенью ---
+  drawPitRim();
+
+  // --- 3. Основная земля (0) ---
+  drawGroundLayer(now);
+
+  // Слой тумана: неисследованное закрыто, исследованное приглушено.
+  drawFogOverlay();
+
+  // Танки земли — под мостами и холмами.
+  if (pair && deck === LEVEL_GROUND) drawDeckTanks(pair, deck);
+
+  // --- 4. Тень, которую отбрасывают мосты и холмы ---
+  drawUpperShadows();
+
+  // --- 5. Настил мостов, холмы и танки на них (+1) ---
+  drawUpperLayer();
+  if (pair && deck === LEVEL_UPPER) drawDeckTanks(pair, deck);
+
   if (pair) {
-    const { a, b, f } = pair;
-
     // --- Бонусы ---
-    drawPickups(b.pickups);
-
-    // --- Снаряды ---
-    drawBullets(b.bullets);
-
-    // --- Способности в полёте ---
-    drawEffects(b.effects);
-
-    // --- Танки ---
-    for (const [id, pb] of b.players) {
-      if (id === state.myId) continue;
-      // Чужие танки с другого этажа не видны — этаж перекрывает.
-      if ((pb.deck ?? LEVEL_GROUND) !== deck) continue;
-      const pa = a.players.get(id);
-      const p = {
-        ...pb,
-        x: pa ? pa.x + (pb.x - pa.x) * f : pb.x,
-        y: pa ? pa.y + (pb.y - pa.y) * f : pb.y,
-      };
-      drawTank(p, {
-        hue: hueFor(id),
-        trackPhase: (performance.now() / 60) % 6,
-        lift: rampHeightAt(p.x, p.y, p.deck ?? deck),
-      });
-    }
+    drawPickups(pair.b.pickups);
   }
 
   // --- Свой танк (предсказание + мягкая коррекция) ---
+  // Рисуется поверх рельефа и чужих танков: игрок не должен теряться
+  // ни под мостом, ни за кромкой ямы.
   if (pred.active) {
     const selfX = pred.x + correction.x;
     const selfY = pred.y + correction.y;
@@ -2209,6 +3166,7 @@ function renderWorld(now) {
         hp: pred.hp,
         maxHp: pred.maxHp,
         shielded: pred.shielded,
+        deck: pred.deck,
         name: '',
       },
       {
@@ -2218,6 +3176,14 @@ function renderWorld(now) {
         lift: rampHeightAt(selfX, selfY, pred.deck),
       },
     );
+  }
+
+  if (pair) {
+    // --- Снаряды: свои всегда поверх рельефа и тумана ---
+    drawBullets(pair.b.bullets);
+
+    // --- Способности в полёте ---
+    drawEffects(pair.b.effects);
   }
 
   drawParticles();
@@ -2260,13 +3226,33 @@ function drawCursor() {
 }
 
 /**
+ * Свой ли эффект способности.
+ *
+ * Владельца у эффекта в протоколе нет, поэтому «свой» определяется по
+ * дальности: миномёт и авиаудар применяются игроком в пределах
+ * `ABILITY_RANGE`.
+ *
+ * @param {object} e эффект
+ * @returns {boolean}
+ */
+function isOwnEffect(e) {
+  if (e.owner !== undefined && e.owner !== null) return e.owner === state.myId;
+  const dx = e.x - (pred.x + TANK_SIZE / 2);
+  const dy = e.y - (pred.y + TANK_SIZE / 2);
+  return Math.hypot(dx, dy) <= ABILITY_RANGE;
+}
+
+/**
  * Рисует эффекты способностей: дуга миномёта и вызов авиаподдержки.
+ *
+ * Свои эффекты рисуются всегда — их не должен съедать туман войны.
  */
 function drawEffects(effects) {
   if (!effects) return;
   for (const e of effects.values()) {
-    // Эффекты соседнего этажа не видны.
-    if ((e.deck ?? LEVEL_GROUND) !== pred.deck) continue;
+    const own = isOwnEffect(e);
+    // Эффекты соседнего этажа не видны, кроме собственных.
+    if (!own && (e.deck ?? LEVEL_GROUND) !== pred.deck) continue;
     const t = Math.max(0, Math.min(1, e.phase / 100));
     if (e.kind === EFFECT.MORTAR) {
       // Миномёт летит по дуге: горизонталь — по прямой, высота — по параболе.
@@ -2350,9 +3336,16 @@ function updateStatus() {
   statKills.textContent = String(state.kills);
   statPing.textContent = state.pingSeen ? `${state.ping} мс` : '—';
   if (statDeck) {
+    // Слой игрока: ямка, земля или верхний ярус.
+    const pit = pred.deck === LEVEL_PIT;
     const upper = pred.deck === LEVEL_UPPER;
-    statDeck.textContent = upper ? tr('hud.deck.upper', 'ВЕРХНИЙ') : tr('hud.deck.lower', 'НИЖНИЙ');
+    statDeck.textContent = pit
+      ? tr('hud.deck.pit', 'PIT')
+      : upper
+        ? tr('hud.deck.upper', 'UPPER')
+        : tr('hud.deck.ground', 'GROUND');
     statDeck.classList.toggle('upper', upper);
+    statDeck.classList.toggle('pit', pit);
   }
 }
 
@@ -2463,6 +3456,7 @@ function refreshLocalizedUi() {
     buildAbilityBar();
     updateAbilityHint();
     updateSoundButton();
+    updateLanguageButtons();
     updateStatus();
     renderLeaderboard();
     if (minimapToggle) {
@@ -2543,7 +3537,14 @@ function setMinimapExpanded(expanded) {
   }
 }
 
-/** Текущий масштаб интерфейса из CSS-переменной `--ui`. */
+/**
+ * Текущий масштаб интерфейса из CSS-переменной `--ui`.
+ *
+ * Нужен, чтобы холст мини-карты оставался резким: CSS увеличивает карту
+ * в `--ui` раз, значит и буфер рисунка должен быть в столько же больше.
+ *
+ * @returns {number}
+ */
 function uiScale() {
   try {
     const raw = getComputedStyle(document.documentElement).getPropertyValue('--ui');
@@ -2557,26 +3558,29 @@ function uiScale() {
 /**
  * Подгоняет размер холста мини-карты под текущий режим.
  *
- * В обычном режиме размер задаёт CSS, в развёрнутом — считаем сами,
- * чтобы карта занимала весь экран и оставалась резкой на HiDPI.
+ * В обычном режиме размер задаёт CSS-переменная `--map-size` (её меняет
+ * клиент: select и клавиша K), в развёрнутом — считаем сами, чтобы карта
+ * занимала весь экран и оставалась резкой на HiDPI.
  */
 function resizeMinimap() {
   try {
-    if (!minimapCanvas || !state.map) return;
+    if (!minimapCanvas) return;
+    // Размер мини-карты в CSS: этим же свойством оперирует style.css.
+    document.documentElement.style.setProperty('--map-size', `${minimapSize}px`);
+    if (!state.map) return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
-    let size;
+    // В обычном режиме размер задаёт CSS, а в развёрнутом — холст сам.
+    minimapCanvas.style.width = '';
+    minimapCanvas.style.height = '';
+    let px;
     if (minimapExpanded) {
       const availW = Math.max(240, window.innerWidth - 80);
       const availH = Math.max(240, window.innerHeight - 170);
-      size = Math.floor(Math.min(availW, availH));
-      minimapCanvas.style.width = `${size}px`;
-      minimapCanvas.style.height = `${size}px`;
+      px = Math.floor(Math.min(availW, availH) * dpr);
     } else {
-      minimapCanvas.style.width = '';
-      minimapCanvas.style.height = '';
-      size = Math.floor(320 * uiScale());
+      px = Math.floor(minimapSize * uiScale() * dpr);
     }
-    const px = Math.max(160, Math.min(1600, Math.floor(size * dpr)));
+    px = Math.max(160, Math.min(1600, px));
     if (minimapCanvas.width !== px) {
       minimapCanvas.width = px;
       minimapCanvas.height = px;
@@ -2586,6 +3590,101 @@ function resizeMinimap() {
   }
 }
 
+/**
+ * Читает сохранённый размер мини-карты.
+ */
+function loadMapSize() {
+  try {
+    const raw = localStorage.getItem(MINIMAP_SIZE_KEY);
+    const num = Number(raw);
+    if (Number.isFinite(num) && MINIMAP_SIZES.includes(num)) minimapSize = num;
+  } catch (err) {
+    // Приватный режим браузера — остаётся размер по умолчанию.
+  }
+}
+
+/**
+ * Сохраняет размер мини-карты в localStorage.
+ */
+function saveMapSize() {
+  try {
+    localStorage.setItem(MINIMAP_SIZE_KEY, String(minimapSize));
+  } catch (err) {
+    // Сохранение недоступно — на игру это не влияет.
+  }
+}
+
+/**
+ * Задаёт размер мини-карты и перерисовывает её.
+ * @param {number} size размер в пикселях
+ */
+function setMapSize(size) {
+  if (!MINIMAP_SIZES.includes(size)) return;
+  minimapSize = size;
+  saveMapSize();
+  if (mapSizeSelect && mapSizeSelect.value !== String(size)) {
+    mapSizeSelect.value = String(size);
+  }
+  resizeMinimap();
+  renderMinimap();
+}
+
+/**
+ * Переключает размер мини-карты по кругу: 150 → 200 → 260 → 320 → 150.
+ */
+function cycleMapSize() {
+  const idx = MINIMAP_SIZES.indexOf(minimapSize);
+  const next = MINIMAP_SIZES[(idx + 1) % MINIMAP_SIZES.length];
+  setMapSize(next);
+}
+
+/**
+ * Рисует иконку бонуса на мини-карте.
+ *
+ * Разные бонусы — разные цвета: звезда жёлтая, щит голубой,
+ * ремкомплект зелёный.
+ *
+ * @param {number} kind вид бонуса
+ * @param {number} cx
+ * @param {number} cy
+ * @param {number} scale пикселей на тайл
+ */
+function drawMinimapPickup(kind, cx, cy, scale) {
+  const r = Math.max(3, 4 * scale);
+  if (kind === PICKUP.STAR) {
+    mctx.fillStyle = '#ffd166';
+    mctx.beginPath();
+    for (let i = 0; i < 10; i++) {
+      const rad = i % 2 === 0 ? r : r * 0.45;
+      const a = (Math.PI / 5) * i - Math.PI / 2;
+      const px = cx + Math.cos(a) * rad;
+      const py = cy + Math.sin(a) * rad;
+      if (i === 0) mctx.moveTo(px, py);
+      else mctx.lineTo(px, py);
+    }
+    mctx.closePath();
+    mctx.fill();
+  } else if (kind === PICKUP.SHIELD) {
+    mctx.fillStyle = '#58a6ff';
+    mctx.beginPath();
+    mctx.arc(cx, cy, r, 0, Math.PI * 2);
+    mctx.fill();
+    mctx.strokeStyle = '#d6ecff';
+    mctx.lineWidth = 1;
+    mctx.stroke();
+  } else {
+    mctx.fillStyle = '#3fb950';
+    mctx.fillRect(cx - r * 0.3, cy - r, r * 0.6, r * 2);
+    mctx.fillRect(cx - r, cy - r * 0.3, r * 2, r * 0.6);
+  }
+}
+
+/**
+ * Рисует мини-карту.
+ *
+ * Показывается только активный слой игрока: на земле — земля и дыры
+ * ямок, в ямке — дно ямок, наверху — холмы и мостики.
+ */
 function renderMinimap() {
   if (!state.map || !terrainCanvases.length) return;
   const m = state.map;
@@ -2595,12 +3694,15 @@ function renderMinimap() {
   if (!w || !h) return;
   mctx.clearRect(0, 0, w, h);
   const terrain = terrainCanvases[deck] ?? terrainCanvases[0];
+  // Фон слоя: на верхнем ярусе пустота — пропасть, её видно как тёмное поле.
+  mctx.fillStyle = deck === LEVEL_UPPER ? '#141c12' : '#05070a';
+  mctx.fillRect(0, 0, w, h);
   // Рельеф карты (160×160 тайлов) растягиваем на весь холст: так карта
   // одинаково чёткая и в маленьком, и в полноэкранном виде.
   mctx.imageSmoothingEnabled = false;
   mctx.drawImage(terrain, 0, 0, w, h);
 
-  // Поверх рельефа — туман войны: неисследованное чёрное,
+  // Поверх рельефа — туман войны: неисследованное закрыто,
   // исследованное приглушено, видимое — как есть.
   if (fog.canvas) {
     mctx.drawImage(fog.canvas, 0, 0, w, h);
@@ -2612,26 +3714,36 @@ function renderMinimap() {
   // Бонусы.
   const snap = state.snapshots[state.snapshots.length - 1];
   if (snap) {
-    mctx.fillStyle = '#58a6ff';
     for (const p of snap.pickups.values()) {
       if ((p.deck ?? LEVEL_GROUND) !== deck) continue;
       const cx = (p.x / m.tileSize) * scale;
       const cy = (p.y / m.tileSize) * scale;
-      mctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
+      drawMinimapPickup(p.kind, cx, cy, scale);
     }
-    // Танки — только с текущего этажа.
+    // Танки — только с текущего слоя.
     for (const p of snap.players.values()) {
       if ((p.deck ?? LEVEL_GROUND) !== deck) continue;
       const cx = (p.x / m.tileSize) * scale;
       const cy = (p.y / m.tileSize) * scale;
       if (p.id === state.myId) {
-        mctx.fillStyle = '#58d68d';
-        mctx.fillRect(cx - 2, cy - 2, 4, 4);
-        mctx.strokeStyle = 'rgba(88,214,141,0.6)';
+        // Свой танк: яркая метка со стрелкой направления корпуса.
+        const r = Math.max(4, 6 * scale);
+        mctx.strokeStyle = 'rgba(126,242,154,0.75)';
         mctx.lineWidth = 1;
         mctx.beginPath();
-        mctx.arc(cx, cy, Math.max(4, 6 * scale), 0, Math.PI * 2);
+        mctx.arc(cx, cy, r, 0, Math.PI * 2);
         mctx.stroke();
+        const dx = DIR_DX[p.dir] ?? 0;
+        const dy = DIR_DY[p.dir] ?? 0;
+        mctx.fillStyle = '#7ef29a';
+        mctx.beginPath();
+        mctx.moveTo(cx + dx * (r + 4), cy + dy * (r + 4));
+        mctx.lineTo(cx - dy * 3.5, cy + dx * 3.5);
+        mctx.lineTo(cx + dy * 3.5, cy - dx * 3.5);
+        mctx.closePath();
+        mctx.fill();
+        mctx.fillStyle = '#f2fff4';
+        mctx.fillRect(cx - 2, cy - 2, 4, 4);
       } else {
         mctx.fillStyle = p.isBot ? '#f0a202' : '#f85149';
         mctx.fillRect(cx - 1.5, cy - 1.5, 3, 3);
@@ -2712,7 +3824,7 @@ function frame(now) {
     }
   }
   // А затухание идёт каждый кадр: край конуса растворяется, а не щёлкает.
-  updateFogFade(dt, pred.deck);
+  updateFogFade(dt);
   paintFogLayer(pred.deck);
 
   // Звук мотора: громче и выше на высокой скорости.
@@ -2767,10 +3879,20 @@ function boot() {
     console.warn('не удалось инициализировать язык:', err);
   }
   watchLanguage();
+  bindLanguageButtons();
+  updateLanguageButtons();
 
   // Регуляторы громкости: восстанавливаем сохранённые значения.
   loadVolumes();
   bindVolumeControls();
+
+  // Размер мини-карты: восстанавливаем сохранённый.
+  loadMapSize();
+  if (mapSizeSelect) mapSizeSelect.value = String(minimapSize);
+
+  // Панель звука закрыта по умолчанию, иконка показывает состояние.
+  setSoundPopoverOpen(false);
+  updateSoundButton();
 
   // Спрайты тайлов рисуем один раз в offscreen-холст.
   buildSprites();
@@ -2820,14 +3942,14 @@ function boot() {
 /** Спрайты тайлов (см. buildSprites). */
 function buildSpritesInto(g, TS) {
   const c = g.canvas;
-  // Кирпич: 4 стадии.
+  // Кирпич: 4 стадии. Тёплая красная кладка.
   for (let d = 0; d < 4; d++) {
     const x = d * TS;
-    g.fillStyle = '#9c4a1c';
+    g.fillStyle = TERRAIN.brick;
     g.fillRect(x, 0, TS, TS);
-    g.fillStyle = '#b8591f';
+    g.fillStyle = '#c9693c';
     g.fillRect(x + 1, 1, TS - 2, TS - 2);
-    g.strokeStyle = '#7a3714';
+    g.strokeStyle = TERRAIN.brickDark;
     g.lineWidth = 1;
     for (let row = 0; row < 4; row++) {
       const y = row * 8 + 0.5;
@@ -2847,7 +3969,7 @@ function buildSpritesInto(g, TS) {
       }
     }
     if (d > 0) {
-      g.strokeStyle = 'rgba(30,15,8,0.85)';
+      g.strokeStyle = 'rgba(60,26,12,0.85)';
       g.lineWidth = d;
       g.beginPath();
       g.moveTo(x + 6, 2);
@@ -2863,35 +3985,35 @@ function buildSpritesInto(g, TS) {
       g.stroke();
     }
     if (d > 2) {
-      g.fillStyle = 'rgba(20,10,5,0.55)';
+      g.fillStyle = 'rgba(50,24,10,0.55)';
       g.fillRect(x + 4, 6, 9, 7);
       g.fillRect(x + 19, 18, 8, 9);
     }
-    g.strokeStyle = 'rgba(0,0,0,0.45)';
+    g.strokeStyle = 'rgba(60,26,12,0.45)';
     g.lineWidth = 1;
     g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
   }
 
-  // Бетон.
+  // Бетон: светло-серый.
   {
     const x = 4 * TS;
-    g.fillStyle = '#767f8c';
+    g.fillStyle = TERRAIN.steel;
     g.fillRect(x, 0, TS, TS);
-    g.fillStyle = '#aeb8c6';
+    g.fillStyle = '#d7dee6';
     g.fillRect(x + 1, 1, TS - 2, 7);
-    g.fillStyle = '#5d6673';
+    g.fillStyle = TERRAIN.steelDark;
     g.fillRect(x + 1, TS - 8, TS - 2, 7);
-    g.fillStyle = '#8d97a5';
+    g.fillStyle = '#c6cfd9';
     g.fillRect(x + 2, 9, TS - 4, TS - 18);
-    g.fillStyle = '#c9d3df';
+    g.fillStyle = '#eef3f8';
     g.fillRect(x + 4, 4, 5, 4);
     g.fillRect(x + TS - 9, 4, 5, 4);
-    g.strokeStyle = '#454d58';
+    g.strokeStyle = '#79828e';
     g.lineWidth = 1;
     g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
   }
 
-  // Лес.
+  // Лес: зелёный, темнее травы, но читаемый.
   {
     const x = 5 * TS;
     const blobs = [
@@ -2902,25 +4024,25 @@ function buildSpritesInto(g, TS) {
       [26, 21, 8],
     ];
     for (const [bx, by, r] of blobs) {
-      g.fillStyle = '#1d5c2a';
+      g.fillStyle = TERRAIN.forest;
       g.beginPath();
       g.arc(x + bx, by, r, 0, Math.PI * 2);
       g.fill();
     }
     for (const [bx, by, r] of blobs) {
-      g.fillStyle = '#2b7d3b';
+      g.fillStyle = TERRAIN.forestLight;
       g.beginPath();
       g.arc(x + bx - 1.5, by - 2, r * 0.62, 0, Math.PI * 2);
       g.fill();
     }
   }
 
-  // Лёд.
+  // Лёд: светло-голубой.
   {
     const x = 6 * TS;
-    g.fillStyle = '#a8d8ef';
+    g.fillStyle = TERRAIN.ice;
     g.fillRect(x, 0, TS, TS);
-    g.fillStyle = '#c8ecff';
+    g.fillStyle = '#e2f6ff';
     g.beginPath();
     g.moveTo(x + 2, 22);
     g.lineTo(x + 13, 6);
@@ -2933,7 +4055,7 @@ function buildSpritesInto(g, TS) {
     g.lineTo(x + 31, 15);
     g.lineTo(x + 21, 30);
     g.fill();
-    g.strokeStyle = 'rgba(90,150,190,0.7)';
+    g.strokeStyle = 'rgba(110,170,205,0.7)';
     g.lineWidth = 1;
     g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
   }
@@ -2941,11 +4063,11 @@ function buildSpritesInto(g, TS) {
   // Вода: 3 кадра.
   for (let f = 0; f < 3; f++) {
     const x = (7 + f) * TS;
-    g.fillStyle = '#17518f';
+    g.fillStyle = TERRAIN.waterDeep;
     g.fillRect(x, 0, TS, TS);
-    g.fillStyle = '#1f6cb8';
+    g.fillStyle = TERRAIN.water;
     g.fillRect(x, 0, TS, 16);
-    g.strokeStyle = '#5fb2f0';
+    g.strokeStyle = '#8fd2ff';
     g.lineWidth = 2;
     for (let w = 0; w < 3; w++) {
       const yy = 6 + w * 10 + f * 2;
@@ -2956,13 +4078,14 @@ function buildSpritesInto(g, TS) {
     }
   }
 
-  // Трамплин — переход между ярусами. Жёлтые шевроны показывают,
-  // куда уезжает танк.
+  // Пандус вверх: жёлтые шевроны показывают направление полосы.
   {
     const x = 10 * TS;
-    g.fillStyle = '#4a3c12';
+    g.fillStyle = '#7d6a2c';
     g.fillRect(x, 0, TS, TS);
-    g.strokeStyle = '#e3b341';
+    g.fillStyle = '#a89040';
+    g.fillRect(x + 1, 1, TS - 2, TS - 2);
+    g.strokeStyle = '#f2c94c';
     g.lineWidth = 3;
     g.lineCap = 'round';
     for (let i = 0; i < 3; i++) {
@@ -2973,9 +4096,86 @@ function buildSpritesInto(g, TS) {
       g.lineTo(x + TS - 7, yy + 5);
       g.stroke();
     }
-    g.strokeStyle = 'rgba(0,0,0,0.5)';
+    g.strokeStyle = 'rgba(50,40,10,0.5)';
     g.lineWidth = 1;
     g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
+  }
+
+  // Дно ямки: земля, грунт.
+  {
+    const x = 11 * TS;
+    g.fillStyle = TERRAIN.pit;
+    g.fillRect(x, 0, TS, TS);
+    g.fillStyle = TERRAIN.pitDark;
+    for (let i = 0; i < 12; i++) {
+      const px = x + ((i * 13) % TS);
+      const py = (i * 7) % TS;
+      g.fillRect(px, py, 3, 2);
+    }
+    g.fillStyle = 'rgba(255,225,180,0.12)';
+    g.fillRect(x, 0, TS, 4);
+  }
+
+  // Спускной пандус в ямку: земляные шевроны.
+  {
+    const x = 12 * TS;
+    g.fillStyle = '#5b4028';
+    g.fillRect(x, 0, TS, TS);
+    g.strokeStyle = '#d9a05b';
+    g.lineWidth = 3;
+    g.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {
+      const yy = 7 + i * 9;
+      g.beginPath();
+      g.moveTo(x + 7, yy + 5);
+      g.lineTo(x + TS / 2, yy);
+      g.lineTo(x + TS - 7, yy + 5);
+      g.stroke();
+    }
+    g.strokeStyle = 'rgba(30,18,8,0.5)';
+    g.lineWidth = 1;
+    g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
+  }
+
+  // Настил моста: доски.
+  {
+    const x = 13 * TS;
+    g.fillStyle = TERRAIN.deck;
+    g.fillRect(x, 0, TS, TS);
+    g.fillStyle = TERRAIN.deckTop;
+    g.fillRect(x + 1, 1, TS - 2, 4);
+    g.strokeStyle = TERRAIN.deckDark;
+    g.lineWidth = 1;
+    for (let i = 0; i < 4; i++) {
+      const y = 8 * i + 7.5;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(x + TS, y);
+      g.stroke();
+    }
+    g.strokeStyle = 'rgba(60,40,18,0.55)';
+    g.strokeRect(x + 0.5, 0.5, TS - 1, TS - 1);
+  }
+
+  // Трава: четыре оттенка, чтобы поле не выглядело однотонным.
+  for (let v = 0; v < 4; v++) {
+    const x = (14 + v) * TS;
+    g.fillStyle = TERRAIN.grass[v];
+    g.fillRect(x, 0, TS, TS);
+    // Редкие пучки травы — лёгкая фактура.
+    g.strokeStyle = 'rgba(40,74,32,0.35)';
+    g.lineWidth = 1;
+    for (let i = 0; i < 5; i++) {
+      const px = 4 + ((v * 7 + i * 11) % (TS - 8));
+      const py = 5 + ((v * 5 + i * 9) % (TS - 10));
+      g.beginPath();
+      g.moveTo(x + px, py);
+      g.lineTo(x + px + 1, py - 3);
+      g.stroke();
+    }
+    // Пятнышки света.
+    g.fillStyle = 'rgba(190,225,150,0.16)';
+    g.fillRect(x + ((v * 3) % 20) + 4, 10 + ((v * 7) % 14), 5, 3);
   }
 }
 

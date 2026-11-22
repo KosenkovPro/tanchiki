@@ -17,6 +17,8 @@
   --font: "Consolas", "SF Mono", "Menlo", "DejaVu Sans Mono", monospace;
   /* Базовый масштаб интерфейса: один множитель на весь HUD. */
   --ui: 1;
+  /* Размер мини-карты в пикселях (меняется из интерфейса и по клавише K). */
+  --map-size: 200px;
 }
 
 * {
@@ -107,12 +109,30 @@ canvas#game {
 
 #minimap {
   display: block;
-  width: calc(320px * var(--ui));
-  height: calc(320px * var(--ui));
+  width: calc(var(--map-size) * var(--ui));
+  height: calc(var(--map-size) * var(--ui));
   image-rendering: pixelated;
   border: 1px solid var(--panel-border);
   background: #05070a;
   border-radius: 3px;
+}
+
+/* Переключатель размера мини-карты в шапке панели. */
+#minimap-size {
+  flex: none;
+  background: #161b22;
+  color: var(--accent);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: calc(10px * var(--ui));
+  padding: 1px 3px;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+#minimap-size:focus-visible {
+  outline: 1px solid var(--accent);
 }
 
 .legend {
@@ -413,15 +433,153 @@ canvas#game {
   justify-content: flex-end;
 }
 
-/* ---------------------- Настройки звука ---------------------- */
+/* ---------------------- Панель звука и настроек ---------------------- */
 
-#audio-panel {
-  width: calc(342px * var(--ui));
+/* Хаб в правом нижнем углу: иконка динамика и всплывающая панель настроек. */
+#sound-hub {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 14;
+}
+
+.hub-btn {
+  width: calc(38px * var(--ui));
+  height: calc(38px * var(--ui));
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  color: var(--accent);
+  border: 1px solid var(--panel-border);
+  border-radius: 50%;
+  font-size: calc(17px * var(--ui));
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+  backdrop-filter: blur(3px);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+
+.hub-btn:hover {
+  background: #161b22;
+}
+
+.hub-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.hub-btn.muted {
+  color: var(--muted);
+}
+
+#sound-popover {
+  width: calc(300px * var(--ui));
+  padding: 10px 12px;
+  background: var(--panel-solid);
+  border: 1px solid var(--panel-border);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  pointer-events: auto;
+  font-size: calc(11px * var(--ui));
+}
+
+.pop-title {
+  color: var(--accent);
+  font-size: calc(10px * var(--ui));
+  letter-spacing: 2px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--panel-border);
+  padding-bottom: 4px;
+}
+
+.mute-btn {
+  width: 100%;
+  margin-top: 4px;
+  padding: 5px 8px;
+  background: #161b22;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: calc(10px * var(--ui));
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s;
+}
+
+.mute-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.mute-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Переключатель языка EN / RU. */
+.lang-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: calc(10px * var(--ui));
+  color: var(--muted);
+}
+
+.lang-row.start {
+  justify-content: center;
+  margin: 10px 0 4px;
+}
+
+.lang-switch {
+  display: inline-flex;
+  border: 1px solid var(--panel-border);
+  border-radius: 4px;
+  overflow: hidden;
   pointer-events: auto;
 }
 
-#audio-panel header {
-  cursor: default;
+.lang-btn {
+  padding: 3px 10px;
+  background: #161b22;
+  color: var(--muted);
+  border: none;
+  font-family: inherit;
+  font-size: calc(10px * var(--ui));
+  letter-spacing: 1px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.lang-btn + .lang-btn {
+  border-left: 1px solid var(--panel-border);
+}
+
+.lang-btn:hover {
+  color: var(--accent);
+}
+
+.lang-btn.is-active {
+  background: var(--accent);
+  color: #1a1206;
+  font-weight: 700;
+}
+
+.lang-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .vol {
@@ -497,7 +655,7 @@ canvas#game {
   outline-offset: 2px;
 }
 
-#audio-panel .hint {
+#sound-popover .hint {
   font-size: calc(9px * var(--ui));
   margin-top: 2px;
 }
@@ -598,31 +756,8 @@ canvas#game {
   text-align: center;
 }
 
-/* Кнопки звука и языка */
-#sound-toggle,
-#lang-toggle {
-  margin-top: 0;
-  padding: 5px 12px;
-  font-size: calc(10px * var(--ui));
-  letter-spacing: 1px;
-  box-shadow: 0 2px 0 #7a4c00;
-  pointer-events: auto;
-}
-
-#sound-toggle.off {
-  background: #30363d;
-  color: var(--muted);
-  box-shadow: 0 2px 0 #21262d;
-}
-
-#sound-toggle.off:hover {
-  background: #3d444d;
-  color: var(--text);
-}
-
-#lang-toggle {
-  min-width: 52px;
-}
+/* Кнопки звука и языка живут в панели настроек справа снизу
+   (#sound-hub) и на стартовом экране — отдельных кнопок в подсказке нет. */
 
 /* Индикатор потери связи */
 #connection {
