@@ -130,7 +130,8 @@ docker run -d --name tanchiki -p 3000:3000 tanchiki
 | `1` `2` | выбор способности: миномёт / авиаподдержка |
 | `Enter` | начать бой / возродиться |
 | `F` | развернуть / свернуть карту на весь экран |
-| `Esc` | свернуть развёрнутую карту |
+| `Esc` | свернуть развёрнутую карту, закрыть панель настроек |
+| `K` | размер мини-карты: XS → S → M → L |
 | `M` | включить / выключить звук |
 | Колесо мыши | зум камеры (0.55×…1.6×) |
 
@@ -154,26 +155,37 @@ Battle City, поэтому он не застревает в узких про�
 
 ## 🗺 Мини-карта
 
-Мини-карта в v0.2.0 стала заметно крупнее и превратилась в полноценный обзор карты.
+Мини-карта в v0.3.0 стала **регулируемой** и показывает обстановку по слоям.
 
-* Холст мини-карты вырос до **320 × 320** px (было 168 × 168).
-* Весь интерфейс HUD **увеличился в целом**: размеры панелей и шрифтов задаёт
-  CSS-переменная `--ui`, а на низких разрешениях она уменьшается, чтобы панели
-  не наезжали друг на друга.
+* Базовый размер холста — **200 × 200** px. Рядом с заголовком карты стоит
+  **селектор размера**: `XS` (150), `S` (200), `M` (260), `L` (320).
+  Выбранный размер сохраняется в `localStorage` по ключу `tanchiki.mapSize`
+  и переживает перезагрузку.
+* Клавиша **`K`** переключает размер по кругу — от компактного обзора до
+  почти полноэкранной карты.
 * Кнопка **⛶** в шапке панели карты (или клавиша `F`) разворачивает карту **на
   весь экран**, `Esc` сворачивает обратно. В развёрнутом виде карта занимает всё
   поле, а на ней нарисована **рамка видимой области камеры** — по ней видно,
   где именно сейчас находится танк.
-* Мини-карта показывает **только текущий этаж** — соседнего яруса на ней нет.
+* Мини-карта показывает **только текущий слой** — соседних слоёв на ней нет.
+  На верхнем слое пустота (пропасть) залита тёмным фоном, на земле — обычный.
+* **Метка игрока** — яркий круг со **стрелкой направления корпуса**, чтобы
+  было видно, куда развёрнут танк.
+* **Бонусы** отмечены цветными иконками: ★ звезда, ● щит, ✚ ремкомплект.
 
-Соседний этаж не рисуется вообще: ни в мире, ни на карте. Где вы находитесь,
+Соседний слой не рисуется вообще: ни в мире, ни на карте. Где вы находитесь,
 показывает индикатор **«ЯРУС»** в панели состояния.
 
 ---
 
-## 🔈 Микшер звука
+## 🔈 Панель звука и настроек
 
-В панели **«Настройки звука»** пять независимых регуляторов — по одному на каждое действие:
+Всё управление звуком и языком собрано в **одной панели в правом нижнем углу**
+экрана — там, где рука не мешает стрелять.
+
+* Кнопка **🔊** в углу открывает **всплывающее окно настроек**
+  (`Esc` или повторный клик — закрывает).
+* Внутри — пять независимых регуляторов, по одному на каждое действие:
 
 | Регулятор | Что регулирует |
 |-----------|-----------------|
@@ -183,7 +195,11 @@ Battle City, поэтому он не застревает в узких про�
 | Мотор | процедурный звук двигателя |
 | Попадания и интерфейс | попадания, урон, подбор бонуса, повышение уровня, звуки интерфейса |
 
-Значения сохраняются в браузере (`localStorage`) и переживают перезагрузку:
+* Кнопка **MUTE** и клавиша `M` **полностью отключают** звук, не трогая положение
+  регуляторов: включили звук обратно — и громкость осталась той, которую вы выставили.
+* В этом же окне — **переключатель языка** `EN` / `RU`.
+
+Значения громкости сохраняются в браузере (`localStorage`) и переживают перезагрузку:
 
 | Ключ | Регулятор |
 |------|-----------|
@@ -193,20 +209,19 @@ Battle City, поэтому он не застревает в узких про�
 | `tanchiki.vol.engine` | мотор |
 | `tanchiki.vol.hits` | попадания и интерфейс |
 
-Кнопка **🔊 / 🔇** и клавиша `M` работают как раньше: они **полностью отключают**
-звук, не трогая положение регуляторов — включили звук обратно, и громкость
-останется той, которую вы выставили.
-
 ---
 
 ## 🌐 Язык интерфейса
 
-Язык переключается **прямо в игре** — кнопкой в панели управления рядом с кнопкой
-звука. Выбранный язык сохраняется в `localStorage` по ключу `tanchiki.lang` и
-восстанавливается при следующем запуске.
+Язык переключается **прямо в игре**: кнопками `EN` / `RU` — и на стартовом
+экране, и в панели настроек в правом нижнем углу. Выбранный язык сохраняется
+в `localStorage` по ключу `tanchiki.lang` и восстанавливается при следующем запуске.
 
-Английский вариант — полноценный, а не машинный перевод: «ТАНЧИКИ» в нём
-называется **«TANCHEKI»**.
+**По умолчанию — английский** (`<html lang="en">`): у игры два полноценных
+языка, и английский открывается первым. Русский включается одним кликом.
+
+Английский вариант — не машинный перевод: «ТАНЧИКИ» в нём называется
+**«TANCHEKI»**.
 
 Переводы живут в отдельном модуле `static/i18n.js`:
 
@@ -219,6 +234,7 @@ Battle City, поэтому он не застревает в узких про�
 | `data-i18n-placeholder` | подсказка поля ввода (`placeholder`) |
 | `data-i18n-title` | всплывающая подсказка (`title`) |
 | `data-i18n-aria` | подпись для скринридеров (`aria-label`) |
+| `data-lang-set` | кнопка переключения языка (`en` / `ru`) |
 
 Статические подписи помечаются атрибутами прямо в разметке — `data-i18n="hud.score"` —
 а `applyI18n()` подставляет переводы при смене языка.
@@ -303,31 +319,56 @@ Battle City, поэтому он не застревает в узких про�
 | `Water` (3) | нет | да | танк не проезжает, снаряды летят насквозь |
 | `Forest` (4) | да | да | танк внутри леса **невидим** для врагов снаружи массива (пока не выстрелит) и **полупрозрачен** — сквозь него видно кусты |
 | `Ice` (5) | да | да | скользко: слабое трение, танк уезжает по инерции |
-| `Ramp` (6) | да | да | **пандус** (жёлтые шевроны) — полоса из трёх тайлов, переход между ярусами |
+| `Ramp` (6) | да | да | **пандус** (жёлтые шевроны) — полоса из трёх тайлов, переход между слоями |
+| `Pit` (7) | да | да | **дно ямки**: проходимо, но не пропускает настильный огонь сверху |
 
-### Двухуровневая карта
+### Три уровня высот
 
-Карта состоит из **двух ярусов** (этажей по высоте), но вид остаётся сверху, 2D:
+Карта стала **трёхслойной**: три дискретные высоты — ямки, земля и возвышенности.
 
-| Ярус | Что на нём |
-|------|-------------|
-| `НИЖНИЙ` (0) | земля — основная поверхность |
-| `ВЕРХНИЙ` (1) | площадки и перекрытия |
+| Слой | Высота | Что лежит |
+|------|--------|------------|
+| `ЯМКА` (0) | `−1` | дно ямки (окопы), стенки окопа, спускные пандусы |
+| `ЗЕМЛЯ` (1) | `0` | основная поверхность, подъёмные пандусы, дыры ямок |
+| `ВЕРХНИЙ` (2) | `+1` | холмы-платформы, мостики-эстакады, подъёмные пандусы |
 
-**Виден только свой этаж.** Соседний ярус не рисуется вообще — ни в мире, ни на
+**Виден только свой слой.** Соседние слои не рисуются вообще — ни в мире, ни на
 мини-карте. Где вы находитесь, показывает индикатор **«ЯРУС»** в панели
-состояния: `НИЖНИЙ` или `ВЕРХНИЙ`.
+состояния: `ЯМКА`, `ЗЕМЛЯ` или `ВЕРХНИЙ`.
+
+#### Ямки — окопы ниже уровня земли
+
+На карте **5–8 ямок**, размещённых симметрично (как и остальные структуры — зеркально
+в четыре квадранта).
+
+* Ямка — это **дыра в земле**: тайлы земли внутри неё пустые, танк на земле туда
+  не провалится и не заедет случайно.
+* По периметру ямки идёт **кольцо кирпича** — стенки окопа; внутри — `Pit`, дно.
+* В ямку ведёт **спускной пандус**: полоса из трёх тайлов с поверхности вниз.
+  Единственный законный способ спуститься — заехать на него.
+
+#### Холмы и мостики — уровень выше земли
+
+Верхний слой — **не сплошное поле**, а разрежённая сеть:
+
+* **Холмы-платформы** — сплошные блоки на слое `ВЕРХ`, к краям которых привязаны
+  подъёмные пандусы.
+* **Мостики (эстакады)** — проходимые настилы над ямками и землёй, шириной 1–2 тайла.
+  Под мостиком по земле можно свободно проехать, а на сам мостик — заехать
+  **своим** подъёмным пандусом.
+* У каждого холма и каждого мостика **обязателен пандус**: без него платформа
+  просто не ставится, поэтому на карте не бывает «отрезанных» верхних участков.
 
 #### Пандус — полоса из трёх тайлов
 
-Переход между этажами — **пандус** (`Ramp`): это не одиночный тайл, а полоса из
-трёх тайлов, ведущая к краю верхней площадки.
+Переход между слоями — **пандус** (`Ramp`): это не одиночный тайл, а полоса из
+трёх тайлов, ведущая к краю соседнего слоя.
 
 | Тайл полосы | Что это |
 |-------------|---------|
-| `0` | нижний край — уровень земли, сюда танк заезжает |
+| `0` | край **низкой** стороны — сюда танк заезжает |
 | `1` | середина полосы |
-| `2` | верхний край — верхняя площадка |
+| `2` | край **высокой** стороны — здесь уже другой слой |
 
 В байте тайла это закодировано так:
 
@@ -335,22 +376,36 @@ Battle City, поэтому он не застревает в узких про�
 |------|-------------|
 | `0..=2` | вид тайла (`Ramp` = 6) |
 | `3..=4` | направление полосы: `0` — вправо, `1` — вниз, `2` — влево, `3` — вверх |
-| `5..=6` | номер тайла в полосе: `0` — нижний край, `1` — середина, `2` — верхний край |
+| `5..=6` | номер тайла в полосе: `0` — низкий край, `1` — середина, `2` — высокий край |
+| `7` | `1` — пандус ведёт **в ямку** (`земля ↔ ямка`), `0` — пандус ведёт **вверх** (`земля ↔ верх`) |
 
-* Танк заезжает на пандус **снизу** и поднимается на верхний этаж
+* Танк заезжает на пандус **снизу** и поднимается на верхний слой
   **непрерывно**: клиент плавно поднимает корпус, а под ним по земле едет тень.
-  Никаких «телепортаций» между этажами.
-* Ярус меняется на **верхнем тайле полосы** (`2`), при спуске — на нижнем (`0`).
+  Никаких «телепортаций» между слоями.
+* Слой меняется на **высоком тайле полосы** (`2`), при спуске — на низком (`0`).
   Ехать можно **в обе стороны**: заехать можно и сверху.
-* Пандус занимает **один и тот же тайл на обоих ярусах**, поэтому заезд
+* Пандус занимает **один и тот же тайл на обоих слоях** пары, поэтому заезд
   работает и вверх, и вниз.
-* Стены, снаряды, бонусы, взрывы и обзор работают **в пределах своего яруса**:
-  танк на другом этаже не виден и не слышен как цель.
-* Пандусы **привязаны к краям верхних площадок** — они не расставлены случайными
-  одиночными тайлами: полоса всегда ведёт к площадке, с которой можно заехать
-  наверх, и подъезд к ней свободен на обоих ярусах.
+* Переход возможен, только если на новом слое танк **помещается** — иначе
+  полоса просто не ставится.
+* Стены, снаряды, бонусы, взрывы и обзор работают **в пределах своего слоя**:
+  танк на другом слое не виден и не слышен как цель.
 * Карта генерируется на сервере **детерминированно** (сид `0x7A4C1E55D1CE2026`):
   `160 × 160` тайлов по `32` px — это `5120 × 5120` px.
+
+#### Баллистика по слоям — честная, без «через стену»
+
+| Снаряд | Куда попадает |
+|--------|---------------|
+| свой слой | всегда |
+| с `ВЕРХ` (+1) | в `ЗЕМЛЯ` (0) — **преимущество высоты**, снаряд не цепляется за края платформ |
+| с `ЗЕМЛЯ` (0) | в `ВЕРХ` (+1) — **нет**: края возвышенностей и бортики мостов блокируют |
+| с `ЗЕМЛЯ` (0) или `ВЕРХ` (+1) | в `ЯМКУ` (−1) — **нет**: это защита от настильного огня |
+| из `ЯМКИ` (−1) | только в свою низину — вверх стрелять нельзя |
+| миномёт и авиаудар | **по всем слоям** сразу — это навесное оружие |
+
+Собственные выстрелы **всегда** приходят в снимок мира, даже если выстрел ушёл
+за пределы конуса обзора: свой снаряд нельзя потерять.
 
 ### Прокачка
 
@@ -404,19 +459,21 @@ Battle City, поэтому он не застревает в узких про�
 в [`static/sfx/CREDITS.txt`](static/sfx/CREDITS.txt).
 
 Звук включается при первом клике (браузеры разрешают аудио только после действия
-пользователя) и переключается клавишей `M` или кнопкой «🔊 ЗВУК» в углу экрана.
-Отдельные уровни громкости — в разделе «🔈 Микшер звука».
+пользователя) и переключается клавишей `M` или кнопкой **🔊** в правом нижнем углу.
+Отдельные уровни громкости — в разделе «🔈 Панель звука и настроек».
 
 #### Звук выстрела
 
 Выстрел из пушки **процедурный** — он больше не «лазерный» и не берётся из mp3:
-тон собирается прямо в браузере через Web Audio API из трёх слоёв.
+тон собирается прямо в браузере через Web Audio API из четырёх слоёв. В основе —
+**глубокий сабовый удар**, поэтому выстрел звучит как танковый, а не как пик.
 
 | Слой | Что это |
 |------|---------|
-| Низкочастотный свип | синус **150 → 45 Гц** — сама тяга выстрела |
-| Шумовой всплеск | белый шум через lowpass-фильтр — «порох» |
-| Металлический отзунок | короткий треугольный импульс — ствол и отдача |
+| Сабовый удар | синус **90 → 38 Гц** за 0.12 с — тяга и вес выстрела |
+| Тело выстрела | синус **150 → 45 Гц** за 0.3 с — основной тон |
+| Пороховой щелчок | короткий шум через полосовой фильтр **2600 Гц** — «щелчок» затвора |
+| Резонанс ствола | шум в узкой полосе **1500 → 700 Гц** + треугольный импульс **430 Гц** |
 
 Внешний mp3-семпл выстрела **больше не используется**: у звука нет файла, есть
 только формула, поэтому он одинаково звучит у всех и не зависит от загрузки
@@ -441,11 +498,27 @@ Battle City, поэтому он не застревает в узких про�
 
 ### Боты
 
-Если на сервере меньше 20 активных игроков, сервер сам поддерживает население ИИ-танками
-(до 24 ботов): поиск пути в обход препятствий, стрельба по линии видимости и **бой друг
-с другом** — целью бота может быть и человек, и другой бот, поэтому на карте идут
-настоящие бои. Если цели нет, бот блуждает по карте. Когда приходят люди,
-лишние боты уходят плавно: исчезают со взрывом и удаляются через 1.5 секунды.
+Сервер сам поддерживает население ИИ-танками: **целевое число ботов — 20**
+(независимо от числа людей), жёсткий верхний предел — 24. Поиск пути в обход
+препятствий, стрельба по линии видимости и **бой друг с другом** — целью бота
+может быть и человек, и другой бот, поэтому на карте идут настоящие бои.
+Если цели нет, бот блуждает по карте. Когда приходят люди, лишние боты уходят
+плавно: исчезают со взрывом и удаляются через 1.5 секунды.
+
+#### Боты не наваливаются толпой
+
+У каждого бота **собственный характер**, поэтому на карте они ведут себя
+по-разному и не сливаются в одну кучу:
+
+| Что | Значение |
+|-----|----------|
+| Личный темп | свой множитель скорости **0.55…0.9** от базовой |
+| Личная реакция | своя задержка от **4 до 26 тиков** поверх реакции по сложности |
+| Личное пространство | если у цели уже скопились **3+ других бота**, бот **не сближается** |
+| Разные планы | цель пересчитывается не каждый тик, а с разбросом по времени |
+
+Последнее правило — ключевое: боты **держат дистанцию** и обходят цель с
+разных сторон вместо того, чтобы все разом нестись на одного игрока.
 
 #### Уровни сложности
 
@@ -477,6 +550,7 @@ Battle City, поэтому он не застревает в узких про�
 | `TANCHIKI_MAP_W` | `160` | ширина карты в тайлах (32…512) |
 | `TANCHIKI_MAP_H` | `160` | высота карты в тайлах (32…512) |
 | `TANCHIKI_MIN_PLAYERS` | `20` | минимальный размер населения (люди + боты) |
+| `TANCHIKI_BOT_COUNT` | `20` | целевое число ботов на карте |
 | `TANCHIKI_MAX_BOTS` | `24` | максимум ботов |
 | `TANCHIKI_BOT_SKILL` | `mixed` | сложность ботов: `easy` / `normal` / `hard` / `mixed` |
 | `TANCHIKI_SEED` | фиксированный | зерно генерации карты |
@@ -545,8 +619,8 @@ static/
 Танк в чаще дополнительно скрывается от наблюдателей, находящихся вне того же лесного
 массива.
 
-Фильтрация **по ярусам** идёт отдельным шагом: сущности с чужим `deck` в снимок
-не попадают вообще — этаж перекрывает обзор. Исключение — **звуковой канал**:
+Фильтрация **по слоям** идёт отдельным шагом: сущности с чужим `deck` в снимок
+не попадают вообще — соседний слой перекрывает обзор. Исключение — **звуковой канал**:
 звуковые события присылаются всем, кто в пределах слышимости, независимо от
 конуса обзора, поэтому игрок слышит, с какой стороны атакуют.
 
@@ -556,10 +630,10 @@ static/
 
 ### Синхронизация карты
 
-* При входе игрок получает **полное состояние карты по ярусам**, упакованное **RLE**:
-  для каждого яруса — своя последовательность троек `value:u8, len:u16`.
+* При входе игрок получает **полное состояние карты по слоям**, упаковано **RLE**:
+  для каждого из трёх слоёв — своя последовательность троек `value:u8, len:u16`.
 * Во время игры приходят только **дельты** `TileUpdate { x, y, value, deck }` для изменившихся
-  тайлов в зоне видимости; свой ярус указывает и у дельты.
+  тайлов в зоне видимости; свой слой указывает и у дельты.
 
 ### Безопасность сети
 
@@ -616,7 +690,7 @@ static/
 | `ERROR` | `0x17` | `code: u16`, `message: string` |
 
 **Карта** (внутри `WELCOME`): `width: u32`, `height: u32`, `tile_size: u32`,
-`layers: u8`, затем для каждого яруса — `rle_len: u32` и байты RLE-потока.
+`layers: u8`, затем для каждого слоя — `rle_len: u32` и байты RLE-потока.
 
 **`SNAPSHOT`:**
 
@@ -639,14 +713,16 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 Значение тайла упаковано в один байт: биты `0..=2` — базовый тип. У кирпича биты
 `3..=5` — стадия повреждения (0–3), у пандуса биты `3..=4` — направление полосы
 (`0` вправо, `1` вниз, `2` влево, `3` вверх) и биты `5..=6` — номер тайла в
-полосе (`0` — нижний край, `1` — середина, `2` — верхний край).
+полосе (`0` — низкий край, `1` — середина, `2` — высокий край). Бит `7` у пандуса
+означает, что полоса ведёт **в ямку** (`0` — ведёт наверх).
 
 `dir`: `0` вверх, `1` вниз, `2` влево, `3` вправо, `4` вверх-влево, `5` вверх-вправо,
 `6` вниз-влево, `7` вниз-вправо. Это направление **корпуса**.
 
 `aim` — направление **башни**, 64 значения с шагом 5.625°; по нему летят снаряды.
-`deck` — номер яруса: `0` — нижний, `1` — верхний. Он есть у всех сущностей:
-танков, снарядов, бонусов, эффектов способностей, дельт тайлов и звуков.
+`deck` — **индекс слоя**: `0` — ямка (−1), `1` — земля (0), `2` — верх (+1).
+Он есть у всех сущностей: танков, снарядов, бонусов, эффектов способностей,
+дельт тайлов и звуков.
 `mortar_cd` и `airstrike_cd` — остатки кулдаунов миномёта и авиаподдержки в тиках;
 присылаются **всегда**, поэтому панель показывает готовность обеих способностей.
 
@@ -659,14 +735,17 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 `x2,y2` — точка падения, `phase` — ход полёта в процентах), `kind = 2` вызов
 авиаподдержки (`x,y` — точка удара, `phase` — ход вызова).
 
-События `Explosion` и `TileBroken` тоже несут `deck` — ярус, на котором они произошли.
+События `Explosion` и `TileBroken` тоже несут `deck` — слой, на котором они произошли.
 
-Версия протокола — **5**: в первой было 4 направления, во второй добавились 8 направлений
+Версия протокола — **6**: в первой было 4 направления, во второй добавились 8 направлений
 и счётчик убийств, в третьей — независимая башня (16 направлений), способности и туман
 войны, в четвёртой — 64 направления башни (шаг 5.625°), многоуровневая карта с ярусами
 (`deck` у всех сущностей), раздельные кулдауны миномёта и авиаподдержки и звуковой
 канал вне конуса обзора, в пятой — переходы между ярусами стали полосами пандуса из
 трёх тайлов: в байте тайла закодированы направление полосы и номер тайла в ней.
+В шестой — карта стала **трёхслойной**: `deck` теперь означает индекс слоя
+(`0` ямка, `1` земля, `2` верх), появился тайл `Pit` (дно ямки) и бит «пандус ведёт
+в ямку».
 
 ---
 
@@ -687,7 +766,7 @@ events:  u16 × { kind: u8, ... }     // 0 взрыв, 1 разрушен тай
 
 ```bash
 cargo check --all-targets   # 0 ошибок, 0 предупреждений
-cargo test                  # 52 тестов
+cargo test                  # 60 тестов
 cargo build --release
 ```
 
@@ -700,6 +779,16 @@ cargo build --release
 из трёх тайлов (порядок номеров, отсутствие наложений, свободный подъезд на обоих
 ярусах), смена яруса только на верхнем тайле полосы и только на нижнем при спуске,
 сокрытие противников на соседнем этаже и слышимость выстрелов вне конуса обзора.
+
+Отдельно проверены механики **трёх слоёв**:
+
+* спуск в ямку по пандусу и подъём обратно;
+* невозможность **съехать в ямку** с земли случайно (дыра в земле);
+* правила настильного огня: с земли в ямку и с земли наверх — не пробивает,
+  с верха на землю — пробивает;
+* миномёт и авиаудар достают танк **на всех слоях**;
+* ямки генерируются с собственным спускным пандусом;
+* на карте **20 ботов**, и ни один из них не быстрее игрока.
 
 Полезные команды во время разработки:
 
@@ -828,7 +917,8 @@ polls `/healthz`, so `docker ps` reflects the real state of the container.
 | `1` `2` | select ability: mortar / air strike |
 | `Enter` | join the battle / respawn |
 | `F` | expand / collapse the full-screen map |
-| `Esc` | collapse the expanded map |
+| `Esc` | collapse the expanded map, close the settings panel |
+| `K` | minimap size: XS → S → M → L |
 | `M` | toggle sound on / off |
 | Mouse wheel | camera zoom (0.55×…1.6×) |
 
@@ -853,26 +943,38 @@ The camera **never shakes**: not on hits, not on explosions.
 
 ## 🗺 Minimap
 
-In v0.2.0 the minimap became noticeably bigger and turned into a full overview of the map.
+In v0.3.0 the minimap became **adjustable** and shows the situation per layer.
 
-* The minimap canvas grew to **320 × 320** px (it was 168 × 168).
-* The whole HUD got **bigger**: panel and font sizes are driven by the CSS
-  variable `--ui`, and it shrinks on low resolutions so the panels do not
-  overlap each other.
+* The base canvas size is **200 × 200** px. Next to the map header there is a
+  **size selector**: `XS` (150), `S` (200), `M` (260), `L` (320).
+  The chosen size is stored in `localStorage` under the `tanchiki.mapSize` key
+  and survives a reload.
+* The **`K`** key cycles the size — from a compact overview to a nearly
+  full-screen map.
 * The **⛶** button in the map panel header (or the `F` key) expands the map **to
   the full screen**, `Esc` collapses it back. In the expanded view the map takes
   the whole field and shows the **frame of the visible camera area** — you can
   see exactly where your tank is right now.
-* The minimap shows **the current deck only** — there is no neighbouring floor on it.
+* The minimap shows **the current layer only** — there are no neighbouring layers
+  on it. On the upper layer the void (the abyss) is filled with a dark colour,
+  on the ground it is the usual one.
+* The **player marker** is a bright circle with an **arrow of the hull
+  direction**, so you can see where the tank is pointing.
+* **Pickups** are marked with coloured icons: ★ star, ● shield, ✚ repair kit.
 
-The neighbouring deck is not drawn at all: neither in the world, nor on the map.
-Where you are is shown by the **«ЯРУС» (deck)** indicator in the status panel.
+The neighbouring layer is not drawn at all: neither in the world, nor on the map.
+Where you are is shown by the **«DECK»** indicator in the status panel.
 
 ---
 
-## 🔈 Sound mixer
+## 🔈 Sound and settings panel
 
-The **“Sound settings”** panel has five independent sliders — one per action:
+Sound and language controls live in **one panel in the bottom-right corner** of
+the screen — where your hand never blocks the shooting.
+
+* The **🔊** button in the corner opens a **popover with the settings**
+  (`Esc` or another click closes it).
+* Inside there are five independent sliders, one per action:
 
 | Slider | What it controls |
 |--------|------------------|
@@ -881,6 +983,10 @@ The **“Sound settings”** panel has five independent sliders — one per acti
 | Explosions | tank explosions and destroyed walls |
 | Engine | the procedural engine sound |
 | Hits and interface | hits, damage, pickups, level-ups and interface sounds |
+
+* The **MUTE** button and the `M` key **mute everything** without touching the
+  slider positions: turn the sound back on and the volume is still the one you set.
+* The same popover holds the **language switch** `EN` / `RU`.
 
 The values are stored in the browser (`localStorage`) and survive a reload:
 
@@ -892,17 +998,17 @@ The values are stored in the browser (`localStorage`) and survive a reload:
 | `tanchiki.vol.engine` | engine |
 | `tanchiki.vol.hits` | hits and interface |
 
-The **🔊 / 🔇** button and the `M` key work as before: they **mute everything**
-without touching the slider positions — turn the sound back on and the volume is
-still the one you set.
-
 ---
 
 ## 🌐 Interface language
 
-The language is switched **right in the game** — with a button in the control
-panel next to the sound button. The chosen language is stored in `localStorage`
-under the `tanchiki.lang` key and is restored on the next start.
+The language is switched **right in the game**: with the `EN` / `RU` buttons —
+both on the start screen and in the settings panel in the bottom-right corner.
+The chosen language is stored in `localStorage` under the `tanchiki.lang` key
+and is restored on the next start.
+
+**English is the default** (`<html lang="en">`): the game has two full-fledged
+languages, and English opens first. Russian is one click away.
 
 The English variant is a full-fledged translation, not a machine one: «ТАНЧИКИ»
 is called **«TANCHEKI»** in it.
@@ -918,6 +1024,7 @@ The translations live in a separate module `static/i18n.js`:
 | `data-i18n-placeholder` | input hint (`placeholder`) |
 | `data-i18n-title` | tooltip (`title`) |
 | `data-i18n-aria` | screen reader label (`aria-label`) |
+| `data-lang-set` | language switch button (`en` / `ru`) |
 
 Static labels are marked with the attributes right in the markup —
 `data-i18n="hud.score"` — and `applyI18n()` substitutes the translations when the
@@ -1006,32 +1113,57 @@ itself is drawn locally by the client — from the map data, with no extra traff
 | `Water` (3) | no | yes | tanks cannot enter, bullets fly over |
 | `Forest` (4) | yes | yes | a tank inside the forest is **invisible** to enemies outside that forest block (until it fires) and **semi-transparent** — the bushes show through it |
 | `Ice` (5) | yes | yes | slippery: low friction, the tank coasts by inertia |
-| `Ramp` (6) | yes | yes | **ramp** (yellow chevrons) — a strip of three tiles, the transition between decks |
+| `Ramp` (6) | yes | yes | **ramp** (yellow chevrons) — a strip of three tiles, the transition between layers |
+| `Pit` (7) | yes | yes | **pit floor**: driveable, but it does not let overhead fire through |
 
-### Two-level map
+### Three levels of height
 
-The map has **two decks** (floors by height), but the view is still top-down 2D:
+The map became **three-layered**: three discrete heights — pits, ground and highlands.
 
-| Deck | What is on it |
-|------|---------------|
-| `LOWER` (0) | the ground — the main surface |
-| `UPPER` (1) | platforms and overhangs |
+| Layer | Height | What is on it |
+|-------|--------|---------------|
+| `PIT` (0) | `−1` | pit floors (trenches), the trench walls, descending ramps |
+| `GROUND` (1) | `0` | the main surface, ascending ramps, the holes of the pits |
+| `UPPER` (2) | `+1` | hill platforms, bridges (elevated walkways), ascending ramps |
 
-**Only your own deck is visible.** The neighbouring deck is not drawn at all —
+**Only your own layer is visible.** The neighbouring layers are not drawn at all —
 neither in the world, nor on the minimap. Where you are is shown by the
-**«ЯРУС» (deck)** indicator in the status panel: `НИЖНИЙ` (lower) or `ВЕРХНИЙ`
-(upper).
+**«DECK»** indicator in the status panel: `PIT`, `GROUND` or `UPPER`.
+
+#### Pits — trenches below the ground level
+
+The map has **5–8 pits**, placed symmetrically (like the other structures — mirrored
+into the four quadrants).
+
+* A pit is a **hole in the ground**: the ground tiles inside it are empty, so a
+  tank on the ground can neither fall in nor drive into it by accident.
+* The perimeter of a pit is a **ring of brick** — the trench walls; inside is
+  `Pit`, the floor.
+* A **descending ramp** leads into the pit: a strip of three tiles from the
+  surface down. It is the only legal way to get down there.
+
+#### Hills and bridges — the level above the ground
+
+The upper layer is **not a solid field**, but a sparse network:
+
+* **Hill platforms** — solid blocks on the `UPPER` layer, with ascending ramps
+  tied to their edges.
+* **Bridges (elevated walkways)** — driveable decks above pits and ground, 1–2
+  tiles wide. You can drive freely on the ground under a bridge, and to get onto
+  the bridge itself you use **its own** ascending ramp.
+* Every hill and every bridge **must have a ramp**: without one the platform is
+  simply not placed, so the map never contains “cut off” upper areas.
 
 #### A ramp is a strip of three tiles
 
-The transition between floors is a **ramp** (`Ramp`): not a single tile, but a
-strip of three tiles that leads to the edge of an upper platform.
+The transition between layers is a **ramp** (`Ramp`): not a single tile, but a
+strip of three tiles that leads to the edge of the neighbouring layer.
 
 | Strip tile | What it is |
 |------------|------------|
-| `0` | the lower edge — the ground level, where the tank drives in |
+| `0` | the **low** edge — where the tank drives in |
 | `1` | the middle of the strip |
-| `2` | the upper edge — the upper platform |
+| `2` | the **high** edge — the other layer starts here |
 
 This is packed into the tile byte like this:
 
@@ -1039,23 +1171,37 @@ This is packed into the tile byte like this:
 |------|----------------|
 | `0..=2` | the tile kind (`Ramp` = 6) |
 | `3..=4` | the strip direction: `0` — right, `1` — down, `2` — left, `3` — up |
-| `5..=6` | the tile index in the strip: `0` — lower edge, `1` — middle, `2` — upper edge |
+| `5..=6` | the tile index in the strip: `0` — low edge, `1` — middle, `2` — high edge |
+| `7` | `1` — the ramp leads **into a pit** (`ground ↔ pit`), `0` — it leads **up** (`ground ↔ upper`) |
 
-* The tank drives onto the ramp **from below** and rises to the upper deck
+* The tank drives onto the ramp **from below** and rises to the upper layer
   **continuously**: the client smoothly lifts the hull while a shadow drives on
-  the ground below it. There is no “teleport” between floors.
-* The deck changes on the **top tile of the strip** (`2`), and on the way down —
-  on the bottom one (`0`). You can drive **in both directions**: entering from
+  the ground below it. There is no “teleport” between layers.
+* The layer changes on the **high tile of the strip** (`2`), and on the way down —
+  on the low one (`0`). You can drive **in both directions**: entering from
   the top works as well.
-* The ramp occupies **the very same tile on both decks**, so driving up and
-  driving down work the same way.
+* The ramp occupies **the very same tile on both layers** of the pair, so driving
+  up and driving down work the same way.
+* The transition only happens if the tank **fits** on the new layer — otherwise
+  the strip is simply not placed.
 * Walls, bullets, pickups, explosions and sight all work **within their own
-  deck**: a tank on another floor is neither visible nor audible as a target.
-* The ramps are **tied to the edges of the upper platforms** — they are not
-  scattered random single tiles: a strip always leads to a platform you can
-  drive up to, and the approach to it is free on both decks.
+  layer**: a tank on another layer is neither visible nor audible as a target.
 * The map is generated on the server **deterministically** (seed `0x7A4C1E55D1CE2026`):
   `160 × 160` tiles of `32` px — that is `5120 × 5120` px.
+
+#### Ballistics across layers — honest, no shooting through walls
+
+| Shot | What it hits |
+|------|--------------|
+| its own layer | always |
+| from `UPPER` (+1) | `GROUND` (0) — the **advantage of height**, the shot does not catch on platform edges |
+| from `GROUND` (0) | `UPPER` (+1) — **no**: the edges of the highlands and the bridge kerbs block it |
+| from `GROUND` (0) or `UPPER` (+1) | `PIT` (−1) — **no**: that is protection from overhead fire |
+| from `PIT` (−1) | only inside its own hollow — you cannot shoot upwards |
+| mortar and air strike | **all layers at once** — that is what indirect fire is for |
+
+Your own shots **always** come in the world snapshot, even when the shot has left
+the vision cone: you can never lose track of your own shell.
 
 ### Tank levels
 
@@ -1108,20 +1254,22 @@ Source — [The Essential Retro Video Game Sound Effects Collection](https://ope
 [`static/sfx/CREDITS.txt`](static/sfx/CREDITS.txt).
 
 Audio starts on the first click (browsers only allow sound after a user gesture) and can be
-toggled with the `M` key or the “🔊 SOUND” button in the corner of the screen.
-Separate volume levels live in the “🔈 Sound mixer” section.
+toggled with the `M` key or the **🔊** button in the bottom-right corner.
+Separate volume levels live in the “🔈 Sound and settings panel” section.
 
 #### Shot sound
 
 The gun shot is **procedural** — it is no longer a “laser” and it is not taken from an
 mp3: the tone is assembled right in the browser with the Web Audio API out of
-three layers.
+four layers. At the bottom sits a **deep sub-bass hit**, so the shot sounds like
+a tank gun, not like a beep.
 
 | Layer | What it is |
 |-------|------------|
-| Low-frequency sweep | a sine wave **150 → 45 Hz** — the punch of the shot itself |
-| Noise burst | white noise through a lowpass filter — the “gunpowder” |
-| Metallic echo | a short triangle impulse — the barrel and the recoil |
+| Sub-bass hit | a sine wave **90 → 38 Hz** over 0.12 s — the pull and the weight of the shot |
+| Shot body | a sine wave **150 → 45 Hz** over 0.3 s — the main tone |
+| Powder click | a short noise burst through a bandpass at **2600 Hz** — the “click” of the breech |
+| Barrel resonance | noise in a narrow band **1500 → 700 Hz** plus a triangle impulse at **430 Hz** |
 
 The external mp3 shot sample is **no longer used**: the sound has no file, only a
 formula, so it sounds the same everywhere and does not depend on loading any assets.
@@ -1144,11 +1292,28 @@ from another floor is duller — the floor muffles it.
 
 ### Bots
 
-If the server has fewer than 20 active players, it maintains the population with AI tanks
-(up to 24 bots): pathfinding around obstacles, shooting along the line of sight and
-**fighting each other** — a bot may target a human or another bot, so real battles happen
-all over the map. With no target around, a bot wanders around the map. When real players
-join, the extra bots leave gracefully: they explode and are removed 1.5 seconds later.
+The server maintains the population with AI tanks: the **target number of bots is
+20** (regardless of how many humans are playing), and the hard ceiling is 24.
+Pathfinding around obstacles, shooting along the line of sight and **fighting
+each other** — a bot may target a human or another bot, so real battles happen
+all over the map. With no target around, a bot wanders around the map. When real
+players join, the extra bots leave gracefully: they explode and are removed 1.5
+seconds later.
+
+#### Bots do not swarm
+
+Every bot has its **own character**, so they behave differently on the map and
+never melt into a single blob:
+
+| What | Value |
+|------|-------|
+| Personal pace | its own speed factor **0.55…0.9** of the base one |
+| Personal reaction | its own delay of **4 to 26 ticks** on top of the difficulty reaction |
+| Personal space | if **3+ other bots** already gathered near the target, the bot **does not close in** |
+| Different plans | the target is re-planned not every tick, but with a time spread |
+
+The last rule is the key one: bots **keep their distance** and approach the
+target from different sides instead of all rushing at one player at once.
 
 #### Difficulty levels
 
@@ -1181,6 +1346,7 @@ Everything is configured through environment variables (see `src/game.rs`,
 | `TANCHIKI_MAP_W` | `160` | map width in tiles (32…512) |
 | `TANCHIKI_MAP_H` | `160` | map height in tiles (32…512) |
 | `TANCHIKI_MIN_PLAYERS` | `20` | minimum population (humans + bots) |
+| `TANCHIKI_BOT_COUNT` | `20` | target number of bots on the map |
 | `TANCHIKI_MAX_BOTS` | `24` | maximum number of bots |
 | `TANCHIKI_BOT_SKILL` | `mixed` | bot difficulty: `easy` / `normal` / `hard` / `mixed` |
 | `TANCHIKI_SEED` | fixed | map generation seed |
@@ -1249,8 +1415,8 @@ blocked by a wall are included. The chunk grid is used as a fast candidate filte
 3 chunks), and the cone check makes the final decision. A tank hidden in the forest
 additionally disappears from observers that are outside the same forest block.
 
-Filtering **by deck** is a separate step: entities with a foreign `deck` never enter
-the snapshot at all — the floor blocks the view. The exception is the **sound
+Filtering **by layer** is a separate step: entities with a foreign `deck` never enter
+the snapshot at all — the neighbouring layer blocks the view. The exception is the **sound
 channel**: sound events are sent to everyone within hearing range, regardless of the
 vision cone, so the player hears which side the attack comes from.
 
@@ -1261,10 +1427,10 @@ the “🌫 Fog of war” section.
 
 ### Map synchronization
 
-* On join, a player receives the **full map state per deck**, packed with **RLE**:
-  for every deck its own sequence of `value:u8, len:u16` triples.
+* On join, a player receives the **full map state per layer**, packed with **RLE**:
+  for every one of the three layers its own sequence of `value:u8, len:u16` triples.
 * During the game only **deltas** arrive: `TileUpdate { x, y, value, deck }` for changed
-  tiles inside the visibility area; a delta carries its deck too.
+  tiles inside the visibility area; a delta carries its layer too.
 
 ### Network safety
 
@@ -1321,7 +1487,7 @@ where the ability is applied (the crosshair is drawn there).
 | `ERROR` | `0x17` | `code: u16`, `message: string` |
 
 **Map** (inside `WELCOME`): `width: u32`, `height: u32`, `tile_size: u32`,
-`layers: u8`, then for every deck — `rle_len: u32` and the bytes of the RLE stream.
+`layers: u8`, then for every layer — `rle_len: u32` and the bytes of the RLE stream.
 
 **`SNAPSHOT`:**
 
@@ -1344,14 +1510,15 @@ events:  u16 × { kind: u8, ... }     // 0 explosion, 1 tile destroyed, 2 pickup
 A tile value is packed into a single byte: bits `0..=2` hold the base type. For
 brick, bits `3..=5` hold the damage stage (0–3); for a ramp, bits `3..=4` hold
 the strip direction (`0` right, `1` down, `2` left, `3` up) and bits `5..=6`
-hold the tile index in the strip (`0` — lower edge, `1` — middle, `2` — upper edge).
+hold the tile index in the strip (`0` — low edge, `1` — middle, `2` — high edge).
+For a ramp, bit `7` means the strip leads **into a pit** (`0` — it leads up).
 
 `dir`: `0` up, `1` down, `2` left, `3` right, `4` up-left, `5` up-right, `6` down-left,
 `7` down-right. That is the **hull** direction.
 
 `aim` is the **turret** direction, 64 values with a 5.625° step; bullets fly along it.
-`deck` is the deck number: `0` — lower, `1` — upper. Every entity has one: tanks,
-bullets, pickups, ability effects, tile deltas and sounds.
+`deck` is the **layer index**: `0` — pit (−1), `1` — ground (0), `2` — upper (+1).
+Every entity has one: tanks, bullets, pickups, ability effects, tile deltas and sounds.
 `mortar_cd` and `airstrike_cd` are the remaining cooldowns of the mortar and the air
 strike in ticks; they are **always** sent, so the panel can show the readiness of
 both abilities.
@@ -1365,16 +1532,18 @@ the vision cone, so the player hears which side the attack comes from.
 `x2,y2` the impact point, `phase` the flight progress in percent), `kind = 2` an air strike
 call (`x,y` is the impact point, `phase` the call progress).
 
-The `Explosion` and `TileBroken` events carry a `deck` as well — the deck they happened
+The `Explosion` and `TileBroken` events carry a `deck` as well — the layer they happened
 on.
 
-The protocol version is **5**: version 1 had 4 directions, version 2 added 8 directions
+The protocol version is **6**: version 1 had 4 directions, version 2 added 8 directions
 and a kill counter, version 3 added the independent turret (16 directions), abilities and
 fog of war, version 4 added 64 turret directions (5.625° per step), the multi-level map
 with decks (`deck` on every entity), separate cooldowns for the mortar and the air strike
 and the sound channel outside the vision cone, version 5 turned the transitions between
 decks into ramp strips of three tiles: the tile byte now carries the strip direction and
-the tile index in it.
+the tile index in it. Version 6 made the map **three-layered**: `deck` is now the layer
+index (`0` pit, `1` ground, `2` upper), the `Pit` tile appeared (the floor of a trench)
+together with the “ramp leads into a pit” bit.
 
 ---
 
@@ -1395,7 +1564,7 @@ the tile index in it.
 
 ```bash
 cargo check --all-targets   # 0 errors, 0 warnings
-cargo test                  # 52 tests
+cargo test                  # 60 tests
 cargo build --release
 ```
 
@@ -1409,6 +1578,16 @@ gaps, ramps as three-tile strips (index order, no overlaps, a free approach on b
 decks), a deck change only on the top tile of the strip and only on the bottom one when
 going down, hiding enemies on a neighbouring deck and shots being heard outside the
 vision cone.
+
+The **three-layer** mechanics are covered separately:
+
+* driving down into a pit along its ramp and back up again;
+* the impossibility of **driving into a pit** from the ground by accident (the hole);
+* the overhead fire rules: from the ground into a pit and from the ground up to the
+  upper layer it does not penetrate, from the upper layer down to the ground it does;
+* the mortar and the air strike reach a tank **on every layer**;
+* pits are generated with their own descending ramp;
+* the map holds **20 bots**, and none of them is faster than the player.
 
 Useful commands while developing:
 
